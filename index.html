@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Workflow Guild Heraldry</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Pirata+One&family=IM+Fell+English:ital@0;1&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one parchment broadsheet. Hero row of five crests, then one plate per repo, then palette and prompt pack. Deliberately single-theme (letterpress world). */
+:root {
+  color-scheme: light;
+  --parchment: #efe4c8;
+  --parchment-deep: #e2d3ad;
+  --ink: #1d1a16;
+  --ink-soft: #4a4136;
+  --gold: #b8892f;
+  --gules: #a8322d;
+  --purpure: #5b3a7a;
+  --azure: #2d5a8a;
+  --vert: #3d6b3a;
+  --sable: #1d1a16;
+  --display: "Pirata One", "UnifrakturMaguntia", Georgia, serif;
+  --body: "IM Fell English", Georgia, "Times New Roman", serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--parchment);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 18px;
+  line-height: 1.5;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 32px 64px;
+  background-image:
+    radial-gradient(ellipse at 20% 10%, rgba(184,137,47,.10), transparent 60%),
+    radial-gradient(ellipse at 85% 80%, rgba(74,65,54,.10), transparent 55%);
+}
+main { max-width: 1080px; margin: 0 auto; display: grid; gap: 56px; }
+h1, h2, h3 { font-family: var(--display); font-weight: 400; margin: 0; text-wrap: balance; }
+h1 { font-size: clamp(44px, 8vw, 84px); line-height: 1; text-align: center; }
+h2 { font-size: 40px; line-height: 1.1; }
+h3 { font-size: 34px; line-height: 1; }
+p { margin: 0; max-width: 62ch; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-soft); }
+.rule { height: 0; border: 0; border-top: 3px double var(--ink); margin: 0; }
+
+/* hero */
+.hero { display: grid; gap: 20px; justify-items: center; text-align: center; }
+.hero .sub { font-style: italic; font-size: 21px; color: var(--ink-soft); }
+.row { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px 22px; }
+.row a { color: inherit; text-decoration: none; display: grid; justify-items: center; gap: 2px; }
+.row a:focus-visible { outline: 3px solid var(--gold); outline-offset: 4px; }
+.row svg { width: 120px; height: 132px; transition: transform .2s; }
+.row a:hover svg { transform: rotate(-4deg) translateY(-3px); }
+.row span { font-family: var(--display); font-size: 22px; }
+@media (prefers-reduced-motion: reduce) { .row svg { transition: none; } .row a:hover svg { transform: none; } }
+
+/* plates */
+.plates { display: grid; gap: 28px; }
+.plate {
+  display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 28px; align-items: start;
+  border: 3px solid var(--ink); background: var(--parchment); padding: 24px;
+  box-shadow: 6px 6px 0 var(--ink);
+}
+.crest { display: grid; justify-items: center; gap: 0; }
+.crest .shield { width: 200px; height: 220px; }
+.crest .banner { width: 240px; height: 56px; margin-top: -26px; }
+.plate .text { display: grid; gap: 12px; min-width: 0; }
+.motto { font-style: italic; font-size: 22px; }
+.motto small { display: block; font-style: normal; font-size: 15px; color: var(--ink-soft); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
+.chip { display: inline-flex; align-items: center; gap: 8px; }
+.chip i { width: 16px; height: 16px; border: 2px solid var(--ink); display: inline-block; }
+.sizes { display: flex; align-items: end; gap: 14px; }
+.sizes svg { display: block; }
+.sizes .lbl { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); text-align: center; }
+.does { font-size: 16px; color: var(--ink-soft); }
+
+/* palette */
+.palette { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+.sw { border: 3px solid var(--ink); background: var(--parchment); }
+.sw div { height: 64px; border-bottom: 3px solid var(--ink); }
+.sw p { padding: 8px 10px; font-family: var(--mono); font-size: 12px; line-height: 1.4; }
+.sw b { font-family: var(--body); font-size: 17px; font-weight: 400; display: block; }
+
+/* prompts */
+.prompts { display: grid; gap: 14px; }
+.howto { display: grid; gap: 8px; padding-left: 1.2em; margin: 0; max-width: 70ch; }
+pre {
+  margin: 0; background: var(--ink); color: var(--parchment); padding: 16px 18px;
+  font-family: var(--mono); font-size: 13px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.pbox { display: grid; gap: 0; }
+.pbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; border: 3px solid var(--ink); border-bottom: 0; padding: 6px 6px 6px 14px; }
+.pbar span { font-family: var(--display); font-size: 22px; }
+button {
+  font-family: var(--mono); font-size: 13px; cursor: pointer;
+  background: var(--gold); color: var(--ink); border: 2px solid var(--ink); padding: 6px 12px;
+  box-shadow: 3px 3px 0 var(--ink);
+}
+button:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
+button:focus-visible { outline: 3px solid var(--azure); outline-offset: 2px; }
+details { border: 3px solid var(--ink); }
+details > summary { cursor: pointer; padding: 10px 14px; font-family: var(--display); font-size: 24px; }
+details[open] > summary { border-bottom: 3px solid var(--ink); }
+details .pbox { padding: 14px; gap: 14px; }
+
+@media (max-width: 640px) {
+  .plate { grid-template-columns: minmax(0, 1fr); box-shadow: 4px 4px 0 var(--ink); padding: 18px; }
+  .row svg { width: 92px; height: 101px; }
+}
+</style>
+</head>
+<body>
+
+<!-- sprite: shield frame, wobble filter, five glyphs -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <filter id="wobble" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="2" seed="7" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="3.2"/>
+    </filter>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="none"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#1d1a16" stroke-width="1.6" opacity=".55"/>
+    </pattern>
+    <path id="shieldPath" d="M18 14 C40 10 80 10 102 14 L102 58 C102 86 84 102 60 114 C36 102 18 86 18 58 Z"/>
+  </defs>
+
+  <!-- quartermaster: abacus -->
+  <symbol id="g-qm" viewBox="0 0 120 124">
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use href="#shieldPath" fill="#a8322d"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)" stroke="none"/>
+      <use href="#shieldPath" fill="none"/>
+      <rect x="32" y="30" width="56" height="52" rx="3" fill="#efe4c8"/>
+      <line x1="34" y1="44" x2="86" y2="44"/><line x1="34" y1="56" x2="86" y2="56"/><line x1="34" y1="68" x2="86" y2="68"/>
+      <g fill="#b8892f" stroke-width="3">
+        <circle cx="42" cy="44" r="5"/><circle cx="52" cy="44" r="5"/><circle cx="76" cy="44" r="5"/>
+        <circle cx="42" cy="56" r="5"/><circle cx="66" cy="56" r="5"/><circle cx="76" cy="56" r="5"/>
+        <circle cx="42" cy="68" r="5"/><circle cx="52" cy="68" r="5"/><circle cx="62" cy="68" r="5"/>
+      </g>
+      <line x1="36" y1="82" x2="32" y2="94"/><line x1="84" y1="82" x2="88" y2="94"/>
+    </g>
+  </symbol>
+
+  <!-- conclave: gavel and block -->
+  <symbol id="g-cv" viewBox="0 0 120 124">
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use href="#shieldPath" fill="#5b3a7a"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)" stroke="none"/>
+      <use href="#shieldPath" fill="none"/>
+      <rect x="38" y="84" width="44" height="12" rx="2" fill="#b8892f"/>
+      <g transform="rotate(-32 60 54)">
+        <rect x="56" y="44" width="9" height="44" rx="2" fill="#efe4c8"/>
+        <rect x="36" y="28" width="50" height="20" rx="4" fill="#efe4c8"/>
+        <line x1="44" y1="28" x2="44" y2="48" stroke-width="3.5"/>
+        <line x1="78" y1="28" x2="78" y2="48" stroke-width="3.5"/>
+      </g>
+      <path d="M30 76 l-6 -3 M32 70 l-7 -7 M88 78 l7 -2" stroke="#efe4c8" stroke-width="3.5"/>
+    </g>
+  </symbol>
+
+  <!-- bridgekeeper: lantern -->
+  <symbol id="g-bk" viewBox="0 0 120 124">
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use href="#shieldPath" fill="#2d5a8a"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)" stroke="none"/>
+      <use href="#shieldPath" fill="none"/>
+      <circle cx="60" cy="24" r="6" fill="none"/>
+      <path d="M46 40 L50 31 H70 L74 40 Z" fill="#efe4c8"/>
+      <rect x="45" y="40" width="30" height="38" rx="2" fill="#efe4c8"/>
+      <path d="M60 46 C67 55 66 62 60 68 C54 62 53 55 60 46 Z" fill="#b8892f" stroke-width="3.5"/>
+      <path d="M60 58 C62 61 62 64 60 66 C58 64 58 61 60 58 Z" fill="#a8322d" stroke="none"/>
+      <line x1="52" y1="40" x2="52" y2="78" stroke-width="3"/><line x1="68" y1="40" x2="68" y2="78" stroke-width="3"/>
+      <rect x="42" y="78" width="36" height="8" rx="2" fill="#efe4c8"/>
+      <path d="M36 54 l-8 -2 M36 64 l-9 2 M84 54 l8 -2 M84 64 l9 2" stroke="#b8892f" stroke-width="3.5"/>
+    </g>
+  </symbol>
+
+  <!-- bopeep: crook with ribbon -->
+  <symbol id="g-bp" viewBox="0 0 120 124">
+    <g filter="url(#wobble)" stroke-linejoin="round" stroke-linecap="round">
+      <use href="#shieldPath" fill="#3d6b3a" stroke="#1d1a16" stroke-width="4.5"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)"/>
+      <use href="#shieldPath" fill="none" stroke="#1d1a16" stroke-width="4.5"/>
+      <path d="M68 100 L68 46 C68 24 42 20 38 36 C35 46 46 52 52 44" fill="none" stroke="#1d1a16" stroke-width="13"/>
+      <path d="M68 100 L68 46 C68 24 42 20 38 36 C35 46 46 52 52 44" fill="none" stroke="#efe4c8" stroke-width="5.5"/>
+      <g stroke="#1d1a16" stroke-width="3.5">
+        <path d="M68 58 L54 50 L56 66 Z" fill="#a8322d"/>
+        <path d="M68 58 L82 50 L80 66 Z" fill="#a8322d"/>
+        <path d="M66 60 L58 80 M70 60 L78 82" fill="none"/>
+        <circle cx="68" cy="58" r="4" fill="#b8892f"/>
+      </g>
+    </g>
+  </symbol>
+
+  <!-- orderly: bell, gold on sable -->
+  <symbol id="g-or" viewBox="0 0 120 124">
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use href="#shieldPath" fill="#1d1a16"/>
+      <use href="#shieldPath" fill="none" stroke="#b8892f" stroke-width="3" transform="translate(60 62) scale(.9) translate(-60 -62)"/>
+      <path d="M54 30 C54 22 66 22 66 30" fill="none" stroke="#b8892f" stroke-width="5"/>
+      <path d="M60 30 C46 30 42 44 42 58 C42 70 36 74 33 82 H87 C84 74 78 70 78 58 C78 44 74 30 60 30 Z" fill="#b8892f" stroke="#efe4c8" stroke-width="3.5"/>
+      <path d="M50 42 C47 48 47 56 47 62" fill="none" stroke="#efe4c8" stroke-width="3"/>
+      <circle cx="60" cy="89" r="6" fill="#b8892f" stroke="#efe4c8" stroke-width="3"/>
+      <path d="M31 50 l-7 -5 M30 62 l-8 0 M89 50 l7 -5 M90 62 l8 0" stroke="#efe4c8" stroke-width="3.5"/>
+    </g>
+  </symbol>
+
+  <!-- ribbon banner -->
+  <symbol id="ribbon" viewBox="0 0 240 56">
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="3.5" stroke-linejoin="round">
+      <path d="M8 22 H40 V48 H8 L18 35 Z" fill="#e2d3ad"/>
+      <path d="M232 22 H200 V48 H232 L222 35 Z" fill="#e2d3ad"/>
+      <path d="M40 48 L32 40 V48 Z M200 48 L208 40 V48 Z" fill="#1d1a16"/>
+      <path d="M32 12 C80 6 160 6 208 12 V40 C160 34 80 34 32 40 Z" fill="#efe4c8"/>
+    </g>
+  </symbol>
+</svg>
+
+<main>
+  <header class="hero">
+    <p class="eyebrow">Arms of the Workflow Guild</p>
+    <h1>The Workflow Guild</h1>
+    <p class="sub">Five deterministic tools, five crests, one very proud bard.</p>
+    <nav class="row" aria-label="The five crests">
+      <a href="#quartermaster"><svg viewBox="0 0 120 124" role="img" aria-label="quartermaster"><use href="#g-qm"/></svg><span>quartermaster</span></a>
+      <a href="#conclave"><svg viewBox="0 0 120 124" role="img" aria-label="conclave"><use href="#g-cv"/></svg><span>conclave</span></a>
+      <a href="#bridgekeeper"><svg viewBox="0 0 120 124" role="img" aria-label="bridgekeeper"><use href="#g-bk"/></svg><span>bridgekeeper</span></a>
+      <a href="#bopeep"><svg viewBox="0 0 120 124" role="img" aria-label="bopeep"><use href="#g-bp"/></svg><span>bopeep</span></a>
+      <a href="#orderly"><svg viewBox="0 0 120 124" role="img" aria-label="orderly"><use href="#g-or"/></svg><span>orderly</span></a>
+    </nav>
+  </header>
+
+  <hr class="rule">
+
+  <section class="plates" id="plates" aria-label="Crests"></section>
+
+  <hr class="rule">
+
+  <section style="display:grid;gap:18px">
+    <div style="display:grid;gap:6px">
+      <p class="eyebrow">Tinctures</p>
+      <h2>Three shared, one per house</h2>
+      <p>Every crest uses parchment, ink and gold. Each repo adds exactly one field color. Nothing else, no gradients.</p>
+    </div>
+    <div class="palette" id="palette"></div>
+  </section>
+
+  <hr class="rule">
+
+  <section class="prompts">
+    <div style="display:grid;gap:6px">
+      <p class="eyebrow">Prompt pack</p>
+      <h2>Painting the full crests</h2>
+      <p>The glyphs above are the small marks. The character crests come from an image model, and this is how to keep five of them looking like one set.</p>
+    </div>
+    <ol class="howto">
+      <li><strong>Generate the first crest</strong> with the full prompt below. Pick conclave first: it has the most figures, so it sets the hardest style.</li>
+      <li><strong>Keep the best one</strong> and attach it to every later request with the style-lock prompt.</li>
+      <li><strong>Letter the banners yourself</strong> in Pirata One. Image models misspell ribbons.</li>
+    </ol>
+    <div class="pbox">
+      <div class="pbar"><span>Style-lock follow-up</span><button type="button" data-copy="lock" id="copy-lock">Copy</button></div>
+      <pre id="lock"></pre>
+    </div>
+    <div id="perrepo" style="display:grid;gap:12px"></div>
+  </section>
+</main>
+
+<script>
+const BASE = {
+  parchment: "#efe4c8", ink: "#1d1a16", gold: "#b8892f"
+};
+const REPOS = [
+  { id: "quartermaster", g: "g-qm", tinct: "Gules", hex: "#a8322d",
+    glyph: "Abacus",
+    does: "Reads every seat's usage pools and routes work to whichever has headroom.",
+    motto: "Rationes finitae sunt", tr: "The rations are finite",
+    scene: "a frazzled, bearded dwarf quartermaster hunched at a counting table, sliding beads on a huge abacus while a ledger of rations unrolls off the table, over the shield's edge and onto the floor; sacks of grain beside him have little fill-gauges painted on them, two of them nearly empty" },
+  { id: "conclave", g: "g-cv", tinct: "Purpure", hex: "#5b3a7a",
+    glyph: "Gavel",
+    does: "Seats a council of model voters on a brief, and a judge returns one decision.",
+    motto: "Quot capita, tot sententiae", tr: "As many heads, as many opinions",
+    scene: "five hooded council members around a round oak table, each wearing a different absurd hat (a wizard cone, a crown, a jester cap, a bishop's mitre, a pot), each pointing in a different direction; at the head sits a small, smug goblin judge in an oversized wig, raising a gavel" },
+  { id: "bridgekeeper", g: "g-bk", tinct: "Azure", hex: "#2d5a8a",
+    glyph: "Lantern",
+    does: "Pre-push guards that keep secrets and work names out of public repos.",
+    motto: "Thou shalt not push", tr: "Said with great relish",
+    scene: "a lumpy, officious troll under a stone bridge holding up a lantern and squinting at a tiny traveller's papers through a monocle; beside him a burlap sack stamped CONFISCATED overflows with keys and scrolls; the traveller looks sheepish" },
+  { id: "bopeep", g: "g-bp", tinct: "Vert", hex: "#3d6b3a",
+    glyph: "Crook",
+    does: "Shepherds every open pull request to its next step, and merges the safe ones.",
+    motto: "They will NOT come home on their own", tr: "With apologies to the nursery rhyme",
+    scene: "a determined shepherdess with a beribboned crook herding a flock of sheep; each sheep has a little tag on its ear, one has wandered off the edge of the shield chewing a scroll, and another is stuck in a hedge while the rest file neatly through a gate" },
+  { id: "orderly", g: "g-or", tinct: "Sable", hex: "#1d1a16",
+    glyph: "Bell",
+    does: "The orderly room board: the day's business on a browser new-tab page.",
+    motto: "Audite, audite", tr: "Hear ye, hear ye",
+    scene: "a skinny herald ringing a hand bell while nailing yet another notice to an overstuffed notice board in a castle's orderly room; notices flutter off the board; he wears a small nurse's cap with a firm red X painted over it" }
+];
+
+const fullPrompt = r => `Cartoon heraldic crest, hand-inked with thick, wobbly black brush outlines and crosshatch shading, like a woodcut drawn for a humorous fantasy card game. Strictly limited palette: parchment cream (${BASE.parchment}), ink black (${BASE.ink}), tarnished gold (${BASE.gold}), and one field color, ${r.tinct.toLowerCase()} (${r.hex}). Flat fills, no gradients, no photorealism, no extra colors. A lumpy shield centered on a plain parchment background, with an empty ribbon banner curling beneath it. Inside the shield: ${r.scene}. The tone is a bard's comic ballad: earnest and slightly ridiculous. Original characters only. No text, letters or numbers anywhere in the image. Square image.`;
+
+const LOCK = `Match the attached crest exactly: same line weight, crosshatching, shield shape, banner, parchment background and four-color limit. Change only two things: the field color becomes {COLOR NAME} ({HEX}), and the scene inside the shield becomes: {SCENE}. No text, letters or numbers anywhere in the image.`;
+
+const plates = document.getElementById("plates");
+REPOS.forEach(r => {
+  const el = document.createElement("article");
+  el.className = "plate"; el.id = r.id;
+  el.innerHTML = `
+    <div class="crest">
+      <svg class="shield" viewBox="0 0 120 124" role="img" aria-label="${r.id} crest"><use href="#${r.g}"/></svg>
+      <svg class="banner" viewBox="0 0 240 56" aria-hidden="true">
+        <use href="#ribbon"/>
+        <text x="120" y="31" text-anchor="middle" font-family="Pirata One, Georgia, serif" font-size="${r.id.length > 11 ? 21 : 24}" fill="#1d1a16">${r.id}</text>
+      </svg>
+    </div>
+    <div class="text">
+      <h3>${r.id}</h3>
+      <p class="does">${r.does}</p>
+      <p class="motto">“${r.motto}”<small>${r.tr}</small></p>
+      <div class="meta">
+        <span class="chip"><i style="background:${r.hex}"></i>${r.tinct} ${r.hex}</span>
+        <span>glyph: ${r.glyph.toLowerCase()}</span>
+      </div>
+      <div class="sizes" aria-label="Small-size test">
+        <div><svg width="64" height="66" viewBox="0 0 120 124"><use href="#${r.g}"/></svg><div class="lbl">64</div></div>
+        <div><svg width="32" height="33" viewBox="0 0 120 124"><use href="#${r.g}"/></svg><div class="lbl">32</div></div>
+        <div><svg width="16" height="17" viewBox="0 0 120 124"><use href="#${r.g}"/></svg><div class="lbl">16</div></div>
+      </div>
+      <p><em>Full crest:</em> ${r.scene}.</p>
+    </div>`;
+  plates.appendChild(el);
+});
+
+const pal = document.getElementById("palette");
+[
+  ["Parchment", BASE.parchment, "shared ground"],
+  ["Ink", BASE.ink, "shared line, and orderly's field"],
+  ["Tarnished gold", BASE.gold, "shared metal"],
+  ...REPOS.filter(r => r.id !== "orderly").map(r => [r.tinct, r.hex, r.id])
+].forEach(([n, h, use]) => {
+  const d = document.createElement("div"); d.className = "sw";
+  d.innerHTML = `<div style="background:${h}"></div><p><b>${n}</b>${h}<br>${use}</p>`;
+  pal.appendChild(d);
+});
+
+document.getElementById("lock").textContent = LOCK;
+const per = document.getElementById("perrepo");
+REPOS.forEach((r, i) => {
+  const d = document.createElement("details");
+  if (i === 1) d.open = true;
+  d.innerHTML = `<summary>${r.id}</summary><div class="pbox"><div><button type="button" id="copy-${r.id}" data-copy="p-${r.id}">Copy full prompt</button></div><pre id="p-${r.id}"></pre></div>`;
+  per.appendChild(d);
+  d.querySelector("pre").textContent = fullPrompt(r);
+});
+
+document.addEventListener("click", e => {
+  const b = e.target.closest("button[data-copy]"); if (!b) return;
+  const pre = document.getElementById(b.dataset.copy);
+  const done = () => { const t = b.textContent; b.textContent = "Copied"; setTimeout(() => b.textContent = t, 1400); };
+  navigator.clipboard?.writeText(pre.textContent).then(done).catch(() => {
+    const s = window.getSelection(), rg = document.createRange(); rg.selectNodeContents(pre); s.removeAllRanges(); s.addRange(rg);
+    b.textContent = "Selected, press Ctrl+C";
+  });
+});
+</script>
+</body>
+</html>

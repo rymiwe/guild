@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 120 124" width="160" height="165">
+<title>quartermaster</title>
+<defs>
+    <filter id="wobble" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="2" seed="7" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="3.2"/>
+    </filter>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="none"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#1d1a16" stroke-width="1.6" opacity=".55"/>
+    </pattern>
+    <path id="shieldPath" d="M18 14 C40 10 80 10 102 14 L102 58 C102 86 84 102 60 114 C36 102 18 86 18 58 Z"/>
+  </defs>
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use xlink:href="#shieldPath" fill="#a8322d"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)" stroke="none"/>
+      <use xlink:href="#shieldPath" fill="none"/>
+      <rect x="32" y="30" width="56" height="52" rx="3" fill="#efe4c8"/>
+      <line x1="34" y1="44" x2="86" y2="44"/><line x1="34" y1="56" x2="86" y2="56"/><line x1="34" y1="68" x2="86" y2="68"/>
+      <g fill="#b8892f" stroke-width="3">
+        <circle cx="42" cy="44" r="5"/><circle cx="52" cy="44" r="5"/><circle cx="76" cy="44" r="5"/>
+        <circle cx="42" cy="56" r="5"/><circle cx="66" cy="56" r="5"/><circle cx="76" cy="56" r="5"/>
+        <circle cx="42" cy="68" r="5"/><circle cx="52" cy="68" r="5"/><circle cx="62" cy="68" r="5"/>
+      </g>
+      <line x1="36" y1="82" x2="32" y2="94"/><line x1="84" y1="82" x2="88" y2="94"/>
+    </g>
+  </svg>
