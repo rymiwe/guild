@@ -46,6 +46,7 @@ The tools are public and carry no employer names. Every org fact (repo names, lo
 - **No tool paths.** One tool calls another by command name on `PATH`, and fails closed when it is absent.
 - **No `.guild.json` in a tool repo.** Tests use made-up names such as `AcmeCorp`.
 - **One loader:** `guild-config` in [quartermaster](https://github.com/rymiwe/quartermaster). Shell callers run `guild-config [--repo OWNER/NAME | --org] KEY`; Python callers import it.
+- **Wrappers run the main checkout.** A machine-local wrapper calls `guild-exec TOOL PATH "$@"` (quartermaster), which runs `~/code/TOOL/PATH` only when that checkout is clean and on its default branch, and otherwise exits 3. Branch work goes in a worktree; `bopeep sync` fast-forwards the main checkouts.
 
 A starting org file, with made-up values:
 
