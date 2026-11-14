@@ -16,8 +16,8 @@
 | --- | --- | --- |
 | [quartermaster](https://github.com/rymiwe/quartermaster) | Reads every seat's usage pools and routes work to whichever has headroom. | *Rationes finitae sunt*: the rations are finite |
 | [conclave](https://github.com/rymiwe/conclave) | Seats a council of model voters on a brief; a judge returns one decision. | *Quot capita, tot sententiae*: as many heads, as many opinions |
-| bridgekeeper (private) | Pre-push guards that keep secrets and work names out of public repos. | *Thou shalt not push* |
-| bopeep (private) | Shepherds every open pull request to its next step, and merges the safe ones. | *They will NOT come home on their own* |
+| bridgekeeper (private) | Hooks and gates on every step that leaves the machine: push, PR ready, review post and merge. | *Thou shalt not push* |
+| bopeep (private) | Shepherds every open pull request, yours and your team's, to its next step, and merges the safe ones. | *They will NOT come home on their own* |
 | [orderly](https://github.com/rymiwe/orderly) | The orderly room board: the day's business on a browser new-tab page. | *Audite, audite*: hear ye, hear ye |
 
 ## The style sheet
