@@ -30,6 +30,36 @@
 - **Thick, wobbly ink outlines.** The wobble is an SVG displacement filter, so every crest gets it the same way.
 - **The glyph must read at 16px.** The painted character crests are for READMEs and pages; the glyph is for everything small.
 
+## Org config: `.guild.json`
+
+The tools are public and carry no employer names. Every org fact (repo names, logins, ticket prefixes, persona names) lives in `.guild.json` files under the work root, which git never sees:
+
+| File | Holds |
+| --- | --- |
+| `<work root>/.guild.json` | Org-wide: persona names, colleague handles, author logins and emails, secret references (never values). |
+| `<work root>/<repo>/.guild.json` | Per repo: ticket prefixes, changelog route, CI workflow, lint allowances. List it in that checkout's `.git/info/exclude`. |
+
+- **The work root** is each `work_path_prefixes` entry in `~/.config/work-account/config.json`. Its `work_github_owners` say which repos are work. That file keeps those two keys only.
+- **Lookup.** Repo slug (an argument, or the `origin` remote) → owner must be a work owner → canonical checkout `<work root>/<repo>` → its `.guild.json`, then each parent's up to the work root. The nearer file wins; objects merge key by key. Clones and worktrees elsewhere read the canonical checkout's file.
+- **Sections.** Top-level keys are shared. A tool keeps its own keys under its name.
+- **Fail closed.** A missing or malformed file, or a missing key, exits 3 and names the file and key. No environment variable bypasses it. A tool that posts, merges or pushes loads the file itself and never treats "not work" as "config present".
+- **No tool paths.** One tool calls another by command name on `PATH`, and fails closed when it is absent.
+- **No `.guild.json` in a tool repo.** Tests use made-up names such as `AcmeCorp`.
+- **One loader:** `guild-config` in [quartermaster](https://github.com/rymiwe/quartermaster). Shell callers run `guild-config [--repo OWNER/NAME | --org] KEY`; Python callers import it.
+
+A starting org file, with made-up values:
+
+```json
+{
+  "personas": ["Pat"],
+  "colleagues": {"alex": "alex-gh"},
+  "author_logins": ["you-gh"],
+  "author_emails": ["you@example.com"],
+  "secrets": {"review_token": "<a secret manager reference>"},
+  "conclave": {"lint_names": ["Pat"]}
+}
+```
+
 ## Changing a crest
 
 `index.html` holds the source. Its hidden SVG sprite defines each glyph as a `<symbol>`.
