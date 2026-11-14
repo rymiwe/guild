@@ -1,3 +1,5 @@
+<p align="center"><img src="crests/guild.svg" width="160" alt="guild crest: a guildhall on a gold shield"></p>
+
 <h1 align="center">The Workflow Guild</h1>
 
 <p align="center">Six deterministic tools for agent workflows, and the heraldry they share.</p>
