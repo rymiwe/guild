@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 120 124" width="160" height="165">
+<title>thresher</title>
+<defs>
+    <filter id="wobble" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="2" seed="7" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="3.2"/>
+    </filter>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="none"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#1d1a16" stroke-width="1.6" opacity=".55"/>
+    </pattern>
+    <path id="shieldPath" d="M18 14 C40 10 80 10 102 14 L102 58 C102 86 84 102 60 114 C36 102 18 86 18 58 Z"/>
+  </defs>
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use xlink:href="#shieldPath" fill="#b5602a"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)" stroke="none"/>
+      <use xlink:href="#shieldPath" fill="none"/>
+      <g fill="#b8892f" stroke-width="3"><rect x="73.0" y="56.0" width="8" height="8" rx="1.5" transform="rotate(0 77.0 60.0)"/><rect x="67.8" y="71.9" width="8" height="8" rx="1.5" transform="rotate(36 71.8 75.9)"/><rect x="54.3" y="81.7" width="8" height="8" rx="1.5" transform="rotate(72 58.3 85.7)"/><rect x="37.7" y="81.7" width="8" height="8" rx="1.5" transform="rotate(108 41.7 85.7)"/><rect x="24.2" y="71.9" width="8" height="8" rx="1.5" transform="rotate(144 28.2 75.9)"/><rect x="19.0" y="56.0" width="8" height="8" rx="1.5" transform="rotate(180 23.0 60.0)"/><rect x="24.2" y="40.1" width="8" height="8" rx="1.5" transform="rotate(216 28.2 44.1)"/><rect x="37.7" y="30.3" width="8" height="8" rx="1.5" transform="rotate(252 41.7 34.3)"/><rect x="54.3" y="30.3" width="8" height="8" rx="1.5" transform="rotate(288 58.3 34.3)"/><rect x="67.8" y="40.1" width="8" height="8" rx="1.5" transform="rotate(324 71.8 44.1)"/></g>
+      <circle cx="50" cy="60" r="23" fill="#efe4c8"/>
+      <path d="M33 50 H67 M29 60 H71 M33 70 H67" stroke-width="3.5"/>
+      <circle cx="50" cy="60" r="5" fill="#b8892f" stroke-width="3"/>
+      <path d="M84 100 C84 80 82 60 80 36" fill="none" stroke-width="5"/>
+      <g fill="#b8892f" stroke-width="3">
+        <ellipse cx="80" cy="28" rx="4" ry="7"/>
+        <ellipse cx="74" cy="40" rx="4" ry="7" transform="rotate(-30 74 40)"/>
+        <ellipse cx="87" cy="42" rx="4" ry="7" transform="rotate(30 87 42)"/>
+        <ellipse cx="75" cy="53" rx="4" ry="7" transform="rotate(-30 75 53)"/>
+        <ellipse cx="88" cy="55" rx="4" ry="7" transform="rotate(30 88 55)"/>
+      </g>
+    </g>
+  </svg>

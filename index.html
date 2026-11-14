@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Pirata+One&family=IM+Fell+English:ital@0;1&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: one parchment broadsheet. Hero row of five crests, then one plate per repo, then palette and prompt pack. Deliberately single-theme (letterpress world). */
+/* Layout: one parchment broadsheet. Hero row of six crests, then one plate per repo, then palette and prompt pack. Deliberately single-theme (letterpress world). */
 :root {
   color-scheme: light;
   --parchment: #efe4c8;
@@ -20,6 +20,7 @@
   --azure: #2d5a8a;
   --vert: #3d6b3a;
   --sable: #1d1a16;
+  --tenne: #b5602a;
   --display: "Pirata One", "UnifrakturMaguntia", Georgia, serif;
   --body: "IM Fell English", Georgia, "Times New Roman", serif;
   --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
@@ -116,7 +117,7 @@ details .pbox { padding: 14px; gap: 14px; }
 </head>
 <body>
 
-<!-- sprite: shield frame, wobble filter, five glyphs -->
+<!-- sprite: shield frame, wobble filter, six glyphs -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
     <filter id="wobble" x="-5%" y="-5%" width="110%" height="110%">
@@ -211,6 +212,27 @@ details .pbox { padding: 14px; gap: 14px; }
     </g>
   </symbol>
 
+  <!-- thresher: gear-toothed drum and a wheat stalk, on tenne -->
+  <symbol id="g-th" viewBox="0 0 120 124">
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use href="#shieldPath" fill="#b5602a"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)" stroke="none"/>
+      <use href="#shieldPath" fill="none"/>
+      <g fill="#b8892f" stroke-width="3"><rect x="73.0" y="56.0" width="8" height="8" rx="1.5" transform="rotate(0 77.0 60.0)"/><rect x="67.8" y="71.9" width="8" height="8" rx="1.5" transform="rotate(36 71.8 75.9)"/><rect x="54.3" y="81.7" width="8" height="8" rx="1.5" transform="rotate(72 58.3 85.7)"/><rect x="37.7" y="81.7" width="8" height="8" rx="1.5" transform="rotate(108 41.7 85.7)"/><rect x="24.2" y="71.9" width="8" height="8" rx="1.5" transform="rotate(144 28.2 75.9)"/><rect x="19.0" y="56.0" width="8" height="8" rx="1.5" transform="rotate(180 23.0 60.0)"/><rect x="24.2" y="40.1" width="8" height="8" rx="1.5" transform="rotate(216 28.2 44.1)"/><rect x="37.7" y="30.3" width="8" height="8" rx="1.5" transform="rotate(252 41.7 34.3)"/><rect x="54.3" y="30.3" width="8" height="8" rx="1.5" transform="rotate(288 58.3 34.3)"/><rect x="67.8" y="40.1" width="8" height="8" rx="1.5" transform="rotate(324 71.8 44.1)"/></g>
+      <circle cx="50" cy="60" r="23" fill="#efe4c8"/>
+      <path d="M33 50 H67 M29 60 H71 M33 70 H67" stroke-width="3.5"/>
+      <circle cx="50" cy="60" r="5" fill="#b8892f" stroke-width="3"/>
+      <path d="M84 100 C84 80 82 60 80 36" fill="none" stroke-width="5"/>
+      <g fill="#b8892f" stroke-width="3">
+        <ellipse cx="80" cy="28" rx="4" ry="7"/>
+        <ellipse cx="74" cy="40" rx="4" ry="7" transform="rotate(-30 74 40)"/>
+        <ellipse cx="87" cy="42" rx="4" ry="7" transform="rotate(30 87 42)"/>
+        <ellipse cx="75" cy="53" rx="4" ry="7" transform="rotate(-30 75 53)"/>
+        <ellipse cx="88" cy="55" rx="4" ry="7" transform="rotate(30 88 55)"/>
+      </g>
+    </g>
+  </symbol>
+
   <!-- ribbon banner -->
   <symbol id="ribbon" viewBox="0 0 240 56">
     <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="3.5" stroke-linejoin="round">
@@ -226,13 +248,14 @@ details .pbox { padding: 14px; gap: 14px; }
   <header class="hero">
     <p class="eyebrow">Arms of the Workflow Guild</p>
     <h1>The Workflow Guild</h1>
-    <p class="sub">Five deterministic tools, five crests, one very proud bard.</p>
-    <nav class="row" aria-label="The five crests">
+    <p class="sub">Six deterministic tools, six crests, one very proud bard.</p>
+    <nav class="row" aria-label="The six crests">
       <a href="#quartermaster"><svg viewBox="0 0 120 124" role="img" aria-label="quartermaster"><use href="#g-qm"/></svg><span>quartermaster</span></a>
       <a href="#conclave"><svg viewBox="0 0 120 124" role="img" aria-label="conclave"><use href="#g-cv"/></svg><span>conclave</span></a>
       <a href="#bridgekeeper"><svg viewBox="0 0 120 124" role="img" aria-label="bridgekeeper"><use href="#g-bk"/></svg><span>bridgekeeper</span></a>
       <a href="#bopeep"><svg viewBox="0 0 120 124" role="img" aria-label="bopeep"><use href="#g-bp"/></svg><span>bopeep</span></a>
       <a href="#orderly"><svg viewBox="0 0 120 124" role="img" aria-label="orderly"><use href="#g-or"/></svg><span>orderly</span></a>
+      <a href="#thresher"><svg viewBox="0 0 120 124" role="img" aria-label="thresher"><use href="#g-th"/></svg><span>thresher</span></a>
     </nav>
   </header>
 
@@ -257,7 +280,7 @@ details .pbox { padding: 14px; gap: 14px; }
     <div style="display:grid;gap:6px">
       <p class="eyebrow">Prompt pack</p>
       <h2>Painting the full crests</h2>
-      <p>The glyphs above are the small marks. The character crests come from an image model, and this is how to keep five of them looking like one set.</p>
+      <p>The glyphs above are the small marks. The character crests come from an image model, and this is how to keep six of them looking like one set.</p>
     </div>
     <ol class="howto">
       <li><strong>Generate the first crest</strong> with the full prompt below. Pick conclave first: it has the most figures, so it sets the hardest style.</li>
@@ -301,7 +324,12 @@ const REPOS = [
     glyph: "Bell",
     does: "The orderly room board: the day's business on a browser new-tab page.",
     motto: "Audite, audite", tr: "Hear ye, hear ye",
-    scene: "a skinny herald ringing a hand bell while nailing yet another notice to an overstuffed notice board in a castle's orderly room; notices flutter off the board; he wears a small nurse's cap with a firm red X painted over it" }
+    scene: "a skinny herald ringing a hand bell while nailing yet another notice to an overstuffed notice board in a castle's orderly room; notices flutter off the board; he wears a small nurse's cap with a firm red X painted over it" },
+  { id: "thresher", g: "g-th", tinct: "Tenné", hex: "#b5602a",
+    glyph: "Drum and wheat",
+    does: "Harvests small, well-sourced tasks from review leftovers and backlogs, winnows out the chaff, and turns each sheaf into a tiny PR.",
+    motto: "Triticum a palea", tr: "The wheat from the chaff",
+    scene: "an original clockwork thresher-golem: a squat, riveted barrel body in rust and brass with one glowing amber eye, a spinning drum of flail arms on its front, clean wheat pouring out of a chute on one side into a tidy sack while a cloud of chaff and crumpled scraps blows out of the other side across a stubble field at harvest dusk" }
 ];
 
 const fullPrompt = r => `Cartoon heraldic crest, hand-inked with thick, wobbly black brush outlines and crosshatch shading, like a woodcut drawn for a humorous fantasy card game. Strictly limited palette: parchment cream (${BASE.parchment}), ink black (${BASE.ink}), tarnished gold (${BASE.gold}), and one field color, ${r.tinct.toLowerCase()} (${r.hex}). Flat fills, no gradients, no photorealism, no extra colors. A lumpy shield centered on a plain parchment background, with an empty ribbon banner curling beneath it. Inside the shield: ${r.scene}. The tone is a bard's comic ballad: earnest and slightly ridiculous. Original characters only. No text, letters or numbers anywhere in the image. Square image.`;

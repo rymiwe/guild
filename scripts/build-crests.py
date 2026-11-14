@@ -5,7 +5,7 @@ root = pathlib.Path(__file__).resolve().parent.parent
 src = (root / "index.html").read_text()
 out = root / "crests"
 defs = re.search(r'<defs>(.*?)</defs>', src, re.S).group(1)
-for sym, name in [("g-qm","quartermaster"),("g-cv","conclave"),("g-bk","bridgekeeper"),("g-bp","bopeep"),("g-or","orderly")]:
+for sym, name in [("g-qm","quartermaster"),("g-cv","conclave"),("g-bk","bridgekeeper"),("g-bp","bopeep"),("g-or","orderly"),("g-th","thresher")]:
     body = re.search(r'<symbol id="%s" viewBox="0 0 120 124">(.*?)</symbol>' % sym, src, re.S).group(1)
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 120 124" width="160" height="165">\n'
            f'<title>{name}</title>\n<defs>{defs}</defs>{body}</svg>\n')
