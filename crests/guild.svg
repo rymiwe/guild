@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 120 124" width="160" height="165">
+<title>guild</title>
+<defs>
+    <filter id="wobble" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="2" seed="7" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="3.2"/>
+    </filter>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="none"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#1d1a16" stroke-width="1.6" opacity=".55"/>
+    </pattern>
+    <path id="shieldPath" d="M18 14 C40 10 80 10 102 14 L102 58 C102 86 84 102 60 114 C36 102 18 86 18 58 Z"/>
+  </defs>
+    <g filter="url(#wobble)" stroke="#1d1a16" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round">
+      <use xlink:href="#shieldPath" fill="#b8892f"/>
+      <path d="M60 114 C84 102 102 86 102 58 L102 14 L80 12 L80 100 Z" fill="url(#hatch)" stroke="none"/>
+      <use xlink:href="#shieldPath" fill="none"/>
+      <path d="M36 92 V44 H43 V34 H51 V44 H56 V34 H64 V44 H69 V34 H77 V44 H84 V92 Z" fill="#efe4c8"/>
+      <path d="M52 92 V72 C52 64 68 64 68 72 V92 Z" fill="#1d1a16"/>
+      <rect x="44" y="52" width="8" height="10" rx="1" fill="#1d1a16" stroke-width="3"/>
+      <rect x="68" y="52" width="8" height="10" rx="1" fill="#1d1a16" stroke-width="3"/>
+      <line x1="60" y1="34" x2="60" y2="14" stroke-width="3.5"/>
+      <path d="M60 14 L76 19 L60 24 Z" fill="#a8322d" stroke-width="3"/>
+    </g>
+  </svg>
