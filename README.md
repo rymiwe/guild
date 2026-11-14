@@ -6,10 +6,10 @@
   <tr>
     <td align="center"><a href="https://github.com/rymiwe/quartermaster"><img src="crests/quartermaster.svg" width="96" alt="quartermaster crest: an abacus on a red shield"><br><b>quartermaster</b></a></td>
     <td align="center"><a href="https://github.com/rymiwe/conclave"><img src="crests/conclave.svg" width="96" alt="conclave crest: a gavel on a purple shield"><br><b>conclave</b></a></td>
-    <td align="center"><img src="crests/bridgekeeper.svg" width="96" alt="bridgekeeper crest: a lantern on a blue shield"><br><b>bridgekeeper</b></td>
-    <td align="center"><img src="crests/bopeep.svg" width="96" alt="bopeep crest: a crook on a green shield"><br><b>bopeep</b></td>
+    <td align="center"><a href="https://github.com/rymiwe/bridgekeeper"><img src="crests/bridgekeeper.svg" width="96" alt="bridgekeeper crest: a lantern on a blue shield"><br><b>bridgekeeper</b></a></td>
+    <td align="center"><a href="https://github.com/rymiwe/bopeep"><img src="crests/bopeep.svg" width="96" alt="bopeep crest: a crook on a green shield"><br><b>bopeep</b></a></td>
     <td align="center"><a href="https://github.com/rymiwe/orderly"><img src="crests/orderly.svg" width="96" alt="orderly crest: a gold bell on a black shield"><br><b>orderly</b></a></td>
-    <td align="center"><img src="crests/thresher.svg" width="96" alt="thresher crest: a gear-toothed drum and a wheat stalk on a tenné shield"><br><b>thresher</b></td>
+    <td align="center"><a href="https://github.com/rymiwe/thresher"><img src="crests/thresher.svg" width="96" alt="thresher crest: a gear-toothed drum and a wheat stalk on a tenné shield"><br><b>thresher</b></a></td>
   </tr>
 </table>
 
@@ -17,10 +17,10 @@
 | --- | --- | --- |
 | [quartermaster](https://github.com/rymiwe/quartermaster) | Reads every seat's usage pools and routes work to whichever has headroom. | *Rationes finitae sunt*: the rations are finite |
 | [conclave](https://github.com/rymiwe/conclave) | Seats a council of model voters on a brief; a judge returns one decision. | *Quot capita, tot sententiae*: as many heads, as many opinions |
-| bridgekeeper (private) | Hooks and gates on every step that leaves the machine: push, PR ready, review post and merge. | *Thou shalt not push* |
-| bopeep (private) | Shepherds every open pull request, yours and your team's, to its next step, and merges the safe ones. | *They will NOT come home on their own* |
+| [bridgekeeper](https://github.com/rymiwe/bridgekeeper) (private) | Hooks and gates on every step that leaves the machine: push, PR ready, review post and merge. | *Thou shalt not push* |
+| [bopeep](https://github.com/rymiwe/bopeep) (private) | Shepherds every open pull request, yours and your team's, to its next step, and merges the safe ones. | *They will NOT come home on their own* |
 | [orderly](https://github.com/rymiwe/orderly) | The orderly room board: the day's business on a browser new-tab page. | *Audite, audite*: hear ye, hear ye |
-| thresher (private) | Harvests small, sourced tasks from review leftovers and backlogs, winnows out the chaff, and turns each sheaf into a tiny PR. | *Triticum a palea*: the wheat from the chaff |
+| [thresher](https://github.com/rymiwe/thresher) (private) | Harvests small, sourced tasks from review leftovers and backlogs, winnows out the chaff, and turns each sheaf into a tiny PR. | *Triticum a palea*: the wheat from the chaff |
 
 ## The style sheet
 
