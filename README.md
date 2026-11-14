@@ -20,7 +20,7 @@
 | bridgekeeper (private) | Hooks and gates on every step that leaves the machine: push, PR ready, review post and merge. | *Thou shalt not push* |
 | bopeep (private) | Shepherds every open pull request, yours and your team's, to its next step, and merges the safe ones. | *They will NOT come home on their own* |
 | [orderly](https://github.com/rymiwe/orderly) | The orderly room board: the day's business on a browser new-tab page. | *Audite, audite*: hear ye, hear ye |
-| thresher (not yet published) | Harvests small, sourced tasks from review leftovers and backlogs, winnows out the chaff, and turns each sheaf into a tiny PR. | *Triticum a palea*: the wheat from the chaff |
+| thresher (private) | Harvests small, sourced tasks from review leftovers and backlogs, winnows out the chaff, and turns each sheaf into a tiny PR. | *Triticum a palea*: the wheat from the chaff |
 
 ## The style sheet
 
