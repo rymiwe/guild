@@ -1,0 +1,8 @@
+# Guild tools, one per line. bopeep sync fast-forwards each ~/code/<name>
+# after this repo, and runs its install.sh --check when it has one.
+quartermaster
+conclave
+bridgekeeper
+bopeep
+orderly
+thresher
