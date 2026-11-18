@@ -1,0 +1,1300 @@
+#!/usr/bin/env python3
+"""Prepare, verify, atomically switch, and roll back pinned Guild releases.
+
+Release layout under --root:
+  <root>/
+    current -> releases/<id>       single active pointer (atomic symlink)
+    previous -> releases/<prev>    prior active release retained for rollback
+    releases/
+      <id>/
+        pins.json                  exact 40-hex commit SHAs for member repos
+        manifest.json              release metadata, commands, hooks, check status
+        code/<member>/             clean git checkouts at pinned commits
+        .local/bin/...             member install.sh wrappers (--check verified)
+        .claude/...                member install.sh hooks and skills
+        .config/...                member install.sh systemd units
+        bin/<cmd>                  release-bound launchers + guild-exec
+        hooks/<hook>               release-bound hook launchers
+
+Machine configuration, credentials, and live state (e.g. ~/.config/work-account,
+.guild.json, bopeep.state_dir) always stay outside release directories.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PINS_FILE = REPO_ROOT / "tests" / "member-pins.json"
+REQUIRED_MEMBERS = ("quartermaster", "bridgekeeper", "bopeep", "conclave")
+INSTALL_ORDER = ("quartermaster", "bridgekeeper", "bopeep", "conclave")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+WRAPPER_LINE_RE = re.compile(
+    r'^exec guild-exec ([A-Za-z0-9._-]+) ([^\s"]+) "\$@" ?$'
+)
+
+
+class ReleaseError(RuntimeError):
+    """Fail-closed error during release preparation, check, switch, or rollback."""
+
+
+def real_home() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+
+
+def find_system_git() -> str:
+    for candidate in ("/usr/bin/git", "/bin/git"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("git")
+    if not found:
+        raise ReleaseError("git is not installed")
+    return found
+
+
+def build_clean_path(*extra_dirs: Path) -> str:
+    home = real_home()
+    dirs: list[str] = [str(d) for d in extra_dirs]
+    py_dir = str(Path(sys.executable).resolve().parent)
+    for base in (py_dir, "/usr/local/bin", "/usr/bin", "/bin"):
+        resolved = Path(base).resolve()
+        if home == resolved or home in resolved.parents:
+            continue
+        if base not in dirs:
+            dirs.append(base)
+    return os.pathsep.join(dirs)
+
+
+def clean_git_env(home_dir: Path) -> dict[str, str]:
+    return {
+        "PATH": build_clean_path(),
+        "HOME": str(home_dir),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_AUTHOR_NAME": "Guild Release",
+        "GIT_AUTHOR_EMAIL": "guild-release@example.invalid",
+        "GIT_COMMITTER_NAME": "Guild Release",
+        "GIT_COMMITTER_EMAIL": "guild-release@example.invalid",
+    }
+
+
+def run_git(
+    system_git: str,
+    git_env: dict[str, str],
+    *args: str,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [system_git, *args],
+            cwd=str(cwd) if cwd else None,
+            env=git_env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise ReleaseError(f"git {' '.join(args)} failed: {detail}") from exc
+
+
+def load_pins(pins_path: Path) -> dict[str, str]:
+    if not pins_path.is_file():
+        raise ReleaseError(f"pins file not found: {pins_path}")
+    try:
+        raw = json.loads(pins_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"cannot parse pins file {pins_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ReleaseError(f"pins file {pins_path} must be a JSON object")
+
+    pins: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not RELEASE_ID_RE.match(k) or k in (".", ".."):
+            raise ReleaseError(f"invalid member name in {pins_path}: {k!r}")
+        if not isinstance(v, str) or not SHA_RE.match(v):
+            raise ReleaseError(f"invalid 40-hex commit SHA for {k} in {pins_path}: {v!r}")
+        pins[k] = v
+
+    for req in REQUIRED_MEMBERS:
+        if req not in pins:
+            raise ReleaseError(f"pins file {pins_path} missing required member {req!r}")
+    return pins
+
+
+def pins_digest(pins: dict[str, str]) -> str:
+    canonical = json.dumps(pins, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:8]
+
+
+def validate_release_id(release_id: str) -> str:
+    if not release_id or release_id in (".", "..") or not RELEASE_ID_RE.match(release_id):
+        raise ReleaseError(f"invalid release id: {release_id!r}")
+    return release_id
+
+
+def choose_release_id(root: Path, pins: dict[str, str], requested: str | None) -> str:
+    if requested is not None:
+        rid = validate_release_id(requested)
+        if (root / "releases" / rid).exists() or (root / "releases" / rid).is_symlink():
+            raise ReleaseError(f"release {rid!r} already exists under {root / 'releases'}")
+        return rid
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{stamp}-{pins_digest(pins)}"
+    rid = base
+    suffix = 2
+    while (root / "releases" / rid).exists() or (root / "releases" / rid).is_symlink():
+        rid = f"{base}-{suffix}"
+        suffix += 1
+    return rid
+
+
+def atomic_symlink(link_path: Path, target: str) -> None:
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{link_path.name}.tmp.", dir=str(link_path.parent))
+    os.close(fd)
+    os.unlink(tmp_name)
+    tmp_path = Path(tmp_name)
+    try:
+        os.symlink(target, tmp_path)
+        os.replace(tmp_path, link_path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def read_pointer_id(root: Path, pointer_name: str) -> str | None:
+    ptr = root / pointer_name
+    if not ptr.is_symlink():
+        if ptr.exists():
+            raise ReleaseError(f"{ptr} exists and is not a symlink")
+        return None
+    resolved = ptr.resolve()
+    releases_dir = (root / "releases").resolve()
+    if resolved.parent != releases_dir or not resolved.is_dir():
+        raise ReleaseError(f"{ptr} points outside {releases_dir}: {os.readlink(ptr)}")
+    return resolved.name
+
+
+def resolve_sources_dir(sources_dir: Path | None) -> Path:
+    if sources_dir is not None:
+        return sources_dir.resolve()
+    env_dir = os.environ.get("GUILD_MEMBER_SOURCES_DIR")
+    if env_dir:
+        return Path(env_dir).resolve()
+    return (real_home() / "code").resolve()
+
+
+def resolve_pstack_dir(pstack_home: Path | None) -> Path | None:
+    candidates: list[Path] = []
+    if pstack_home is not None:
+        candidates.append(pstack_home.resolve())
+    elif os.environ.get("PSTACK_HOME"):
+        candidates.append(Path(os.environ["PSTACK_HOME"]).resolve())
+    else:
+        candidates.append((real_home() / "code" / "cursor-plugins" / "pstack").resolve())
+
+    for cand in candidates:
+        if (cand / "skills" / "poteto-mode" / "SKILL.md").is_file():
+            return cand
+    return None
+
+
+def materialize_member_checkouts(
+    staging: Path,
+    pins: dict[str, str],
+    sources_dir: Path,
+    system_git: str,
+    git_env: dict[str, str],
+) -> None:
+    code_dir = staging / "code"
+    origins_dir = staging / ".origins"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    origins_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for name, expected_sha in pins.items():
+            src = sources_dir / name
+            if not src.is_dir():
+                raise ReleaseError(f"missing member source checkout for {name}: {src}")
+            obj_type = run_git(
+                system_git, git_env, "-C", str(src), "cat-file", "-t", expected_sha
+            ).stdout.strip()
+            if obj_type != "commit":
+                raise ReleaseError(f"{name}@{expected_sha} is {obj_type!r}, expected commit")
+
+            dest = code_dir / name
+            is_shallow = run_git(
+                system_git, git_env, "-C", str(src), "rev-parse", "--is-shallow-repository"
+            ).stdout.strip()
+            if is_shallow == "true":
+                shutil.copytree(src, dest, symlinks=True)
+                run_git(system_git, git_env, "-C", str(dest), "reset", "--hard", "-q", expected_sha)
+                run_git(system_git, git_env, "-C", str(dest), "clean", "-fdq")
+                run_git(
+                    system_git, git_env, "-C", str(dest), "checkout", "-q", "-B", "main", expected_sha
+                )
+                run_git(
+                    system_git,
+                    git_env,
+                    "-C",
+                    str(dest),
+                    "update-ref",
+                    "refs/remotes/origin/main",
+                    expected_sha,
+                )
+                run_git(
+                    system_git,
+                    git_env,
+                    "-C",
+                    str(dest),
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                )
+            else:
+                bare = origins_dir / f"{name}.git"
+                run_git(system_git, git_env, "init", "-q", "--bare", "-b", "main", str(bare))
+                run_git(
+                    system_git,
+                    git_env,
+                    "-C",
+                    str(src),
+                    "push",
+                    "-q",
+                    str(bare),
+                    f"{expected_sha}:refs/heads/main",
+                )
+                run_git(system_git, git_env, "clone", "-q", str(bare), str(dest))
+                run_git(
+                    system_git,
+                    git_env,
+                    "-C",
+                    str(dest),
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                )
+
+            verify_member_checkout(dest, name, expected_sha, system_git, git_env)
+    finally:
+        shutil.rmtree(origins_dir, ignore_errors=True)
+
+
+def verify_member_checkout(
+    repo_dir: Path,
+    name: str,
+    expected_sha: str,
+    system_git: str,
+    git_env: dict[str, str],
+) -> None:
+    if not repo_dir.is_dir():
+        raise ReleaseError(f"missing member checkout {repo_dir}")
+    actual_sha = run_git(system_git, git_env, "-C", str(repo_dir), "rev-parse", "HEAD").stdout.strip()
+    if actual_sha != expected_sha:
+        raise ReleaseError(f"{name}: checked out {actual_sha}, expected {expected_sha}")
+    branch = run_git(
+        system_git, git_env, "-C", str(repo_dir), "branch", "--show-current"
+    ).stdout.strip()
+    ref = run_git(
+        system_git, git_env, "-C", str(repo_dir), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"
+    ).stdout.strip()
+    default_branch = ref.removeprefix("origin/")
+    if branch != default_branch:
+        raise ReleaseError(f"{name}: on branch {branch!r}, expected {default_branch!r}")
+    dirty = run_git(
+        system_git, git_env, "-C", str(repo_dir), "status", "--porcelain", "-uno"
+    ).stdout.strip()
+    if dirty:
+        raise ReleaseError(f"{name}: expected clean checkout, got:\n{dirty}")
+
+
+def bundle_pstack(staging: Path, pstack_src: Path | None) -> Path | None:
+    if pstack_src is None:
+        return None
+    plugins_dir = staging / "code" / "cursor-plugins"
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    dest_pstack = plugins_dir / "pstack"
+    shutil.copytree(pstack_src, dest_pstack, symlinks=True)
+
+    kit_src = pstack_src.parent / "cursor-team-kit"
+    if (kit_src / "skills" / "deslop" / "SKILL.md").is_file():
+        shutil.copytree(kit_src, plugins_dir / "cursor-team-kit", symlinks=True)
+    return dest_pstack
+
+
+def member_install_order(pins: dict[str, str]) -> list[str]:
+    ordered = [m for m in INSTALL_ORDER if m in pins]
+    for m in sorted(pins):
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
+def run_member_installers(
+    release_dir: Path,
+    pins: dict[str, str],
+    git_env: dict[str, str],
+    *,
+    check_only: bool = False,
+) -> None:
+    install_env = {
+        **git_env,
+        "HOME": str(release_dir),
+        "PATH": build_clean_path(release_dir / ".local" / "bin"),
+    }
+    bundled_pstack = release_dir / "code" / "cursor-plugins" / "pstack"
+    if (bundled_pstack / "skills" / "poteto-mode" / "SKILL.md").is_file():
+        install_env["PSTACK_HOME"] = str(bundled_pstack)
+
+    for tool in member_install_order(pins):
+        installer = release_dir / "code" / tool / "install.sh"
+        if not installer.is_file():
+            continue
+        if not check_only:
+            cp = subprocess.run(
+                ["bash", str(installer), "--prefix", str(release_dir)],
+                env=install_env,
+                text=True,
+                capture_output=True,
+            )
+            if cp.returncode != 0:
+                raise ReleaseError(
+                    f"{tool}/install.sh failed ({cp.returncode}):\n{cp.stdout}\n{cp.stderr}"
+                )
+        chk = subprocess.run(
+            ["bash", str(installer), "--prefix", str(release_dir), "--check"],
+            env=install_env,
+            text=True,
+            capture_output=True,
+        )
+        if chk.returncode != 0:
+            raise ReleaseError(
+                f"{tool}/install.sh --check failed ({chk.returncode}):\n{chk.stdout}\n{chk.stderr}"
+            )
+
+
+def parse_wrapper(path: Path) -> tuple[str, str]:
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseError(f"expected regular wrapper file at {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) != 2 or lines[0] != "#!/bin/sh":
+        raise ReleaseError(f"unexpected wrapper format in {path}: {lines!r}")
+    m = WRAPPER_LINE_RE.match(lines[1])
+    if not m:
+        raise ReleaseError(f"unexpected guild-exec line in {path}: {lines[1]!r}")
+    return m.group(1), m.group(2)
+
+
+RELEASE_GUILD_EXEC = """#!/usr/bin/env bash
+# Run a script from this concrete pinned Guild release. Fails closed.
+# usage: guild-exec TOOL PATH [ARG...]
+set -u
+
+prog=guild-exec
+
+usage() {
+  printf 'usage: %s TOOL PATH [ARG...]\\n' "$prog" >&2
+  exit 2
+}
+
+refuse() {
+  printf '%s: %s\\n' "$prog" "$*" >&2
+  exit 3
+}
+
+[ $# -ge 2 ] || usage
+tool=$1
+path=$2
+shift 2
+
+case $tool in
+  ''|.*|*/*|*[!A-Za-z0-9._-]*) usage ;;
+esac
+case $path in
+  ''|/*|..|../*|*/..|*/../*) usage ;;
+esac
+
+self=$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0") ||
+  refuse "cannot resolve $0"
+bindir=$(dirname -- "$self")
+release_dir=$(dirname -- "$bindir")
+
+[ -f "$release_dir/pins.json" ] ||
+  refuse "missing $release_dir/pins.json"
+
+repo=$release_dir/code/$tool
+
+[ -z "${GUILD_EXEC_IN_CHECK-}" ] ||
+  refuse "git for the checkout checks resolved to a guild-exec wrapper; put the system git first on PATH"
+real_git=
+for g in /usr/bin/git /bin/git; do
+  [ -x "$g" ] && { real_git=$g; break; }
+done
+[ -n "$real_git" ] || real_git=$(command -v git) || refuse "git is not installed"
+checkout_git() {
+  GUILD_EXEC_IN_CHECK=1 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \\
+    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE \\
+    -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX -u GIT_CONFIG_PARAMETERS \\
+    -u GIT_CONFIG_COUNT GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "$real_git" "$@"
+}
+
+top=$(checkout_git -C "$repo" rev-parse --show-toplevel 2>/dev/null) ||
+  refuse "$repo is not a git checkout"
+[ "$top" = "$(cd "$repo" && pwd -P)" ] ||
+  refuse "$repo is not the top of a checkout (top is $top)"
+
+ref=$(checkout_git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null) ||
+  refuse "$repo has no origin/HEAD"
+default=${ref#origin/}
+
+branch=$(checkout_git -C "$repo" branch --show-current 2>/dev/null)
+if [ "$branch" != "$default" ]; then
+  refuse "$repo is on ${branch:-a detached HEAD}, not $default"
+fi
+
+head_sha=$(checkout_git -C "$repo" rev-parse HEAD 2>/dev/null) ||
+  refuse "cannot read HEAD of $repo"
+pinned_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], ""))' "$release_dir/pins.json" "$tool" 2>/dev/null) ||
+  refuse "cannot read pin for $tool from $release_dir/pins.json"
+[ -n "$pinned_sha" ] || refuse "no pin for $tool in $release_dir/pins.json"
+[ "$head_sha" = "$pinned_sha" ] ||
+  refuse "$repo is at $head_sha, expected pinned $pinned_sha"
+
+dirty=$(checkout_git -C "$repo" status --porcelain -uno 2>/dev/null) ||
+  refuse "cannot read the status of $repo"
+if [ -n "$dirty" ]; then
+  refuse "$repo has uncommitted changes to tracked files:
+$dirty"
+fi
+
+target=$repo/$path
+[ -f "$target" ] && [ -x "$target" ] ||
+  refuse "$target is not an executable file on $default"
+
+export GUILD_RELEASE_DIR=$release_dir
+export CONCLAVE_HOME=$release_dir/code/conclave
+export BRIDGEKEEPER_HOME=$release_dir/code/bridgekeeper
+export BOPEEP_HOME=$release_dir/code/bopeep
+export QUARTERMASTER_HOME=$release_dir/code/quartermaster
+if [ -d "$release_dir/code/cursor-plugins/pstack" ]; then
+  export PSTACK_HOME=$release_dir/code/cursor-plugins/pstack
+fi
+case ":${PATH-}:" in
+  ":$bindir:"*) ;;
+  *) export PATH="$bindir${PATH:+:$PATH}" ;;
+esac
+
+exec "$target" "$@"
+"""
+
+
+def launcher_script(tool: str, relpath: str) -> str:
+    return (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'self=$(readlink -f "$0" 2>/dev/null || '
+        "python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \"$0\")\n"
+        'release_dir=$(dirname -- "$(dirname -- "$self")")\n'
+        f'exec "$release_dir/bin/guild-exec" {tool} {relpath} "$@"\n'
+    )
+
+
+def build_release_entrypoints(release_dir: Path, pins: dict[str, str]) -> dict[str, Any]:
+    local_bin = release_dir / ".local" / "bin"
+    local_hooks = release_dir / ".claude" / "hooks"
+    bin_dir = release_dir / "bin"
+    hooks_dir = release_dir / "hooks"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    gx = bin_dir / "guild-exec"
+    gx.write_text(RELEASE_GUILD_EXEC, encoding="utf-8")
+    gx.chmod(0o755)
+
+    commands: dict[str, dict[str, str]] = {}
+    if local_bin.is_dir():
+        for entry in sorted(local_bin.iterdir()):
+            if entry.name == "guild-exec":
+                continue
+            tool, relpath = parse_wrapper(entry)
+            if tool not in pins:
+                raise ReleaseError(f"{entry} references unpinned tool {tool!r}")
+            dest = bin_dir / entry.name
+            dest.write_text(launcher_script(tool, relpath), encoding="utf-8")
+            dest.chmod(0o755)
+            commands[entry.name] = {"tool": tool, "path": relpath}
+
+    hooks: dict[str, dict[str, str]] = {}
+    if local_hooks.is_dir():
+        for entry in sorted(local_hooks.iterdir()):
+            tool, relpath = parse_wrapper(entry)
+            if tool not in pins:
+                raise ReleaseError(f"{entry} references unpinned tool {tool!r}")
+            dest = hooks_dir / entry.name
+            dest.write_text(launcher_script(tool, relpath), encoding="utf-8")
+            dest.chmod(0o755)
+            hooks[entry.name] = {"tool": tool, "path": relpath}
+
+    return {"commands": commands, "hooks": hooks}
+
+
+STUB_GH = """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+scenario = json.loads(Path(os.environ["SYNTHETIC_GH_SCENARIO"]).read_text(encoding="utf-8"))
+args = sys.argv[1:]
+
+
+def fail(msg: str) -> None:
+    print(f"synthetic-gh error: {msg}: {args!r}", file=sys.stderr)
+    sys.exit(97)
+
+
+if args[:2] == ["pr", "view"]:
+    print(json.dumps(scenario["pr_view"]))
+    sys.exit(0)
+
+if args[:2] == ["pr", "checks"]:
+    print(json.dumps(scenario["pr_checks"]))
+    sys.exit(0)
+
+if args[:1] == ["api"]:
+    rest = args[1:]
+    slurp = "--slurp" in rest
+    flags_with_val = {"-f", "-F", "--jq"}
+    positional = []
+    vars_map = {}
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("--paginate", "--slurp"):
+            i += 1
+        elif tok in flags_with_val:
+            if i + 1 >= len(rest):
+                fail("missing value for flag")
+            val = rest[i + 1]
+            if tok in ("-f", "-F") and "=" in val:
+                k, v = val.split("=", 1)
+                vars_map[k] = v
+            i += 2
+        elif tok.startswith("-"):
+            fail(f"unsupported flag {tok}")
+        else:
+            positional.append(tok)
+            i += 1
+    if not positional:
+        fail("missing api endpoint")
+    endpoint = positional[0].split("?", 1)[0]
+
+    repo = scenario["repo"]
+    pr = scenario["pr"]
+    if endpoint == f"repos/{repo}/pulls/{pr}/files":
+        print(json.dumps(scenario["files"]))
+        sys.exit(0)
+    if endpoint == f"repos/{repo}/issues/{pr}/comments":
+        comments = scenario["comments"]
+        print(json.dumps([comments] if slurp else comments))
+        sys.exit(0)
+    if endpoint == f"repos/{repo}/actions/workflows/claude.yml/runs":
+        print(json.dumps(scenario["workflow_runs"]))
+        sys.exit(0)
+    if endpoint == f"repos/{repo}/pulls/{pr}/commits":
+        print(json.dumps(scenario["commits"]))
+        sys.exit(0)
+    if endpoint == "graphql":
+        q = vars_map.get("query", "")
+        if "reviewDecision" in q:
+            print(json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewDecision": scenario["pr_view"]["reviewDecision"],
+            }}}}))
+            sys.exit(0)
+        if "reviewThreads" in q:
+            print(json.dumps({"data": {"repository": {"pullRequest": {
+                "number": pr,
+                "state": scenario["pr_view"]["state"],
+                "isDraft": scenario["pr_view"]["isDraft"],
+                "baseRefName": scenario["pr_view"]["baseRefName"],
+                "headRefName": scenario["pr_view"]["headRefName"],
+                "headRefOid": scenario["pr_view"]["headRefOid"],
+                "mergedAt": None,
+                "author": scenario["pr_view"]["author"],
+                "reviewThreads": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": scenario["review_threads"],
+                },
+            }}}}))
+            sys.exit(0)
+        if "commits(first:100" in q:
+            print(json.dumps({"data": {"repository": {"pullRequest": {
+                "commits": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{"commit": {"oid": scenario["pr_view"]["headRefOid"]}}],
+                },
+            }}}}))
+            sys.exit(0)
+        if "reviews(first:100" in q:
+            print(json.dumps({"data": {"repository": {"pullRequest": {
+                "reviews": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [],
+                },
+            }}}}))
+            sys.exit(0)
+        if "comments(first:100" in q:
+            print(json.dumps({"data": {"repository": {"pullRequest": {
+                "comments": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [],
+                },
+            }}}}))
+            sys.exit(0)
+        fail(f"unexpected graphql query: {q[:120]}")
+
+fail("unexpected gh command")
+"""
+
+STUB_COMMIT_LINT = """#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:2] and args[0] == "--ticket":
+    args = args[2:]
+if args == ["-"]:
+    msg = sys.stdin.read()
+elif len(args) >= 2 and args[0] == "--subject":
+    msg = args[1]
+elif len(args) == 1:
+    msg = Path(args[0]).read_text(encoding="utf-8")
+else:
+    print(f"usage error: {sys.argv[1:]}", file=sys.stderr)
+    sys.exit(2)
+
+subject = msg.splitlines()[0] if msg.splitlines() else ""
+if not subject or len(subject) > 50 or subject.endswith(".") or not subject[0].isupper():
+    print(f"FAIL subject: {subject!r}")
+    sys.exit(1)
+print("PASS subject")
+"""
+
+
+def verify_release_contract(release_dir: Path) -> None:
+    """Run the installed cross-repo pr-gate contract check against release_dir."""
+    system_git = find_system_git()
+    with tempfile.TemporaryDirectory(prefix="guild-release-check-") as tmp_str:
+        tmp = Path(tmp_str).resolve()
+        user_home = tmp / "user-home"
+        user_home.mkdir(parents=True)
+        git_env = clean_git_env(user_home)
+
+        work_root = tmp / "work"
+        state_dir = work_root / "state"
+        (state_dir / "autonomy-gates.d").mkdir(parents=True)
+        (work_root / "gnupg").mkdir(parents=True)
+        (state_dir / "pr-grant.md").write_text("Status: GRANTED\n", encoding="utf-8")
+
+        guild_cfg = {
+            "github_owner": "AcmeCorp",
+            "default_repo": "AcmeCorp/widgets",
+            "author_logins": ["acme-author"],
+            "author_emails": ["author@acme.example"],
+            "author_personal_emails": ["author@home.example"],
+            "persona_names": ["Robo", "Helper"],
+            "bopeep": {
+                "state_dir": str(state_dir),
+                "gate_prefix": "acme-",
+                "commands": {
+                    "commit_lint": "acme-commit-lint",
+                    "notify": "acme-notify",
+                },
+                "signatures": {
+                    "signing_fpr": "0123456789ABCDEF0123456789ABCDEF01234567",
+                    "gnupg_home": str(work_root / "gnupg"),
+                },
+                "pr_gate": {
+                    "ci_review_checks": ["danger/widgets", "review / Bot Review"],
+                },
+                "ready_review_gate": {
+                    "review_skill": "acme-tools:review-work",
+                },
+            },
+        }
+        (work_root / ".guild.json").write_text(json.dumps(guild_cfg, indent=2) + "\n", encoding="utf-8")
+
+        work_account_cfg = tmp / "work-account.json"
+        work_account_cfg.write_text(
+            json.dumps({
+                "work_path_prefixes": [str(work_root)],
+                "work_github_owners": ["AcmeCorp"],
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        widgets_origin = tmp / "widgets.git"
+        run_git(system_git, git_env, "init", "-q", "--bare", "-b", "main", str(widgets_origin))
+        repo_dir = work_root / "widgets"
+        run_git(system_git, git_env, "clone", "-q", str(widgets_origin), str(repo_dir))
+        (repo_dir / "README.md").write_text("# widgets\n", encoding="utf-8")
+        run_git(system_git, git_env, "add", "README.md", cwd=repo_dir)
+        run_git(system_git, git_env, "commit", "-qm", "Initial widgets commit", cwd=repo_dir)
+        run_git(system_git, git_env, "push", "-q", "origin", "HEAD:main", cwd=repo_dir)
+
+        run_git(system_git, git_env, "checkout", "-qb", "feat/contract", cwd=repo_dir)
+        (repo_dir / "src").mkdir()
+        (repo_dir / "src" / "widget.py").write_text("x = 1\n", encoding="utf-8")
+        run_git(system_git, git_env, "add", "src/widget.py", cwd=repo_dir)
+        run_git(
+            system_git,
+            git_env,
+            "commit",
+            "-q",
+            "-m",
+            "Add widget gate contract\n\nFixed: test widget gate contract",
+            cwd=repo_dir,
+        )
+        run_git(system_git, git_env, "push", "-q", "origin", "HEAD:feat/contract", cwd=repo_dir)
+        head_sha = run_git(system_git, git_env, "-C", str(repo_dir), "rev-parse", "HEAD").stdout.strip()
+
+        stub_bin = tmp / "stub-bin"
+        stub_bin.mkdir(parents=True)
+        gh_bin = stub_bin / "gh"
+        gh_bin.write_text(STUB_GH, encoding="utf-8")
+        gh_bin.chmod(0o755)
+        commit_lint = stub_bin / "acme-commit-lint"
+        commit_lint.write_text(STUB_COMMIT_LINT, encoding="utf-8")
+        commit_lint.chmod(0o755)
+        notify = stub_bin / "acme-notify"
+        notify.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        notify.chmod(0o755)
+
+        evidence_file = tmp / "evidence.md"
+        evidence_file.write_text("## Blast-radius\n\nScoped to widgets only.\n", encoding="utf-8")
+
+        ci_first_file = tmp / "ci-first.json"
+        ci_first_file.write_text(
+            json.dumps({
+                "threads": [
+                    {"is_ci": True, "head": head_sha, "resolved": True, "replies": []},
+                ],
+                "commit_shas": [head_sha],
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        def write_scenario(tag: str, *, review_threads: list[dict[str, Any]], body: str | None = None) -> Path:
+            pr_body = body or (
+                "## Why\n\nExercise the installed pr-gate contract.\n\n"
+                "## What changes\n\nAdds widget contract logic.\n\n"
+                "## What to check\n\nGate helper wiring.\n"
+            )
+            scenario = {
+                "repo": "AcmeCorp/widgets",
+                "pr": 7,
+                "pr_view": {
+                    "number": 7,
+                    "title": "Add widget gate contract",
+                    "body": pr_body,
+                    "state": "OPEN",
+                    "isDraft": False,
+                    "headRefName": "feat/contract",
+                    "headRefOid": head_sha,
+                    "baseRefName": "main",
+                    "labels": [],
+                    "author": {"login": "acme-author"},
+                    "commits": [
+                        {
+                            "messageHeadline": "Add widget gate contract",
+                            "messageBody": "Fixed: test widget gate contract",
+                        }
+                    ],
+                    "reviewDecision": "APPROVED",
+                    "mergeable": "MERGEABLE",
+                    "url": "https://github.com/AcmeCorp/widgets/pull/7",
+                },
+                "pr_checks": [
+                    {"name": "danger/widgets", "state": "SUCCESS", "bucket": "pass"},
+                    {"name": "ci", "state": "SUCCESS", "bucket": "pass"},
+                ],
+                "files": [
+                    {"filename": "src/widget.py", "patch": "@@ -0,0 +1 @@\n+x = 1\n"},
+                ],
+                "comments": [
+                    {
+                        "id": 101,
+                        "updated_at": "2026-11-17T00:00:00Z",
+                        "user": {"login": "github-actions[bot]", "type": "Bot"},
+                        "body": (
+                            "<!-- risk-review-marker -->\n"
+                            f"<sub>Reviewed commit `{head_sha}`. "
+                            "Add the `risk:reclassify` label to run it again.</sub>"
+                        ),
+                    }
+                ],
+                "workflow_runs": {"workflow_runs": []},
+                "commits": [
+                    {
+                        "sha": head_sha,
+                        "commit": {
+                            "message": "Add widget gate contract\n\nFixed: test widget gate contract",
+                            "author": {
+                                "name": "Acme Author",
+                                "email": "author@acme.example",
+                                "date": "2026-11-17T00:00:00Z",
+                            },
+                            "committer": {
+                                "name": "Acme Author",
+                                "email": "author@acme.example",
+                                "date": "2026-11-17T00:00:00Z",
+                            },
+                            "verification": {"verified": True, "reason": "valid"},
+                        },
+                        "author": {"login": "acme-author"},
+                    }
+                ],
+                "review_threads": review_threads,
+            }
+            path = tmp / f"scenario-{tag}.json"
+            path.write_text(json.dumps(scenario), encoding="utf-8")
+            return path
+
+        def run_gate(bin_dir: Path, scenario_path: Path) -> subprocess.CompletedProcess[str]:
+            env = {
+                **git_env,
+                "HOME": str(user_home),
+                "WORK_ACCOUNT_CONFIG": str(work_account_cfg),
+                "BOPEEP_CI_FIRST_FIXTURE": str(ci_first_file),
+                "BOPEEP_OWN_PR_AUTHORS": "acme-author",
+                "BOPEEP_GH": str(gh_bin),
+                "CONCLAVE_GH": str(gh_bin),
+                "GH_TOKEN": "",
+                "GITHUB_TOKEN": "",
+                "SYNTHETIC_GH_SCENARIO": str(scenario_path),
+                "PATH": build_clean_path(bin_dir, stub_bin),
+            }
+            return subprocess.run(
+                [
+                    str(bin_dir / "pr-gate"),
+                    "--pr",
+                    "7",
+                    "--repo",
+                    "AcmeCorp/widgets",
+                    "--evidence",
+                    str(evidence_file),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+
+        release_bin = release_dir / "bin"
+
+        # 1. Clear gate passes with real installed helpers.
+        clear_scenario = write_scenario("clear", review_threads=[])
+        cp = run_gate(release_bin, clear_scenario)
+        if cp.returncode != 0 or "pr-gate PASS" not in cp.stdout or "PASS: lint: pr-lint PASS" not in cp.stdout:
+            raise ReleaseError(
+                f"candidate clear pr-gate check failed (rc={cp.returncode}):\n{cp.stdout}\n{cp.stderr}"
+            )
+
+        # 2. Unanswered thread reports blocker URL.
+        blocker_url = "https://github.com/AcmeCorp/widgets/pull/7#discussion_r456"
+        blocker_scenario = write_scenario(
+            "blocker",
+            review_threads=[
+                {
+                    "id": "THREAD_1",
+                    "isResolved": False,
+                    "isOutdated": False,
+                    "path": "src/widget.py",
+                    "line": 1,
+                    "comments": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                "author": {"login": "a-reviewer"},
+                                "createdAt": "2026-11-17T00:01:00Z",
+                                "url": blocker_url,
+                                "body": "Please fix this before merge.",
+                                "databaseId": 456,
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+        cp = run_gate(release_bin, blocker_scenario)
+        if cp.returncode != 1 or f"FAIL: unanswered_threads: unanswered: {blocker_url}" not in cp.stdout:
+            raise ReleaseError(
+                f"candidate blocker URL check failed (rc={cp.returncode}):\n{cp.stdout}\n{cp.stderr}"
+            )
+
+        # 3. Real pr-lint failure fails the gate.
+        bad_body = (
+            "## Why\n\nHas an em dash \u2014 should fail real pr-lint.\n\n"
+            "## What changes\n\nAdds widget contract logic.\n"
+        )
+        lint_fail_scenario = write_scenario("lintfail", review_threads=[], body=bad_body)
+        cp = run_gate(release_bin, lint_fail_scenario)
+        if cp.returncode != 1 or "FAIL: lint:" not in cp.stdout:
+            raise ReleaseError(
+                f"candidate pr-lint failure check failed (rc={cp.returncode}):\n{cp.stdout}\n{cp.stderr}"
+            )
+
+        # 4. Missing helper fails closed (threads-check and pr-lint).
+        for missing_helper, expected_err in (
+            ("threads-check", "ERROR: unanswered_threads:"),
+            ("pr-lint", "ERROR: lint: pr-lint not on PATH"),
+        ):
+            iso_root = tmp / f"iso-no-{missing_helper}"
+            iso_root.mkdir(parents=True)
+            os.symlink(release_dir / "pins.json", iso_root / "pins.json")
+            os.symlink(release_dir / "code", iso_root / "code")
+            iso_bin = iso_root / "bin"
+            shutil.copytree(release_bin, iso_bin, symlinks=True)
+            target_helper = iso_bin / missing_helper
+            if not target_helper.exists():
+                raise ReleaseError(f"candidate release missing expected command {missing_helper}")
+            target_helper.unlink()
+            cp = run_gate(iso_bin, clear_scenario)
+            if cp.returncode != 2 or expected_err not in cp.stdout:
+                raise ReleaseError(
+                    f"candidate missing-{missing_helper} check failed (rc={cp.returncode}):\n"
+                    f"{cp.stdout}\n{cp.stderr}"
+                )
+
+
+def verify_release_dir(
+    release_dir: Path,
+    *,
+    check_cmd: str | None = None,
+) -> dict[str, Any]:
+    if not release_dir.is_dir():
+        raise ReleaseError(f"release directory not found: {release_dir}")
+
+    pins = load_pins(release_dir / "pins.json")
+    manifest_path = release_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise ReleaseError(f"missing manifest.json in {release_dir}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    system_git = find_system_git()
+    git_env = clean_git_env(release_dir)
+
+    for name, expected_sha in pins.items():
+        verify_member_checkout(release_dir / "code" / name, name, expected_sha, system_git, git_env)
+
+    run_member_installers(release_dir, pins, git_env, check_only=True)
+
+    gx = release_dir / "bin" / "guild-exec"
+    if not gx.is_file() or not os.access(gx, os.X_OK):
+        raise ReleaseError(f"missing executable {gx}")
+
+    for cmd in manifest.get("commands", {}):
+        cmd_path = release_dir / "bin" / cmd
+        if not cmd_path.is_file() or not os.access(cmd_path, os.X_OK):
+            raise ReleaseError(f"missing release command {cmd_path}")
+
+    for hook in manifest.get("hooks", {}):
+        hook_path = release_dir / "hooks" / hook
+        if not hook_path.is_file() or not os.access(hook_path, os.X_OK):
+            raise ReleaseError(f"missing release hook {hook_path}")
+
+    verify_release_contract(release_dir)
+
+    if check_cmd:
+        env = {
+            **os.environ,
+            "GUILD_CANDIDATE_DIR": str(release_dir),
+            "PATH": f"{release_dir / 'bin'}:{os.environ.get('PATH', '')}",
+        }
+        cp = subprocess.run(
+            ["sh", "-c", check_cmd],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        if cp.returncode != 0:
+            raise ReleaseError(
+                f"custom check command failed ({cp.returncode}):\n{cp.stdout}\n{cp.stderr}"
+            )
+
+    return manifest
+
+
+def prepare_release(
+    *,
+    root: Path,
+    pins_path: Path,
+    sources_dir: Path | None,
+    pstack_home: Path | None,
+    release_id: str | None,
+    check_cmd: str | None,
+) -> dict[str, Any]:
+    root = root.resolve()
+    pins = load_pins(pins_path.resolve())
+    resolved_sources = resolve_sources_dir(sources_dir)
+    resolved_pstack = resolve_pstack_dir(pstack_home)
+    rid = choose_release_id(root, pins, release_id)
+
+    releases_dir = root / "releases"
+    staging_parent = root / ".staging"
+    releases_dir.mkdir(parents=True, exist_ok=True)
+    staging_parent.mkdir(parents=True, exist_ok=True)
+
+    staging_dir = Path(tempfile.mkdtemp(prefix=f"{rid}.", dir=str(staging_parent)))
+    final_dir = releases_dir / rid
+
+    old_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(signum: int, _frame: Any) -> None:
+        raise ReleaseError(f"interrupted by signal {signum}")
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        system_git = find_system_git()
+        git_env = clean_git_env(staging_dir)
+
+        materialize_member_checkouts(staging_dir, pins, resolved_sources, system_git, git_env)
+        bundle_pstack(staging_dir, resolved_pstack)
+        run_member_installers(staging_dir, pins, git_env, check_only=False)
+
+        (staging_dir / "pins.json").write_text(
+            json.dumps(pins, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        entrypoints = build_release_entrypoints(staging_dir, pins)
+        manifest = {
+            "release_id": rid,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "pins": pins,
+            "commands": entrypoints["commands"],
+            "hooks": entrypoints["hooks"],
+        }
+        (staging_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        verify_release_dir(staging_dir, check_cmd=check_cmd)
+        if final_dir.exists() or final_dir.is_symlink():
+            raise ReleaseError(f"target release directory already exists: {final_dir}")
+        os.replace(staging_dir, final_dir)
+        try:
+            retarget_staging_symlinks(final_dir, staging_dir, final_dir)
+            run_member_installers(final_dir, pins, git_env, check_only=True)
+        except BaseException:
+            shutil.rmtree(final_dir, ignore_errors=True)
+            raise
+        return {
+            "release_id": rid,
+            "release_dir": str(final_dir),
+            "pins": pins,
+            "commands": sorted(entrypoints["commands"].keys()),
+            "hooks": sorted(entrypoints["hooks"].keys()),
+        }
+    except BaseException:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, old_sigterm)
+
+
+def retarget_staging_symlinks(root_dir: Path, old_prefix: Path, new_prefix: Path) -> None:
+    old_str = str(old_prefix) + "/"
+    new_str = str(new_prefix) + "/"
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        for name in [*dirnames, *filenames]:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                raw = os.readlink(p)
+                if raw.startswith(old_str):
+                    atomic_symlink(p, new_str + raw[len(old_str):])
+
+
+def switch_release(
+    *,
+    root: Path,
+    release_id: str,
+    skip_check: bool = False,
+) -> dict[str, Any]:
+    root = root.resolve()
+    rid = validate_release_id(release_id)
+    target_dir = root / "releases" / rid
+    if not target_dir.is_dir():
+        raise ReleaseError(f"release {rid!r} does not exist at {target_dir}")
+
+    if not skip_check:
+        verify_release_dir(target_dir)
+
+    old_current = read_pointer_id(root, "current")
+    atomic_symlink(root / "current", f"releases/{rid}")
+    if old_current and old_current != rid:
+        atomic_symlink(root / "previous", f"releases/{old_current}")
+
+    return {
+        "current": rid,
+        "previous": read_pointer_id(root, "previous"),
+        "release_dir": str(target_dir),
+    }
+
+
+def rollback_release(
+    *,
+    root: Path,
+    to_release_id: str | None = None,
+    skip_check: bool = False,
+) -> dict[str, Any]:
+    root = root.resolve()
+    current_id = read_pointer_id(root, "current")
+    if to_release_id is not None:
+        target_id = validate_release_id(to_release_id)
+    else:
+        target_id = read_pointer_id(root, "previous")
+        if not target_id:
+            raise ReleaseError(f"no previous release recorded under {root}")
+        if target_id == current_id:
+            raise ReleaseError(f"previous release {target_id!r} is already active")
+
+    return switch_release(root=root, release_id=target_id, skip_check=skip_check)
+
+
+def status_report(root: Path) -> dict[str, Any]:
+    root = root.resolve()
+    releases_dir = root / "releases"
+    releases: list[str] = []
+    if releases_dir.is_dir():
+        releases = sorted(p.name for p in releases_dir.iterdir() if p.is_dir())
+    return {
+        "root": str(root),
+        "current": read_pointer_id(root, "current"),
+        "previous": read_pointer_id(root, "previous"),
+        "releases": releases,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="guild-release")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    for name in ("prepare", "deploy"):
+        p = sub.add_parser(name)
+        p.add_argument("--root", type=Path, required=True, help="release root directory")
+        p.add_argument("--pins", type=Path, default=DEFAULT_PINS_FILE, help="member pins JSON")
+        p.add_argument("--sources-dir", type=Path, default=None, help="directory containing member repos")
+        p.add_argument("--pstack-home", type=Path, default=None, help="path to pstack checkout")
+        p.add_argument("--release-id", default=None, help="explicit release id")
+        p.add_argument("--check-cmd", default=None, help="extra shell command to verify candidate")
+        p.add_argument("--json", action="store_true", help="emit JSON output")
+
+    p_check = sub.add_parser("check")
+    p_check.add_argument("--release", type=Path, default=None, help="release directory to check")
+    p_check.add_argument("--root", type=Path, default=None, help="release root directory")
+    p_check.add_argument("--release-id", default=None, help="release id under --root (default: current)")
+    p_check.add_argument("--check-cmd", default=None, help="extra shell command to verify candidate")
+    p_check.add_argument("--json", action="store_true")
+
+    p_switch = sub.add_parser("switch")
+    p_switch.add_argument("--root", type=Path, required=True)
+    p_switch.add_argument("--release-id", required=True)
+    p_switch.add_argument("--skip-check", action="store_true")
+    p_switch.add_argument("--json", action="store_true")
+
+    p_rb = sub.add_parser("rollback")
+    p_rb.add_argument("--root", type=Path, required=True)
+    p_rb.add_argument("--to", dest="to_release_id", default=None)
+    p_rb.add_argument("--skip-check", action="store_true")
+    p_rb.add_argument("--json", action="store_true")
+
+    p_st = sub.add_parser("status")
+    p_st.add_argument("--root", type=Path, required=True)
+    p_st.add_argument("--json", action="store_true")
+
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    try:
+        if args.cmd == "prepare":
+            res = prepare_release(
+                root=args.root,
+                pins_path=args.pins,
+                sources_dir=args.sources_dir,
+                pstack_home=args.pstack_home,
+                release_id=args.release_id,
+                check_cmd=args.check_cmd,
+            )
+        elif args.cmd == "deploy":
+            prep = prepare_release(
+                root=args.root,
+                pins_path=args.pins,
+                sources_dir=args.sources_dir,
+                pstack_home=args.pstack_home,
+                release_id=args.release_id,
+                check_cmd=args.check_cmd,
+            )
+            sw = switch_release(root=args.root, release_id=prep["release_id"], skip_check=True)
+            res = {**prep, **sw}
+        elif args.cmd == "check":
+            if args.release is not None:
+                target = args.release.resolve()
+            elif args.root is not None:
+                root = args.root.resolve()
+                rid = args.release_id or read_pointer_id(root, "current")
+                if not rid:
+                    raise ReleaseError(f"no active release under {root}")
+                target = root / "releases" / validate_release_id(rid)
+            else:
+                raise ReleaseError("check requires --release or --root")
+            manifest = verify_release_dir(target, check_cmd=args.check_cmd)
+            res = {"release_dir": str(target), "release_id": manifest["release_id"], "ok": True}
+        elif args.cmd == "switch":
+            res = switch_release(
+                root=args.root,
+                release_id=args.release_id,
+                skip_check=args.skip_check,
+            )
+        elif args.cmd == "rollback":
+            res = rollback_release(
+                root=args.root,
+                to_release_id=args.to_release_id,
+                skip_check=args.skip_check,
+            )
+        elif args.cmd == "status":
+            res = status_report(args.root)
+        else:
+            raise ReleaseError(f"unknown command: {args.cmd}")
+    except ReleaseError as exc:
+        print(f"guild-release: error: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(res, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

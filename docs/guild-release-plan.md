@@ -2,7 +2,7 @@
 
 **Goal.** Update the Surface to one verified set of Guild tools without copying a command into a terminal for each release. Keep the Surface guard in place and keep the previous release usable for rollback.
 
-**Status.** Step 1 complete locally (ready for Step 2). The cross-repo contract test pins the migrated baseline (`tests/member-pins.json`) and passes against the real installed commands in an isolated temporary prefix. Running `.github/workflows/ci.yml` on GitHub Actions requires configuring the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
+**Status.** Step 2 complete locally (ready for Step 3). `bin/guild-release` builds a complete pinned candidate release in a separate staging directory under `--root`, verifies member checkouts, `install.sh --check`, and the installed `pr-gate` contract before promoting to `releases/<id>` and atomically switching the `current` symlink (`os.replace`), while retaining `previous` for `rollback`. Running `.github/workflows/ci.yml` on GitHub Actions still requires configuring the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
 
 | Step | Work | Done when |
 | --- | --- | --- |
@@ -27,6 +27,17 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 - **Command**: `python3 tests/test_pr_gate_contract.py -v`
 - **Result**: `Ran 7 tests in 5.500s, OK` (installed wrappers, clear gate `pr-gate PASS`, blocker URL `FAIL: unanswered_threads: unanswered: https://github.com/AcmeCorp/widgets/pull/7#discussion_r456`, real `pr-lint` failure, missing `threads-check` error, missing `pr-lint` error, and unchanged host install paths; also verified against shallow detached-HEAD CI-style source clones with `GUILD_MEMBER_SOURCES_DIR`).
 - **CI workflow**: `.github/workflows/ci.yml` checks out the exact SHAs from `tests/member-pins.json` using `secrets.GUILD_READ_TOKEN` (failing closed if unset) and runs `python3 tests/test_pr_gate_contract.py -v`.
+
+## Step 2 checks and mechanism
+
+- **Release tool (`bin/guild-release`)**: `prepare`, `check`, `switch`, `deploy`, `rollback`, and `status` manage releases under `--root`:
+  - Builds candidate checkouts, `install.sh` prefixes, and release-bound `bin/` + `hooks/` launchers (with `bin/guild-exec` binding `PATH`, `CONCLAVE_HOME`, `BRIDGEKEEPER_HOME`, `BOPEEP_HOME`, `QUARTERMASTER_HOME`, and `PSTACK_HOME` to that concrete release while keeping `HOME`, `.guild.json`, and `bopeep.state_dir` external).
+  - Verifies checkout integrity, `install.sh --check`, and the installed `pr-gate` contract before promoting from `.staging/` and atomically replacing the `current` symlink while retaining `previous`.
+- **Commands**: `python3 tests/test_pr_gate_contract.py -v && python3 tests/test_release_lifecycle.py -v`
+- **Results**:
+  - `python3 tests/test_pr_gate_contract.py -v`: `Ran 7 tests in 6.342s, OK`
+  - `python3 tests/test_release_lifecycle.py -v`: `Ran 4 tests in 67.341s, OK` (external config/state separation and fail-closed initial rollback, interrupted preparation leaves `r1` active and callable, failed candidate check on broken `conclave/scripts/risk_freshness.py` and failing `--check-cmd` leaves `r1` active, and `r1` -> `r2` switch + `rollback` restores both commands such as `bopeep-v2-only`/`pr-lint` and dependencies such as `CONCLAVE_HOME/scripts/risk_freshness.py` without modifying guarded host paths).
+- **CI workflow**: `.github/workflows/ci.yml` also runs `python3 tests/test_release_lifecycle.py -v` against the pinned `.deps` checkouts.
 
 ## Open follow-ups
 

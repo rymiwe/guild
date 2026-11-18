@@ -76,3 +76,8 @@ jobs:
         env:
           GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
         run: python3 tests/test_pr_gate_contract.py -v
+
+      - name: Run release prepare, check, switch, and rollback tests
+        env:
+          GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
+        run: python3 tests/test_release_lifecycle.py -v
