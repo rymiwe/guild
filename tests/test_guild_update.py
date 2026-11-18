@@ -19,8 +19,11 @@ import test_pr_gate_contract as step1  # noqa: E402
 
 REAL_HOME = step1.REAL_HOME
 STUB_GH = """#!/bin/sh
-# gh api repos/OWNER/REPO/commits/SHA/check-runs --jq ...: print the prepared lines.
-cat "$GH_RUNS_FILE"
+# gh api repos/acme/guild/actions/runs?head_sha=SHA&event=push... --jq ...: print the prepared lines.
+case "$*" in
+  "api repos/acme/guild/actions/runs?head_sha="*"&event=push&"*) cat "$GH_RUNS_FILE" ;;
+  *) echo "unexpected gh call: $*" >&2; exit 1 ;;
+esac
 """
 STUB_NOTIFY = """#!/bin/sh
 printf '%s\\n' "$*" >>"$NOTIFY_LOG"
@@ -192,6 +195,14 @@ class GuildUpdateTest(unittest.TestCase):
         self.assertIsNone(self.current())
         self.assertEqual(self.notifications(), [])
 
+        # 24 hours without a finished run fails and pings once.
+        waiting = self.root / "update-state" / f"waiting-{self.head_id()}"
+        os.utime(waiting, (0, 0))
+        for _ in range(2):
+            self.assertEqual(self.update("in_progress - CI\n").returncode, 1)
+        self.assertEqual(len(self.notifications()), 1)
+        self.assertIn("after 24 hours", self.notifications()[0])
+
     def test_failed_ci_reports_once_and_installs_nothing(self) -> None:
         proc = self.update("completed failure pr-gate-contract\n")
         self.assertEqual(proc.returncode, 1)
@@ -241,6 +252,10 @@ class GuildUpdateTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 1)
             self.assertIn("deploy of", proc.stderr)
             self.assertEqual(self.current(), f"releases/{good}")
+            self.assertEqual(len(self.notifications()), 1)
+            proc = self.update("completed success pr-gate-contract\n")
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("to retry", proc.stderr, "a failed deploy must not rebuild every run")
             self.assertEqual(len(self.notifications()), 1)
             src_head = self._git("-C", str(self.root / "src"), "rev-parse", "HEAD").stdout.strip()
             self.assertEqual("g-" + src_head[:12], good, "a failed deploy must not move the updater checkout")
