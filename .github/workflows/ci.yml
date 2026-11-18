@@ -81,8 +81,8 @@ jobs:
           path: .deps/thresher
           persist-credentials: false
 
-      - name: Run true-check tests
-        run: python3 tests/test_true_check.py -v
+      - name: Run true-check and jev-router tests
+        run: python3 tests/test_true_check.py -v && python3 tests/test_jev_router.py -v
 
       - name: Run installed pr-gate cross-repo contract test
         env:
