@@ -2,7 +2,7 @@
 
 **Goal.** Update the Surface to one verified set of Guild tools without copying a command into a terminal for each release. Keep the Surface guard in place and keep the previous release usable for rollback.
 
-**Status.** Steps 1 to 3 are done. Step 4's updater and host `guild-exec` are built and verified on BLD; enabling them on the Surface waits on the owner. Running jobs stay on the release they started on across a switch and a `bopeep-watch` restart, and `guild-release prune` removes only releases that no running process is bound to. Running `.github/workflows/ci.yml` on GitHub Actions requires the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
+**Status.** Steps 1 to 3 are done. Step 4 is done: the owner enabled the updater on the Surface on 2026-11-18, and its first run activated `g-086883398120` with the Quartermaster cgroup fix. Running jobs stay on the release they started on across a switch and a `bopeep-watch` restart, and `guild-release prune` removes only releases that no running process is bound to. Running `.github/workflows/ci.yml` on GitHub Actions requires the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
 
 | Step | Work | Done when |
 | --- | --- | --- |
