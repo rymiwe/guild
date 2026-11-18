@@ -140,6 +140,20 @@ class GuildUpdateTest(unittest.TestCase):
     def head_id(self) -> str:
         return "g-" + self._git("rev-parse", "HEAD", cwd=self.guild_work).stdout.strip()[:12]
 
+    def test_member_fetch_error_is_transient(self) -> None:
+        bopeep = self.sources / "bopeep"
+        url = self._git("-C", str(bopeep), "remote", "get-url", "origin").stdout.strip()
+        self._git("-C", str(bopeep), "remote", "set-url", "origin", str(self.tmp / "missing.git"))
+        try:
+            proc = self.update("completed success pr-gate-contract\n")
+        finally:
+            self._git("-C", str(bopeep), "remote", "set-url", "origin", url)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("will retry", proc.stderr)
+        self.assertIsNone(self.current())
+        self.assertFalse((self.root / "failed").exists())
+        self.assertEqual(self.notifications(), [])
+
     def test_waits_while_ci_runs_and_when_no_runs(self) -> None:
         for runs in ("", "in_progress - pr-gate-contract\n"):
             proc = self.update(runs)
@@ -160,6 +174,11 @@ class GuildUpdateTest(unittest.TestCase):
         proc = self.update("completed failure pr-gate-contract\n")
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(len(self.notifications()), 1, "a known failure must not ping again")
+
+        # A re-run of the failed check that passes recovers the same commit.
+        proc = self.update("completed success pr-gate-contract\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.current(), f"releases/{self.head_id()}")
 
     def test_passed_ci_activates_then_bad_candidate_keeps_it(self) -> None:
         good = self.head_id()
@@ -194,6 +213,8 @@ class GuildUpdateTest(unittest.TestCase):
             self.assertIn("deploy of", proc.stderr)
             self.assertEqual(self.current(), f"releases/{good}")
             self.assertEqual(len(self.notifications()), 1)
+            src_head = self._git("-C", str(self.root / "src"), "rev-parse", "HEAD").stdout.strip()
+            self.assertEqual("g-" + src_head[:12], good, "a failed deploy must not move the updater checkout")
         finally:
             (self.guild_work / "tests" / "member-pins.json").write_text(json.dumps(PINS, indent=2) + "\n")
             self.commit_guild("Restore pins")
