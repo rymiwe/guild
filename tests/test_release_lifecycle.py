@@ -432,7 +432,6 @@ class ReleaseLifecycleTest(unittest.TestCase):
         conclave_repo = self.sources_dir / "conclave"
         self._git("-C", str(conclave_repo), "checkout", "-qb", "bad-candidate")
         rf_path = conclave_repo / "scripts" / "risk_freshness.py"
-        rf_orig = rf_path.read_text(encoding="utf-8")
         rf_path.write_text("this is invalid python syntax ((((\n", encoding="utf-8")
         self._git("-C", str(conclave_repo), "commit", "-am", "Break risk_freshness")
         bad_conclave_sha = self._git("-C", str(conclave_repo), "rev-parse", "HEAD").stdout.strip()
@@ -471,8 +470,6 @@ class ReleaseLifecycleTest(unittest.TestCase):
         gate = self.run_release_gate(root / "current" / "bin")
         self.assertEqual(gate.returncode, 0, f"stdout:\n{gate.stdout}\nstderr:\n{gate.stderr}")
         self.assertIn("pr-gate PASS", gate.stdout)
-        # Restore rf_orig variable reference lint silence
-        self.assertTrue(len(rf_orig) > 0)
 
     def test_switch_and_rollback_restore_commands_and_dependencies(self) -> None:
         # Build real v2 commits in isolated sources_dir for bopeep, conclave, and bridgekeeper.
@@ -492,7 +489,7 @@ class ReleaseLifecycleTest(unittest.TestCase):
         )
         pr_lint_path = bopeep_repo / "bin" / "pr-lint"
         pr_lint_text = pr_lint_path.read_text(encoding="utf-8")
-        self.assertIn("print('pr-lint PASS')" if "print('pr-lint PASS')" in pr_lint_text else 'print("pr-lint PASS")', pr_lint_text)
+        self.assertIn('print("pr-lint PASS")', pr_lint_text)
         pr_lint_path.write_text(
             pr_lint_text.replace('print("pr-lint PASS")', 'print("pr-lint PASS (v2)")'),
             encoding="utf-8",
@@ -506,7 +503,6 @@ class ReleaseLifecycleTest(unittest.TestCase):
         self._git("-C", str(conclave_repo), "checkout", "-qb", "v2-release")
         rf_path = conclave_repo / "scripts" / "risk_freshness.py"
         rf_text = rf_path.read_text(encoding="utf-8")
-        rf_target = 'return Freshness("PASS", "current-head risk review fresh"'
         # Append a v2 marker to evaluate()'s return reasons cleanly without breaking semantics.
         rf_path.write_text(
             rf_text + '\n_orig_evaluate = evaluate\ndef evaluate(*args, **kwargs):\n'
@@ -623,6 +619,16 @@ class ReleaseLifecycleTest(unittest.TestCase):
         self.assertEqual(st_data["current"], "r1")
         self.assertEqual(st_data["previous"], "r2")
         self.assertEqual(st_data["releases"], ["r1", "r2"])
+
+        # A pruned active release leaves `current` dangling. switch must still
+        # repair it, and status must still report.
+        shutil.rmtree(root / "releases" / "r1")
+        st_dangling = self.run_cli("status", "--root", str(root), "--json")
+        self.assertEqual(st_dangling.returncode, 0, st_dangling.stderr)
+        self.assertIsNone(json.loads(st_dangling.stdout)["current"])
+        fix = self.run_cli("switch", "--root", str(root), "--release-id", "r2")
+        self.assertEqual(fix.returncode, 0, f"stdout:\n{fix.stdout}\nstderr:\n{fix.stderr}")
+        self.assertEqual(os.readlink(root / "current"), "releases/r2")
 
 
 if __name__ == "__main__":

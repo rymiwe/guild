@@ -43,7 +43,7 @@ INSTALL_ORDER = ("quartermaster", "bridgekeeper", "bopeep", "conclave")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 WRAPPER_LINE_RE = re.compile(
-    r'^exec guild-exec ([A-Za-z0-9._-]+) ([^\s"]+) "\$@" ?$'
+    r'^exec guild-exec ([A-Za-z0-9._-]+) ([A-Za-z0-9._/-]+) "\$@" ?$'
 )
 
 
@@ -180,7 +180,10 @@ def atomic_symlink(link_path: Path, target: str) -> None:
         raise
 
 
-def read_pointer_id(root: Path, pointer_name: str) -> str | None:
+def read_pointer_id(root: Path, pointer_name: str, *, tolerate_dangling: bool = False) -> str | None:
+    """The release id a pointer names. With tolerate_dangling, a pointer whose
+    release is gone or outside releases/ reads as None, so switch and rollback
+    can still repair it."""
     ptr = root / pointer_name
     if not ptr.is_symlink():
         if ptr.exists():
@@ -189,6 +192,8 @@ def read_pointer_id(root: Path, pointer_name: str) -> str | None:
     resolved = ptr.resolve()
     releases_dir = (root / "releases").resolve()
     if resolved.parent != releases_dir or not resolved.is_dir():
+        if tolerate_dangling:
+            return None
         raise ReleaseError(f"{ptr} points outside {releases_dir}: {os.readlink(ptr)}")
     return resolved.name
 
@@ -247,7 +252,7 @@ def materialize_member_checkouts(
             if is_shallow == "true":
                 shutil.copytree(src, dest, symlinks=True)
                 run_git(system_git, git_env, "-C", str(dest), "reset", "--hard", "-q", expected_sha)
-                run_git(system_git, git_env, "-C", str(dest), "clean", "-fdq")
+                run_git(system_git, git_env, "-C", str(dest), "clean", "-fdxq")
                 run_git(
                     system_git, git_env, "-C", str(dest), "checkout", "-q", "-B", "main", expected_sha
                 )
@@ -275,6 +280,8 @@ def materialize_member_checkouts(
                 run_git(
                     system_git,
                     git_env,
+                    "-c",
+                    "core.hooksPath=/dev/null",
                     "-C",
                     str(src),
                     "push",
@@ -293,6 +300,12 @@ def materialize_member_checkouts(
                     "refs/remotes/origin/main",
                 )
 
+            src_url = subprocess.run(
+                [system_git, "-C", str(src), "remote", "get-url", "origin"],
+                capture_output=True, text=True, env=git_env,
+            ).stdout.strip()
+            if src_url:
+                run_git(system_git, git_env, "-C", str(dest), "remote", "set-url", "origin", src_url)
             verify_member_checkout(dest, name, expected_sha, system_git, git_env)
     finally:
         shutil.rmtree(origins_dir, ignore_errors=True)
@@ -1098,12 +1111,17 @@ def prepare_release(
         verify_release_dir(staging_dir, check_cmd=check_cmd)
         if final_dir.exists() or final_dir.is_symlink():
             raise ReleaseError(f"target release directory already exists: {final_dir}")
-        os.replace(staging_dir, final_dir)
+        promoted = False
         try:
+            os.replace(staging_dir, final_dir)
+            promoted = True
             retarget_staging_symlinks(final_dir, staging_dir, final_dir)
             run_member_installers(final_dir, pins, git_env, check_only=True)
         except BaseException:
-            shutil.rmtree(final_dir, ignore_errors=True)
+            # Only remove a release this run promoted: a failed rename may mean
+            # another prepare owns final_dir.
+            if promoted:
+                shutil.rmtree(final_dir, ignore_errors=True)
             raise
         return {
             "release_id": rid,
@@ -1146,14 +1164,14 @@ def switch_release(
     if not skip_check:
         verify_release_dir(target_dir)
 
-    old_current = read_pointer_id(root, "current")
+    old_current = read_pointer_id(root, "current", tolerate_dangling=True)
     atomic_symlink(root / "current", f"releases/{rid}")
     if old_current and old_current != rid:
         atomic_symlink(root / "previous", f"releases/{old_current}")
 
     return {
         "current": rid,
-        "previous": read_pointer_id(root, "previous"),
+        "previous": read_pointer_id(root, "previous", tolerate_dangling=True),
         "release_dir": str(target_dir),
     }
 
@@ -1165,7 +1183,7 @@ def rollback_release(
     skip_check: bool = False,
 ) -> dict[str, Any]:
     root = root.resolve()
-    current_id = read_pointer_id(root, "current")
+    current_id = read_pointer_id(root, "current", tolerate_dangling=True)
     if to_release_id is not None:
         target_id = validate_release_id(to_release_id)
     else:
@@ -1186,8 +1204,8 @@ def status_report(root: Path) -> dict[str, Any]:
         releases = sorted(p.name for p in releases_dir.iterdir() if p.is_dir())
     return {
         "root": str(root),
-        "current": read_pointer_id(root, "current"),
-        "previous": read_pointer_id(root, "previous"),
+        "current": read_pointer_id(root, "current", tolerate_dangling=True),
+        "previous": read_pointer_id(root, "previous", tolerate_dangling=True),
         "releases": releases,
     }
 
@@ -1285,8 +1303,8 @@ def main(argv: list[str] | None = None) -> int:
             res = status_report(args.root)
         else:
             raise ReleaseError(f"unknown command: {args.cmd}")
-    except ReleaseError as exc:
-        print(f"guild-release: error: {exc}", file=sys.stderr)
+    except (ReleaseError, OSError, ValueError, KeyError) as exc:
+        print(f"guild-release: error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):
