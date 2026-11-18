@@ -1209,14 +1209,44 @@ def _release_of(path_str: str, releases_dir: Path) -> str | None:
     return resolved.relative_to(releases_dir).parts[0]
 
 
-def releases_in_use(root: Path) -> dict[str, list[int]]:
-    """Release ids that running processes are bound to, with their pids.
+RELEASE_ENV_VARS = (
+    "GUILD_RELEASE_DIR",
+    "CONCLAVE_HOME",
+    "BRIDGEKEEPER_HOME",
+    "BOPEEP_HOME",
+    "QUARTERMASTER_HOME",
+    "PSTACK_HOME",
+)
 
-    A process is bound to a release when its PATH has an entry in that release,
-    GUILD_RELEASE_DIR names it, or an argument of its command line lies in it.
-    A tmux process is skipped: a server keeps the environment of the job that
-    started it, but each new session takes its PATH from the client, so the
-    server never runs Guild code. Processes this user cannot read are skipped.
+
+def _read_proc(path: Path, *, link: bool = False) -> str | bytes | None:
+    try:
+        return os.readlink(path) if link else path.read_bytes()
+    except OSError:
+        return None
+
+
+def _is_tmux_server(entry: Path, exe: str | None) -> bool:
+    """A tmux server daemonizes, so it leads its own session. A client does not."""
+    if exe is None or os.path.basename(exe) != "tmux":
+        return False
+    stat = _read_proc(entry / "stat")
+    if not isinstance(stat, bytes):
+        return False
+    fields = stat.rsplit(b")", 1)[-1].split()
+    return len(fields) > 3 and fields[3] == entry.name.encode()
+
+
+def releases_in_use(root: Path) -> dict[str, list[int]]:
+    """Release ids that running processes may still use, with their pids.
+
+    A process counts for a release when its executable, working directory, a
+    command-line argument, a PATH entry, or one of the variables guild-exec
+    sets (RELEASE_ENV_VARS) lies in that release. A tmux server is skipped: it
+    keeps the environment of the process that started it and runs no Guild
+    code. A tmux client is not skipped, so a session still being started keeps
+    its release. Each file of a process is read on its own; one this user
+    cannot read is skipped.
     """
     proc = Path("/proc")
     if not (proc / "self" / "environ").is_file():
@@ -1226,26 +1256,24 @@ def releases_in_use(root: Path) -> dict[str, list[int]]:
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
-        pid = int(entry.name)
-        try:
-            if os.path.basename(os.readlink(entry / "exe")) == "tmux":
-                continue
-            environ = (entry / "environ").read_bytes().split(b"\0")
-            cmdline = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
+        exe = _read_proc(entry / "exe", link=True)
+        if _is_tmux_server(entry, exe):
             continue
-        paths: list[str] = []
-        for item in environ:
+        paths: list[str] = [p for p in (exe, _read_proc(entry / "cwd", link=True)) if isinstance(p, str)]
+        environ = _read_proc(entry / "environ")
+        for item in environ.split(b"\0") if isinstance(environ, bytes) else ():
             key, _, value = item.decode("utf-8", "replace").partition("=")
             if key == "PATH":
                 paths.extend(value.split(os.pathsep))
-            elif key == "GUILD_RELEASE_DIR":
+            elif key in RELEASE_ENV_VARS:
                 paths.append(value)
-        paths.extend(arg.decode("utf-8", "replace") for arg in cmdline)
+        cmdline = _read_proc(entry / "cmdline")
+        if isinstance(cmdline, bytes):
+            paths.extend(arg.decode("utf-8", "replace") for arg in cmdline.split(b"\0"))
         for p in paths:
             rid = _release_of(p, releases_dir)
             if rid:
-                used.setdefault(rid, set()).add(pid)
+                used.setdefault(rid, set()).add(int(entry.name))
     return {rid: sorted(pids) for rid, pids in sorted(used.items())}
 
 

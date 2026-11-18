@@ -654,6 +654,9 @@ class ReleaseLifecycleTest(unittest.TestCase):
         harvest command, which starts the job in a detached tmux session the way
         job-launch does. The tmux server is started with r1 first on PATH, so job
         B getting r2 shows each session takes PATH from its client, not the server.
+        The server also carries r1's GUILD_RELEASE_DIR and *_HOME, which every
+        session inherits; B's Guild commands still run r2 because guild-exec
+        resets them.
         """
         tmux = shutil.which("tmux")
         if not tmux:
@@ -719,7 +722,17 @@ class ReleaseLifecycleTest(unittest.TestCase):
 
         jobs_dir = self.tmp / "jobs"
         socket = f"guild-step3-{os.getpid()}"
-        server_env = {**self.git_env, "HOME": str(self.user_home), "PATH": build_clean_path(r1_bin, host_bin)}
+        # As in production, where the first job-launch call starts the server through
+        # r1's guild-exec: r1 first on PATH and r1's release variables set.
+        r1_dir = root.resolve() / "releases" / "r1"
+        server_env = {
+            **self.git_env,
+            "HOME": str(self.user_home),
+            "PATH": build_clean_path(r1_bin, host_bin),
+            "GUILD_RELEASE_DIR": str(r1_dir),
+            "CONCLAVE_HOME": str(r1_dir / "code" / "conclave"),
+            "BOPEEP_HOME": str(r1_dir / "code" / "bopeep"),
+        }
         subprocess.run(
             [tmux, "-L", socket, "-f", "/dev/null", "start-server", ";", "set", "-g", "exit-empty", "off"],
             env=server_env, check=True, capture_output=True, text=True,
@@ -785,6 +798,11 @@ class ReleaseLifecycleTest(unittest.TestCase):
         in_use = json.loads(st.stdout)["in_use"]
         self.assertIn("r1", in_use)
         self.assertIn("r2", in_use)
+        server_pid = int(subprocess.run(
+            [tmux, "-L", socket, "display-message", "-p", "#{pid}"],
+            env=server_env, check=True, capture_output=True, text=True,
+        ).stdout.strip())
+        self.assertNotIn(server_pid, in_use["r1"], "the tmux server must not hold r1")
         pr = self.run_cli("prune", "--root", str(root), "--json")
         self.assertEqual(pr.returncode, 0, pr.stderr)
         self.assertEqual(json.loads(pr.stdout)["removed"], [])
