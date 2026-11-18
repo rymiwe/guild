@@ -77,7 +77,10 @@ jobs:
           GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
         run: python3 tests/test_pr_gate_contract.py -v
 
-      - name: Run release prepare, check, switch, and rollback tests
+      - name: Install tmux for the job binding test
+        run: command -v tmux || (sudo apt-get update -q && sudo apt-get install -y -q tmux)
+
+      - name: Run release prepare, check, switch, rollback, and job binding tests
         env:
           GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
         run: python3 tests/test_release_lifecycle.py -v

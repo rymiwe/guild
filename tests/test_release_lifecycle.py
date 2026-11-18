@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Integration tests for Step 2: prepare, check, atomic switch, and rollback of pinned Guild releases."""
+"""Integration tests for Steps 2 and 3: prepare, check, atomic switch, rollback, and per-job release binding."""
 from __future__ import annotations
 
 import json
 import os
 import pwd
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -161,6 +163,10 @@ class ReleaseLifecycleTest(unittest.TestCase):
                 },
                 "ready_review_gate": {
                     "review_skill": "acme-tools:review-work",
+                },
+                # bopeep-watch runs this every cycle; the Step 3 test uses it to start jobs.
+                "watch": {
+                    "harvest": {"command": str(cls.tmp / "job-start"), "every_s": 1},
                 },
             },
         }
@@ -471,10 +477,16 @@ class ReleaseLifecycleTest(unittest.TestCase):
         self.assertEqual(gate.returncode, 0, f"stdout:\n{gate.stdout}\nstderr:\n{gate.stderr}")
         self.assertIn("pr-gate PASS", gate.stdout)
 
-    def test_switch_and_rollback_restore_commands_and_dependencies(self) -> None:
+    _pins_r2_file: Path | None = None
+
+    @classmethod
+    def pins_r2(cls) -> Path:
+        """Pins for r2: bopeep adds bopeep-v2-only and marks pr-lint (v2); conclave marks risk_freshness."""
+        if cls._pins_r2_file is not None:
+            return cls._pins_r2_file
         # Build real v2 commits in isolated sources_dir for bopeep, conclave, and bridgekeeper.
-        bopeep_repo = self.sources_dir / "bopeep"
-        self._git("-C", str(bopeep_repo), "checkout", "-qb", "v2-release")
+        bopeep_repo = cls.sources_dir / "bopeep"
+        cls._git("-C", str(bopeep_repo), "checkout", "-qb", "v2-release")
         v2_cmd = bopeep_repo / "bin" / "bopeep-v2-only"
         v2_cmd.write_text("#!/bin/sh\necho 'bopeep-v2-only ok'\n", encoding="utf-8")
         v2_cmd.chmod(0o755)
@@ -489,18 +501,18 @@ class ReleaseLifecycleTest(unittest.TestCase):
         )
         pr_lint_path = bopeep_repo / "bin" / "pr-lint"
         pr_lint_text = pr_lint_path.read_text(encoding="utf-8")
-        self.assertIn('print("pr-lint PASS")', pr_lint_text)
+        assert 'print("pr-lint PASS")' in pr_lint_text
         pr_lint_path.write_text(
             pr_lint_text.replace('print("pr-lint PASS")', 'print("pr-lint PASS (v2)")'),
             encoding="utf-8",
         )
-        self._git("-C", str(bopeep_repo), "add", "bin/bopeep-v2-only", "install.sh", "bin/pr-lint")
-        self._git("-C", str(bopeep_repo), "commit", "-qm", "bopeep v2 command and lint marker")
-        bopeep_v2_sha = self._git("-C", str(bopeep_repo), "rev-parse", "HEAD").stdout.strip()
-        self._git("-C", str(bopeep_repo), "checkout", "-q", "main")
+        cls._git("-C", str(bopeep_repo), "add", "bin/bopeep-v2-only", "install.sh", "bin/pr-lint")
+        cls._git("-C", str(bopeep_repo), "commit", "-qm", "bopeep v2 command and lint marker")
+        bopeep_v2_sha = cls._git("-C", str(bopeep_repo), "rev-parse", "HEAD").stdout.strip()
+        cls._git("-C", str(bopeep_repo), "checkout", "-q", "main")
 
-        conclave_repo = self.sources_dir / "conclave"
-        self._git("-C", str(conclave_repo), "checkout", "-qb", "v2-release")
+        conclave_repo = cls.sources_dir / "conclave"
+        cls._git("-C", str(conclave_repo), "checkout", "-qb", "v2-release")
         rf_path = conclave_repo / "scripts" / "risk_freshness.py"
         rf_text = rf_path.read_text(encoding="utf-8")
         # Append a v2 marker to evaluate()'s return reasons cleanly without breaking semantics.
@@ -511,18 +523,23 @@ class ReleaseLifecycleTest(unittest.TestCase):
             '    return res\n',
             encoding="utf-8",
         )
-        self._git("-C", str(conclave_repo), "commit", "-am", "conclave v2 risk_freshness marker")
-        conclave_v2_sha = self._git("-C", str(conclave_repo), "rev-parse", "HEAD").stdout.strip()
-        self._git("-C", str(conclave_repo), "checkout", "-q", "main")
+        cls._git("-C", str(conclave_repo), "commit", "-am", "conclave v2 risk_freshness marker")
+        conclave_v2_sha = cls._git("-C", str(conclave_repo), "rev-parse", "HEAD").stdout.strip()
+        cls._git("-C", str(conclave_repo), "checkout", "-q", "main")
 
         pins_r2 = {
-            **self.pins_r1,
+            **cls.pins_r1,
             "bopeep": bopeep_v2_sha,
             "conclave": conclave_v2_sha,
         }
-        pins_r2_file = self.tmp / "pins-r2.json"
+        pins_r2_file = cls.tmp / "pins-r2.json"
         pins_r2_file.write_text(json.dumps(pins_r2, indent=2) + "\n", encoding="utf-8")
 
+        cls._pins_r2_file = pins_r2_file
+        return pins_r2_file
+
+    def test_switch_and_rollback_restore_commands_and_dependencies(self) -> None:
+        pins_r2_file = self.pins_r2()
         root = self.tmp / "root-switch-rollback"
 
         # 1. Deploy R1.
@@ -629,6 +646,190 @@ class ReleaseLifecycleTest(unittest.TestCase):
         fix = self.run_cli("switch", "--root", str(root), "--release-id", "r2")
         self.assertEqual(fix.returncode, 0, f"stdout:\n{fix.stdout}\nstderr:\n{fix.stderr}")
         self.assertEqual(os.readlink(root / "current"), "releases/r2")
+
+    def test_running_jobs_keep_their_release_across_switch_and_watcher_restart(self) -> None:
+        """Step 3: a job stays on the release it started on, through a switch and a watcher restart.
+
+        Mirrors the live path: bopeep-watch, started through `current`, runs its
+        harvest command, which starts the job in a detached tmux session the way
+        job-launch does. The tmux server is started with r1 first on PATH, so job
+        B getting r2 shows each session takes PATH from its client, not the server.
+        """
+        tmux = shutil.which("tmux")
+        if not tmux:
+            if os.environ.get("CI"):
+                self.fail("tmux is required in CI for the job binding test")
+            self.skipTest("tmux is not installed")
+        pins_r2_file = self.pins_r2()
+        root = self.tmp / "root-jobs"
+
+        for verb, rid, pins in (
+            ("deploy", "r1", self.pins_r1_file),
+            ("prepare", "r2", pins_r2_file),
+            ("prepare", "r3", pins_r2_file),
+        ):
+            cp = self.run_cli(verb, "--root", str(root), "--pins", str(pins), "--release-id", rid)
+            self.assertEqual(cp.returncode, 0, f"{verb} {rid}\nstdout:\n{cp.stdout}\nstderr:\n{cp.stderr}")
+        r1_bin = root / "releases" / "r1" / "bin"
+
+        # A host entry point in the member wrapper format, with guild-exec linked to `current`.
+        host_bin = self.tmp / "jobs-host-bin"
+        host_bin.mkdir()
+        os.symlink(root / "current" / "bin" / "guild-exec", host_bin / "guild-exec")
+        (host_bin / "pr-lint").write_text('#!/bin/sh\nexec guild-exec bopeep bin/pr-lint "$@"\n', encoding="utf-8")
+        (host_bin / "pr-lint").chmod(0o755)
+
+        lint_body = self.tmp / "jobs-lint-body.md"
+        lint_body.write_text(
+            "## Why\n\nJob release binding.\n\n## What changes\n\nNothing.\n\n## What to check\n\nOutput marker.\n",
+            encoding="utf-8",
+        )
+        lint = " ".join(shlex.quote(a) for a in (
+            "--body", str(lint_body), "--branch", "feat/contract", "--base", "main",
+            "--create-cmd", "gh pr create --label no-changelog-needed",
+        ))
+        host_lint = shlex.quote(str(host_bin / "pr-lint"))
+        job_script = self.tmp / "job.sh"
+        job_script.write_text(
+            "#!/bin/sh\n"
+            'd=$1\n'
+            f"cd {shlex.quote(str(self.work_root / 'widgets'))}\n"
+            'printf "%s\\n" "$PATH" > "$d/path"\n'
+            f'pr-lint {lint} > "$d/first" 2>&1\n'
+            f'{host_lint} {lint} > "$d/host-first" 2>&1\n'
+            ': > "$d/ready"\n'
+            'while [ ! -e "$d/go" ]; do sleep 0.1; done\n'
+            f'pr-lint {lint} > "$d/second" 2>&1\n'
+            f'{host_lint} {lint} > "$d/host-second" 2>&1\n'
+            ': > "$d/done"\n',
+            encoding="utf-8",
+        )
+        # The harvest command: like job-launch, start the job in a detached tmux session.
+        job_start = self.tmp / "job-start"
+        job_start.write_text(
+            "#!/bin/sh\nset -eu\n"
+            'd=$JOBS_DIR/$JOB_LABEL\n'
+            'mkdir -p "$d"\n'
+            ': > "$d/starting"\n'
+            'if [ -n "${JOB_GATE-}" ]; then while [ ! -e "$JOB_GATE" ]; do sleep 0.1; done; fi\n'
+            '"$JOB_TMUX" -L "$JOB_TMUX_SOCKET" new-session -d -s "job-$JOB_LABEL" "sh $JOB_SCRIPT $d"\n',
+            encoding="utf-8",
+        )
+        job_start.chmod(0o755)
+
+        jobs_dir = self.tmp / "jobs"
+        socket = f"guild-step3-{os.getpid()}"
+        server_env = {**self.git_env, "HOME": str(self.user_home), "PATH": build_clean_path(r1_bin, host_bin)}
+        subprocess.run(
+            [tmux, "-L", socket, "-f", "/dev/null", "start-server", ";", "set", "-g", "exit-empty", "off"],
+            env=server_env, check=True, capture_output=True, text=True,
+        )
+        self.addCleanup(
+            subprocess.run, [tmux, "-L", socket, "kill-server"], env=server_env, capture_output=True
+        )
+
+        def watcher(label: str, gate: Path | None = None) -> subprocess.Popen[str]:
+            env = {
+                **self.git_env,
+                "HOME": str(self.user_home),
+                "PATH": build_clean_path(host_bin, self.stub_bin),
+                "BOPEEP_GH": str(self.stub_bin / "gh"),
+                "BOPEEP_STATE": str(self.tmp / f"watch-state-{label}"),
+                "SYNTHETIC_GH_SCENARIO": str(self.scenario_clear),
+                "JOBS_DIR": str(jobs_dir),
+                "JOB_LABEL": label,
+                "JOB_TMUX": tmux,
+                "JOB_TMUX_SOCKET": socket,
+                "JOB_SCRIPT": str(job_script),
+            }
+            if gate is not None:
+                env["JOB_GATE"] = str(gate)
+            return subprocess.Popen(
+                [str(root / "current" / "bin" / "bopeep-watch"), "--once"],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+
+        def wait_for(path: Path, what: str, timeout: float = 60.0) -> None:
+            deadline = time.monotonic() + timeout
+            while not path.exists():
+                if time.monotonic() > deadline:
+                    logs = {p.name: p.read_text(errors="replace") for p in path.parent.glob("*") if p.is_file()}
+                    self.fail(f"timed out waiting for {what}: {path}\n{logs}")
+                time.sleep(0.1)
+
+        def finish(proc: subprocess.Popen[str], label: str) -> None:
+            out, _ = proc.communicate(timeout=120)
+            self.assertEqual(proc.returncode, 0, f"watcher {label} output:\n{out}")
+            self.assertIn("harvest exit 0", out, f"watcher {label} output:\n{out}")
+
+        # 1. Watcher W1 starts on r1, then holds in its harvest command across the switch to r2.
+        gate = self.tmp / "jobs-gate-a"
+        w1 = watcher("a", gate)
+        wait_for(jobs_dir / "a" / "starting", "watcher W1 to reach its harvest command", timeout=120)
+        sw = self.run_cli("switch", "--root", str(root), "--release-id", "r2", "--skip-check")
+        self.assertEqual(sw.returncode, 0, sw.stderr)
+        gate.touch()
+        finish(w1, "a")
+
+        # 2. A restarted watcher W2 starts from `current`, now r2, and starts job B.
+        finish(watcher("b"), "b")
+        wait_for(jobs_dir / "a" / "ready", "job A's first helper calls")
+        wait_for(jobs_dir / "b" / "ready", "job B's first helper calls")
+
+        # 3. Both releases are in use while their jobs run; prune keeps r1 though it is
+        #    neither current nor previous after a further switch to r3.
+        sw3 = self.run_cli("switch", "--root", str(root), "--release-id", "r3", "--skip-check")
+        self.assertEqual(sw3.returncode, 0, sw3.stderr)
+        st = self.run_cli("status", "--root", str(root), "--json")
+        self.assertEqual(st.returncode, 0, st.stderr)
+        in_use = json.loads(st.stdout)["in_use"]
+        self.assertIn("r1", in_use)
+        self.assertIn("r2", in_use)
+        pr = self.run_cli("prune", "--root", str(root), "--json")
+        self.assertEqual(pr.returncode, 0, pr.stderr)
+        self.assertEqual(json.loads(pr.stdout)["removed"], [])
+        self.assertTrue((root / "releases" / "r1").is_dir())
+
+        # 4. The jobs make their second helper calls after both switches.
+        for label in ("a", "b"):
+            (jobs_dir / label / "go").touch()
+        for label in ("a", "b"):
+            wait_for(jobs_dir / label / "done", f"job {label} to finish")
+
+        def out(label: str, name: str) -> str:
+            """The last line: pr-lint prints its warnings first."""
+            return (jobs_dir / label / name).read_text(encoding="utf-8").strip().splitlines()[-1]
+
+        self.assertEqual(out("a", "path").split(os.pathsep)[0], str(root.resolve() / "releases" / "r1" / "bin"))
+        self.assertEqual(out("b", "path").split(os.pathsep)[0], str(root.resolve() / "releases" / "r2" / "bin"))
+        for name in ("first", "host-first", "second", "host-second"):
+            self.assertEqual(out("a", name), "pr-lint PASS", f"job A {name}")
+            self.assertEqual(out("b", name), "pr-lint PASS (v2)", f"job B {name}")
+
+        # Control: outside a job, the same host entry point follows `current`.
+        unbound = subprocess.run(
+            [str(host_bin / "pr-lint"), *shlex.split(lint)],
+            cwd=str(self.work_root / "widgets"),
+            env={**self.git_env, "HOME": str(self.user_home), "PATH": build_clean_path(host_bin)},
+            text=True, capture_output=True,
+        )
+        self.assertEqual(unbound.stdout.strip().splitlines()[-1], "pr-lint PASS (v2)", unbound.stderr)
+
+        # 5. Once job A has exited, r1 is no longer in use and prune removes it. The tmux
+        #    server still has r1 on its PATH, and does not count.
+        deadline = time.monotonic() + 30
+        while True:
+            st = json.loads(self.run_cli("status", "--root", str(root), "--json").stdout)
+            if "r1" not in st["in_use"] or time.monotonic() > deadline:
+                break
+            time.sleep(0.2)
+        self.assertNotIn("r1", st["in_use"])
+        pr = self.run_cli("prune", "--root", str(root), "--json")
+        self.assertEqual(pr.returncode, 0, pr.stderr)
+        pruned = json.loads(pr.stdout)
+        self.assertEqual(pruned["removed"], ["r1"])
+        self.assertEqual((pruned["current"], pruned["previous"]), ("r3", "r2"))
+        self.assertEqual(sorted(p.name for p in (root / "releases").iterdir()), ["r2", "r3"])
 
 
 if __name__ == "__main__":

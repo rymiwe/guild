@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, verify, atomically switch, and roll back pinned Guild releases.
+"""Prepare, verify, atomically switch, roll back, and prune pinned Guild releases.
 
 Release layout under --root:
   <root>/
@@ -1196,6 +1196,79 @@ def rollback_release(
     return switch_release(root=root, release_id=target_id, skip_check=skip_check)
 
 
+def _release_of(path_str: str, releases_dir: Path) -> str | None:
+    """The release id a path lies in, after resolving symlinks such as `current`."""
+    if not path_str or not path_str.startswith("/"):
+        return None
+    try:
+        resolved = Path(os.path.realpath(path_str))
+    except (OSError, ValueError):
+        return None
+    if releases_dir == resolved or releases_dir not in resolved.parents:
+        return None
+    return resolved.relative_to(releases_dir).parts[0]
+
+
+def releases_in_use(root: Path) -> dict[str, list[int]]:
+    """Release ids that running processes are bound to, with their pids.
+
+    A process is bound to a release when its PATH has an entry in that release,
+    GUILD_RELEASE_DIR names it, or an argument of its command line lies in it.
+    A tmux process is skipped: a server keeps the environment of the job that
+    started it, but each new session takes its PATH from the client, so the
+    server never runs Guild code. Processes this user cannot read are skipped.
+    """
+    proc = Path("/proc")
+    if not (proc / "self" / "environ").is_file():
+        raise ReleaseError("cannot list running processes: /proc is not available")
+    releases_dir = (root / "releases").resolve()
+    used: dict[str, set[int]] = {}
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            if os.path.basename(os.readlink(entry / "exe")) == "tmux":
+                continue
+            environ = (entry / "environ").read_bytes().split(b"\0")
+            cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        paths: list[str] = []
+        for item in environ:
+            key, _, value = item.decode("utf-8", "replace").partition("=")
+            if key == "PATH":
+                paths.extend(value.split(os.pathsep))
+            elif key == "GUILD_RELEASE_DIR":
+                paths.append(value)
+        paths.extend(arg.decode("utf-8", "replace") for arg in cmdline)
+        for p in paths:
+            rid = _release_of(p, releases_dir)
+            if rid:
+                used.setdefault(rid, set()).add(pid)
+    return {rid: sorted(pids) for rid, pids in sorted(used.items())}
+
+
+def prune_releases(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    """Remove each release that is not current, not previous, and not in use.
+
+    No new job can bind to such a release: a new job resolves `current`, and
+    only a process already bound to a release can start another job on it,
+    which keeps that release in use.
+    """
+    root = root.resolve()
+    st = status_report(root)
+    keep = {st["current"], st["previous"], *st["in_use"]}
+    removed: list[str] = []
+    for rid in st["releases"]:
+        if rid in keep:
+            continue
+        if not dry_run:
+            shutil.rmtree(root / "releases" / rid)
+        removed.append(rid)
+    return {**st, "removed": removed, "dry_run": dry_run}
+
+
 def status_report(root: Path) -> dict[str, Any]:
     root = root.resolve()
     releases_dir = root / "releases"
@@ -1207,6 +1280,7 @@ def status_report(root: Path) -> dict[str, Any]:
         "current": read_pointer_id(root, "current", tolerate_dangling=True),
         "previous": read_pointer_id(root, "previous", tolerate_dangling=True),
         "releases": releases,
+        "in_use": releases_in_use(root) if releases else {},
     }
 
 
@@ -1246,6 +1320,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_st = sub.add_parser("status")
     p_st.add_argument("--root", type=Path, required=True)
     p_st.add_argument("--json", action="store_true")
+
+    p_pr = sub.add_parser("prune")
+    p_pr.add_argument("--root", type=Path, required=True)
+    p_pr.add_argument("--dry-run", action="store_true")
+    p_pr.add_argument("--json", action="store_true")
 
     return ap
 
@@ -1301,6 +1380,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.cmd == "status":
             res = status_report(args.root)
+        elif args.cmd == "prune":
+            res = prune_releases(args.root, dry_run=args.dry_run)
         else:
             raise ReleaseError(f"unknown command: {args.cmd}")
     except (ReleaseError, OSError, ValueError, KeyError) as exc:
