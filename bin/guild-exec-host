@@ -1,0 +1,16 @@
+#!/bin/sh
+# Host guild-exec. A tool in the active Guild release runs from that release;
+# any other tool (or no release yet) runs from its main checkout.
+#
+# usage: guild-exec TOOL PATH [ARG...]
+#
+# Install: ln -sfn <guild>/bin/guild-exec-host ~/.local/bin/guild-exec
+# Undo:    ln -sfn ~/code/quartermaster/bin/guild-exec ~/.local/bin/guild-exec
+root=${GUILD_RELEASE_ROOT:-$HOME/.local/share/guild}
+fallback=${GUILD_EXEC_FALLBACK:-$HOME/code/quartermaster/bin/guild-exec}
+
+if [ $# -ge 1 ] && release=$(readlink -f "$root/current" 2>/dev/null) &&
+  [ -d "$release/code/$1" ] && [ -x "$release/bin/guild-exec" ]; then
+  exec "$release/bin/guild-exec" "$@"
+fi
+exec "$fallback" "$@"

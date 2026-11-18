@@ -2,7 +2,7 @@
 
 **Goal.** Update the Surface to one verified set of Guild tools without copying a command into a terminal for each release. Keep the Surface guard in place and keep the previous release usable for rollback.
 
-**Status.** Steps 1 to 3 are done. Step 4 (Surface rollout) has not started. Running jobs stay on the release they started on across a switch and a `bopeep-watch` restart, and `guild-release prune` removes only releases that no running process is bound to. Running `.github/workflows/ci.yml` on GitHub Actions requires the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
+**Status.** Steps 1 to 3 are done. Step 4's updater and host `guild-exec` are built and verified on BLD; enabling them on the Surface waits on the owner. Running jobs stay on the release they started on across a switch and a `bopeep-watch` restart, and `guild-release prune` removes only releases that no running process is bound to. Running `.github/workflows/ci.yml` on GitHub Actions requires the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
 
 | Step | Work | Done when |
 | --- | --- | --- |
@@ -51,6 +51,29 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
   - `python3 tests/test_pr_gate_contract.py -v`: `Ran 7 tests in 6.521s, OK`
   - `python3 tests/test_release_lifecycle.py -v`: `Ran 5 tests in 117.487s, OK`. The new `test_running_jobs_keep_their_release_across_switch_and_watcher_restart` runs the real `bopeep-watch --once` through `current/bin`. Its harvest command starts each job in a detached tmux session, as `job-launch` does. Watcher W1 starts on r1 and holds while `current` switches to r2, then starts job A. A restarted watcher W2 starts job B on r2. After a further switch to r3, each job calls `pr-lint` again, by name and through a host wrapper whose `guild-exec` links to `current`. Job A prints the r1 result (`pr-lint PASS`) on both calls, and job B prints the r2 result (`pr-lint PASS (v2)`) on both. The same host wrapper outside a job prints the r2 result. While A runs, `prune` keeps r1. Once A exits, `prune` removes r1, even though the tmux server still has r1 on its `PATH`.
 - **CI workflow**: `.github/workflows/ci.yml` installs tmux before the lifecycle tests. The job binding test fails, rather than skips, when tmux is missing under `CI`.
+
+## Step 4 checks and mechanism
+
+- **Updater (`bin/guild-update`, `systemd/guild-update.{service,timer}`)**: every 15 minutes it fetches its own Guild checkout (`~/.local/share/guild/src`) and reads `origin/HEAD`. It installs release `g-<sha12>` only when every GitHub check run on that exact commit completed with success, skipped, or neutral. It waits, silently, while CI is queued or running.
+  - It then checks that commit out, fetches each pinned member under `~/code`, and runs `guild-release deploy`. On success it runs `systemctl --user try-restart bopeep-watch.service` and `guild-release prune`.
+  - A failure leaves the active release in place, exits 1, writes `<root>/failed/<id>`, and sends one `job-notify --send` ping. The marker stops a retry of that commit. The next Guild commit tries again.
+  - The updater runs from the checkout it updates, so a new updater takes effect only after its own commit passes CI.
+  - A release that exists but is not current was rolled away from by hand. The updater leaves it alone until the next Guild commit.
+- **Host `guild-exec` (`bin/guild-exec-host`)**: member wrappers in `~/.local/bin` and `~/.claude/hooks` call `guild-exec TOOL PATH`. Linked as `~/.local/bin/guild-exec`, this sends a tool the active release carries to that release, and any other tool (for example `thresher`) to `~/code/quartermaster/bin/guild-exec`. With no release it sends everything there, so installing it first changes nothing.
+- **BLD verification (2026-11-18)**: `guild-release deploy` into a scratch root with `tests/member-pins.json` built `bld1` in 8 s. Through `current/bin`, `pr-gate --repo rymiwe/guild --pr 6` printed the same eleven lines as the live `~/.local/bin/pr-gate`. A second release from member trunks switched and rolled back. The Quartermaster pin [d47a182](https://github.com/rymiwe/quartermaster/commit/d47a182c8e5d03f95c681fcb4a51de34d690f8e3) is the cgroup fix ([quartermaster#109](https://github.com/rymiwe/quartermaster/pull/109)).
+- **Command**: `python3 tests/test_guild_update.py -v`. **Result**: `Ran 3 tests, OK` (waits on running or missing CI; failed CI pings once and installs nothing; passed CI activates, a repeat run is a no-op, the host `guild-exec` routes release and non-release tools, and a CI-passed commit with an unfetchable pin leaves the release active).
+
+### Enable on the Surface (owner runs, once)
+
+```bash
+gh repo clone rymiwe/guild ~/.local/share/guild/src
+ln -sfn ~/.local/share/guild/src/bin/guild-exec-host ~/.local/bin/guild-exec   # no-op until a release exists
+~/.local/share/guild/src/bin/guild-update && readlink ~/.local/share/guild/current
+systemctl --user link ~/.local/share/guild/src/systemd/guild-update.service ~/.local/share/guild/src/systemd/guild-update.timer
+systemctl --user enable --now guild-update.timer
+```
+
+Check the launcher version: `~/.local/share/guild/current/code/quartermaster` must contain [d47a182](https://github.com/rymiwe/quartermaster/commit/d47a182c8e5d03f95c681fcb4a51de34d690f8e3). Undo: `systemctl --user disable --now guild-update.timer`, then `ln -sfn ~/code/quartermaster/bin/guild-exec ~/.local/bin/guild-exec` and `systemctl --user try-restart bopeep-watch.service`.
 
 ## Open follow-ups
 

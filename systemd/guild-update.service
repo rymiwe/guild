@@ -1,0 +1,7 @@
+[Unit]
+Description=Install the newest Guild release that passed CI
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/share/guild/src/bin/guild-update

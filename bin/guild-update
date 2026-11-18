@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Install the newest Guild release whose exact commit passed CI. guild-update.timer runs it.
+#
+# usage: guild-update
+#
+# Each run:
+#   1. Fetches the Guild checkout at $GUILD_SRC and reads the commit at origin/HEAD.
+#   2. Stops when release g-<sha12> already exists. A release that exists but is not
+#      current was rolled away from by hand, and the updater leaves it alone.
+#   3. Waits (exit 0) while CI on that commit is queued or running. Fails when any
+#      check run did not succeed.
+#   4. Checks out that commit, fetches each pinned member under $GUILD_MEMBER_SOURCES_DIR,
+#      and runs `guild-release deploy`. A failed deploy leaves the active release in place.
+#   5. Restarts the watcher (try-restart: only when it runs) and prunes unused releases.
+#
+# A failure prints to stderr, exits 1, writes <root>/failed/<id>, and pings through
+# `job-notify --send` when it is on PATH. The marker stops a retry of the same commit;
+# the next Guild commit tries again.
+#
+# Environment:
+#   GUILD_RELEASE_ROOT        release root (default ~/.local/share/guild)
+#   GUILD_SRC                 Guild checkout the updater runs from (default <root>/src)
+#   GUILD_MEMBER_SOURCES_DIR  member checkouts (default ~/code)
+#   GUILD_UPDATE_RESTART      units to try-restart after a switch (default bopeep-watch.service)
+set -euo pipefail
+
+root=${GUILD_RELEASE_ROOT:-$HOME/.local/share/guild}
+src=${GUILD_SRC:-$root/src}
+sources=${GUILD_MEMBER_SOURCES_DIR:-$HOME/code}
+restart_units=${GUILD_UPDATE_RESTART-bopeep-watch.service}
+
+say() { printf 'guild-update: %s\n' "$*" >&2; }
+
+id=
+fail() {
+  say "FAILED: $*"
+  if [ -n "$id" ]; then
+    mkdir -p "$root/failed"
+    printf '%s\n' "$*" >"$root/failed/$id"
+  fi
+  if command -v job-notify >/dev/null 2>&1; then
+    job-notify --send "$root" guild-update FAILED "$*" || say "job-notify failed"
+  fi
+  exit 1
+}
+
+mkdir -p "$root"
+exec 9>"$root/.update.lock"
+flock -n 9 || { say "another update is running"; exit 0; }
+
+git -C "$src" rev-parse --git-dir >/dev/null 2>&1 || fail "$src is not a git checkout of Guild"
+git -C "$src" fetch -q origin || fail "git fetch failed in $src"
+sha=$(git -C "$src" rev-parse refs/remotes/origin/HEAD) || fail "no origin/HEAD in $src"
+id=g-${sha:0:12}
+
+if [ -e "$root/releases/$id" ]; then
+  exit 0
+fi
+if [ -e "$root/failed/$id" ]; then
+  exit 1
+fi
+
+slug=$(git -C "$src" remote get-url origin | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')
+case $slug in
+  */*) ;;
+  *) fail "cannot read owner/repo from the origin URL in $src" ;;
+esac
+
+runs=$(gh api "repos/$slug/commits/$sha/check-runs" \
+  --jq '.check_runs[] | "\(.status) \(.conclusion // "-") \(.name)"') ||
+  { say "cannot read CI for $sha; will retry"; exit 0; }
+if [ -z "$runs" ]; then
+  say "no CI runs yet for $sha; waiting"
+  exit 0
+fi
+if grep -qv '^completed ' <<<"$runs"; then
+  say "CI still running for $sha; waiting"
+  exit 0
+fi
+bad=$(grep -Ev '^completed (success|skipped|neutral) ' <<<"$runs" || true)
+[ -z "$bad" ] || fail "CI did not pass on $sha: $(tr '\n' ';' <<<"$bad")"
+
+git -C "$src" -c advice.detachedHead=false checkout -q --detach "$sha" ||
+  fail "cannot check out $sha in $src"
+
+for member in $(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))))' "$src/tests/member-pins.json"); do
+  git -C "$sources/$member" fetch -q origin || fail "git fetch failed for $member in $sources"
+done
+
+out=$(python3 "$src/bin/guild-release" deploy --root "$root" --sources-dir "$sources" --release-id "$id" 2>&1) ||
+  fail "deploy of $id failed: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
+say "activated $id"
+
+for unit in $restart_units; do
+  systemctl --user try-restart "$unit" || say "try-restart $unit failed"
+done
+python3 "$src/bin/guild-release" prune --root "$root" >/dev/null || say "prune failed"
