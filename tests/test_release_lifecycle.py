@@ -737,6 +737,12 @@ class ReleaseLifecycleTest(unittest.TestCase):
             [tmux, "-L", socket, "-f", "/dev/null", "start-server", ";", "set", "-g", "exit-empty", "off"],
             env=server_env, check=True, capture_output=True, text=True,
         )
+        socket_path = Path(subprocess.run(
+            [tmux, "-L", socket, "display-message", "-p", "#{socket_path}"],
+            env=server_env, check=True, capture_output=True, text=True,
+        ).stdout.strip())
+        # Cleanups run last-in first-out: stop the server, then remove its socket file.
+        self.addCleanup(socket_path.unlink, missing_ok=True)
         self.addCleanup(
             subprocess.run, [tmux, "-L", socket, "kill-server"], env=server_env, capture_output=True
         )
