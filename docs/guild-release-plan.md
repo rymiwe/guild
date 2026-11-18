@@ -2,7 +2,7 @@
 
 **Goal.** Update the Surface to one verified set of Guild tools without copying a command into a terminal for each release. Keep the Surface guard in place and keep the previous release usable for rollback.
 
-**Status.** Ready to start the parent integration test. The current `pr-gate` migration has already landed in both repos and passed on BLD and the Surface.
+**Status.** Step 1 complete locally (ready for Step 2). The cross-repo contract test pins the migrated baseline (`tests/member-pins.json`) and passes against the real installed commands in an isolated temporary prefix. Running `.github/workflows/ci.yml` on GitHub Actions requires configuring the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
 
 | Step | Work | Done when |
 | --- | --- | --- |
@@ -16,6 +16,17 @@
 Member repos own their unit and component tests. Guild owns the installed command contracts and release lifecycle. Keep machine configuration, credentials, and live job state outside release directories. A change that makes shared state unreadable by the previous release needs its own rollout decision.
 
 Do not add a rollout format or scheduler in step 1. The first deliverable is the integration test and its exact input pins. Record the test command and result in the change that closes each step.
+
+## Step 1 checks and pins
+
+- **Pins (`tests/member-pins.json`)**:
+  - `bridgekeeper`: `a55d996336ecceed421c80637160d7a5742d8242`
+  - `bopeep`: `94d07f8e3ec1eb4d7e8665c58be2938360c2c746`
+  - `quartermaster`: `d47a182c8e5d03f95c681fcb4a51de34d690f8e3`
+  - `conclave`: `79775e7806ddfc8db18a8c188a2a31a7af7429c7`
+- **Command**: `python3 tests/test_pr_gate_contract.py -v`
+- **Result**: `Ran 7 tests in 5.500s, OK` (installed wrappers, clear gate `pr-gate PASS`, blocker URL `FAIL: unanswered_threads: unanswered: https://github.com/AcmeCorp/widgets/pull/7#discussion_r456`, real `pr-lint` failure, missing `threads-check` error, missing `pr-lint` error, and unchanged host install paths; also verified against shallow detached-HEAD CI-style source clones with `GUILD_MEMBER_SOURCES_DIR`).
+- **CI workflow**: `.github/workflows/ci.yml` checks out the exact SHAs from `tests/member-pins.json` using `secrets.GUILD_READ_TOKEN` (failing closed if unset) and runs `python3 tests/test_pr_gate_contract.py -v`.
 
 ## Open follow-ups
 

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pr-gate-contract:
+    runs-on: ubuntu-24.04
+    env:
+      HAS_GUILD_READ_TOKEN: ${{ secrets.GUILD_READ_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Load pinned member commits
+        run: |
+          set -eu
+          if [ "${HAS_GUILD_READ_TOKEN}" != "true" ]; then
+            echo "ERROR: secrets.GUILD_READ_TOKEN is required to check out private member repos (bridgekeeper, bopeep, quartermaster, conclave)." >&2
+            exit 1
+          fi
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json
+          from pathlib import Path
+          pins = json.loads(Path("tests/member-pins.json").read_text(encoding="utf-8"))
+          for key in ("bridgekeeper", "bopeep", "quartermaster", "conclave"):
+              sha = pins[key]
+              if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+                  raise SystemExit(f"invalid SHA for {key}: {sha!r}")
+              print(f"{key.upper()}_SHA={sha}")
+          PY
+
+      - name: Check out pinned bridgekeeper
+        uses: actions/checkout@v4
+        with:
+          repository: rymiwe/bridgekeeper
+          ref: ${{ env.BRIDGEKEEPER_SHA }}
+          token: ${{ secrets.GUILD_READ_TOKEN }}
+          path: .deps/bridgekeeper
+          persist-credentials: false
+
+      - name: Check out pinned bopeep
+        uses: actions/checkout@v4
+        with:
+          repository: rymiwe/bopeep
+          ref: ${{ env.BOPEEP_SHA }}
+          token: ${{ secrets.GUILD_READ_TOKEN }}
+          path: .deps/bopeep
+          persist-credentials: false
+
+      - name: Check out pinned quartermaster
+        uses: actions/checkout@v4
+        with:
+          repository: rymiwe/quartermaster
+          ref: ${{ env.QUARTERMASTER_SHA }}
+          token: ${{ secrets.GUILD_READ_TOKEN }}
+          path: .deps/quartermaster
+          persist-credentials: false
+
+      - name: Check out pinned conclave
+        uses: actions/checkout@v4
+        with:
+          repository: rymiwe/conclave
+          ref: ${{ env.CONCLAVE_SHA }}
+          token: ${{ secrets.GUILD_READ_TOKEN }}
+          path: .deps/conclave
+          persist-credentials: false
+
+      - name: Run installed pr-gate cross-repo contract test
+        env:
+          GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
+        run: python3 tests/test_pr_gate_contract.py -v
