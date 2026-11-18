@@ -121,6 +121,7 @@ class GuildUpdateTest(unittest.TestCase):
             "GUILD_RELEASE_ROOT": str(self.root),
             "GUILD_MEMBER_SOURCES_DIR": str(self.sources),
             "GUILD_UPDATE_RESTART": "",
+            "GUILD_UPDATE_REPO": "acme/guild",
             "PSTACK_HOME": str(self.pstack),
             "GH_RUNS_FILE": str(self.runs),
             "NOTIFY_LOG": str(self.notify_log),
@@ -151,8 +152,37 @@ class GuildUpdateTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("will retry", proc.stderr)
         self.assertIsNone(self.current())
-        self.assertFalse((self.root / "failed").exists())
         self.assertEqual(self.notifications(), [])
+
+        # From the 8th run in a row the error fails each run but pings once.
+        self._git("-C", str(bopeep), "remote", "set-url", "origin", str(self.tmp / "missing.git"))
+        try:
+            codes = [self.update("completed success pr-gate-contract\n").returncode for _ in range(9)]
+        finally:
+            self._git("-C", str(bopeep), "remote", "set-url", "origin", url)
+        self.assertEqual(codes, [0] * 6 + [1, 1, 1])
+        self.assertEqual(len(self.notifications()), 1)
+        self.assertIn("runs in a row", self.notifications()[0])
+
+    def test_hand_rollback_stands_after_prune(self) -> None:
+        bin_ = str(ROOT / "bin" / "guild-release")
+        env = {**self.git_env, "PATH": step1.build_clean_path(),
+               "GUILD_MEMBER_SOURCES_DIR": str(self.sources), "PSTACK_HOME": str(self.pstack)}
+        deploy = [sys.executable, bin_, "deploy", "--root", str(self.root), "--release-id"]
+        subprocess.run([*deploy, "old"], env=env, check=True, capture_output=True, timeout=300)
+        new = self.head_id()
+        self.assertEqual(self.update("completed success pr-gate-contract\n").returncode, 0)
+        self.assertEqual(self.current(), f"releases/{new}")
+        subprocess.run([sys.executable, bin_, "rollback", "--root", str(self.root)],
+                       env=env, check=True, capture_output=True, timeout=300)
+        # A hand deploy pushes the rolled-away release out of previous, so prune removes it.
+        subprocess.run([*deploy, "hand"], env=env, check=True, capture_output=True, timeout=300)
+        subprocess.run([sys.executable, bin_, "prune", "--root", str(self.root)],
+                       env=env, check=True, capture_output=True, timeout=300)
+        self.assertFalse((self.root / "releases" / new).exists(), "prune should remove the rolled-away release")
+        proc = self.update("completed success pr-gate-contract\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.current(), "releases/hand", "the updater must not undo a hand rollback")
 
     def test_waits_while_ci_runs_and_when_no_runs(self) -> None:
         for runs in ("", "in_progress - pr-gate-contract\n"):
@@ -167,7 +197,6 @@ class GuildUpdateTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("CI did not pass", proc.stderr)
         self.assertIsNone(self.current())
-        self.assertTrue((self.root / "failed" / self.head_id()).is_file())
         self.assertEqual(len(self.notifications()), 1)
         self.assertIn("guild-update FAILED", self.notifications()[0])
 

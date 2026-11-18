@@ -5,26 +5,29 @@
 #
 # Each run:
 #   1. Fetches the Guild checkout at $GUILD_SRC and reads the commit at origin/HEAD.
-#   2. Stops when release g-<sha12> already exists. A release that exists but is not
-#      current was rolled away from by hand, and the updater leaves it alone.
-#   3. Waits (exit 0) while CI on that commit is queued or running. Fails when the
-#      latest run of any check did not succeed; a re-run that passes recovers it.
+#   2. Stops when <root>/installed/g-<sha12> exists: that commit was activated once, and
+#      a later hand rollback or switch away from it stands until the next Guild commit.
+#      `guild-release prune` never touches installed/.
+#   3. Waits (exit 0) while the push workflow runs for that commit are queued or running.
+#      Fails when the latest attempt of any of them did not succeed; a passing re-run
+#      recovers the commit.
 #   4. Exports that commit to a candidate directory, fetches each pinned member under
-#      $GUILD_MEMBER_SOURCES_DIR, and runs the candidate's `guild-release deploy`. A
-#      failed deploy leaves the active release and $GUILD_SRC where they were.
-#   5. On success, moves $GUILD_SRC to that commit, so a new updater and host guild-exec
-#      take effect only with a release that deployed. Then it restarts the watcher
-#      (try-restart: only when it runs) and prunes unused releases.
+#      $GUILD_MEMBER_SOURCES_DIR, and runs the candidate's `guild-release deploy` (or
+#      `switch`, when an earlier run built the release but did not activate it). A
+#      failure leaves the active release and $GUILD_SRC where they were.
+#   5. On success, records installed/<id>, moves $GUILD_SRC to that commit (so a new
+#      updater and host guild-exec take effect only with a release that deployed), restarts
+#      the watcher (try-restart: only when it runs), and prunes unused releases.
 #
-# A fetch or GitHub API error is transient: it prints to stderr and exits 0.
-# A failure prints to stderr, exits 1, and pings through `job-notify --send` when it is
-# on PATH. <root>/failed/<id> records the ping, so each commit pings once; later runs
-# still retry it.
+# Reporting: a failure exits 1 and pings once per distinct message through
+# `job-notify --send`. A fetch or GitHub API error is transient and exits 0, but
+# from the 8th transient error in a row (2 hours at the timer's pace) each run fails.
 #
 # Environment:
 #   GUILD_RELEASE_ROOT        release root (default ~/.local/share/guild)
 #   GUILD_SRC                 Guild checkout the updater runs from (default <root>/src)
 #   GUILD_MEMBER_SOURCES_DIR  member checkouts (default ~/code)
+#   GUILD_UPDATE_REPO         GitHub owner/repo for CI (default: read from the origin URL)
 #   GUILD_UPDATE_RESTART      units to try-restart after a switch (default bopeep-watch.service)
 set -euo pipefail
 
@@ -32,24 +35,36 @@ root=${GUILD_RELEASE_ROOT:-$HOME/.local/share/guild}
 src=${GUILD_SRC:-$root/src}
 sources=${GUILD_MEMBER_SOURCES_DIR:-$HOME/code}
 restart_units=${GUILD_UPDATE_RESTART-bopeep-watch.service}
+state=$root/update-state
+transient_limit=8
 
 say() { printf 'guild-update: %s\n' "$*" >&2; }
 
-id=
+# Ping once per distinct failure message. Record it only after the ping went out.
 fail() {
   say "FAILED: $*"
-  if [ -n "$id" ] && [ ! -e "$root/failed/$id" ]; then
-    mkdir -p "$root/failed"
-    printf '%s\n' "$*" >"$root/failed/$id"
-    if command -v job-notify >/dev/null 2>&1; then
-      job-notify --send "$root" guild-update FAILED "$*" || say "job-notify failed"
+  if [ "$(cat "$state/last-failure" 2>/dev/null)" != "$*" ]; then
+    if ! command -v job-notify >/dev/null 2>&1; then
+      say "job-notify not on PATH"
+      printf '%s\n' "$*" >"$state/last-failure"
+    elif job-notify --send "$root" guild-update FAILED "$*"; then
+      printf '%s\n' "$*" >"$state/last-failure"
+    else
+      say "job-notify failed; will ping again next run"
     fi
   fi
   exit 1
 }
-transient() { say "$*; will retry"; exit 0; }
+transient() {
+  n=$(( $(cat "$state/transient" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$n" >"$state/transient"
+  [ "$n" -lt "$transient_limit" ] || fail "$* ($transient_limit or more runs in a row)"
+  say "$*; will retry"
+  exit 0
+}
+ok() { rm -f "$state/transient" "$state/last-failure"; exit 0; }
 
-mkdir -p "$root"
+mkdir -p "$state" "$root/installed"
 exec 9>"$root/.update.lock"
 flock -n 9 || { say "another update is running"; exit 0; }
 
@@ -58,18 +73,22 @@ git -C "$src" fetch -q origin || transient "git fetch failed in $src"
 sha=$(git -C "$src" rev-parse refs/remotes/origin/HEAD) || fail "no origin/HEAD in $src"
 id=g-${sha:0:12}
 
-if [ -e "$root/releases/$id" ]; then
-  exit 0
+if [ -e "$root/installed/$id" ]; then
+  if [ "$(git -C "$src" rev-parse HEAD)" != "$sha" ]; then
+    git -C "$src" -c advice.detachedHead=false checkout -q --detach "$sha" ||
+      fail "installed $id but cannot move $src to it"
+  fi
+  ok
 fi
 
-slug=$(git -C "$src" remote get-url origin | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')
-case $slug in
-  */*) ;;
-  *) fail "cannot read owner/repo from the origin URL in $src" ;;
-esac
+repo=${GUILD_UPDATE_REPO:-$(git -C "$src" remote get-url origin |
+  sed -E 's#^(git@github\.com:|https://github\.com/|ssh://git@github\.com/)##; s#\.git$##')}
+[[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+  fail "cannot read owner/repo from the origin URL in $src; set GUILD_UPDATE_REPO"
 
-runs=$(gh api "repos/$slug/commits/$sha/check-runs" \
-  --jq '.check_runs[] | "\(.status) \(.conclusion // "-") \(.name)"') ||
+# Workflow runs, not check runs: a workflow run completes only when all its jobs have.
+runs=$(gh api "repos/$repo/actions/runs?head_sha=$sha&event=push&per_page=100" \
+  --jq '.workflow_runs[] | "\(.status) \(.conclusion // "-") \(.name)"') ||
   transient "cannot read CI for $sha"
 if [ -z "$runs" ]; then
   say "no CI runs yet for $sha; waiting"
@@ -87,18 +106,27 @@ rm -rf "$candidate"
 mkdir -p "$candidate"
 trap 'rm -rf "$candidate"' EXIT
 git -C "$src" archive "$sha" | tar -x -C "$candidate" || fail "cannot export $sha from $src"
+release=(python3 "$candidate/bin/guild-release")
 
 for member in $(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))))' "$candidate/tests/member-pins.json"); do
+  [ -d "$sources/$member/.git" ] || fail "missing member checkout $sources/$member"
   git -C "$sources/$member" fetch -q origin || transient "git fetch failed for $member in $sources"
 done
 
-out=$(python3 "$candidate/bin/guild-release" deploy --root "$root" --sources-dir "$sources" --release-id "$id" 2>&1) ||
-  fail "deploy of $id failed: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
+if [ -d "$root/releases/$id" ]; then
+  out=$("${release[@]}" switch --root "$root" --release-id "$id" 2>&1) ||
+    fail "switch to $id failed: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
+else
+  out=$("${release[@]}" deploy --root "$root" --sources-dir "$sources" --release-id "$id" 2>&1) ||
+    fail "deploy of $id failed: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
+fi
+touch "$root/installed/$id"
 say "activated $id"
 
-git -C "$src" -c advice.detachedHead=false checkout -q --detach "$sha" ||
-  say "activated $id but could not move $src to it"
 for unit in $restart_units; do
   systemctl --user try-restart "$unit" || say "try-restart $unit failed"
 done
-python3 "$candidate/bin/guild-release" prune --root "$root" >/dev/null || say "prune failed"
+"${release[@]}" prune --root "$root" >/dev/null || say "prune failed"
+git -C "$src" -c advice.detachedHead=false checkout -q --detach "$sha" ||
+  fail "activated $id but cannot move $src to it"
+ok
