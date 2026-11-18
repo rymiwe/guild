@@ -20,7 +20,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 ## Step 1 checks and pins
 
 - **Pins (`tests/member-pins.json`)**:
-  - `bridgekeeper`: `a55d996336ecceed421c80637160d7a5742d8242`
+  - `bridgekeeper`: `e7392cdce930cdbf9e1e9df31e16e0038a4bf2cf` (was `a55d996`; bumped 2026-11-18 so releases carry `bin/surface-commit-guard`)
   - `bopeep`: `94d07f8e3ec1eb4d7e8665c58be2938360c2c746`
   - `quartermaster`: `d47a182c8e5d03f95c681fcb4a51de34d690f8e3`
   - `conclave`: `79775e7806ddfc8db18a8c188a2a31a7af7429c7`
