@@ -21,12 +21,15 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PINS_PATH = "tests/member-pins.json"
 PASSED = {"success", "skipped", "neutral"}
+CHECKS_APPEAR_TRIES = 60
+CHECKS_APPEAR_SECONDS = 5
 
 
 @dataclass
@@ -83,6 +86,21 @@ def report(org: str, moves: list[Move]) -> str:
     return "\n".join(lines)
 
 
+def ci_passed(url: str, cwd: Path) -> bool:
+    # A PR opened seconds ago has no check runs yet, and `gh pr checks --watch` exits 1 on that.
+    for _ in range(CHECKS_APPEAR_TRIES):
+        out = subprocess.run(["gh", "pr", "checks", url, "--json", "name"], cwd=cwd, capture_output=True, text=True)
+        try:
+            if json.loads(out.stdout or "[]"):
+                break
+        except json.JSONDecodeError:
+            pass
+        time.sleep(CHECKS_APPEAR_SECONDS)
+    else:
+        return False
+    return subprocess.run(["gh", "pr", "checks", url, "--watch", "--fail-fast"], cwd=cwd).returncode == 0
+
+
 def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
     for m in ready:
         pins[m.member] = m.new
@@ -99,8 +117,7 @@ def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
             body = "## Why\nShip merged member work to the Surface release.\n\n## Pins\n" + report(org, ready)
             url = sh("gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", body, cwd=wt)
             print(url)
-            checks = subprocess.run(["gh", "pr", "checks", url, "--watch", "--fail-fast"], cwd=wt)
-            if checks.returncode != 0:
+            if not ci_passed(url, wt):
                 raise SystemExit(f"guild-pin: Guild CI did not pass on {url}; not merged")
             sh("gh", "pr", "merge", url, "--merge", "--delete-branch", cwd=wt)
             print(f"guild-pin: merged {url}")
