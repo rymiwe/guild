@@ -38,7 +38,10 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PINS_FILE = REPO_ROOT / "tests" / "member-pins.json"
-REQUIRED_MEMBERS = ("quartermaster", "bridgekeeper", "bopeep", "conclave")
+ROSTER_FILE = REPO_ROOT / "roster"
+# Roster tools a release does not carry, and why. Every other roster tool must be pinned:
+# inside a release-bound job, `guild-exec TOOL` refuses a tool the release lacks.
+NOT_RELEASED = {"orderly": "a page server with no guild-exec commands"}
 INSTALL_ORDER = ("quartermaster", "bridgekeeper", "bopeep", "conclave")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -111,7 +114,9 @@ def run_git(
         raise ReleaseError(f"git {' '.join(args)} failed: {detail}") from exc
 
 
-def load_pins(pins_path: Path) -> dict[str, str]:
+def load_pins(pins_path: Path, *, complete: bool = True) -> dict[str, str]:
+    """Read a pins file. With complete, every roster tool not in NOT_RELEASED must be pinned.
+    Releases built before that rule lack some tools; switch and rollback still accept them."""
     if not pins_path.is_file():
         raise ReleaseError(f"pins file not found: {pins_path}")
     try:
@@ -129,10 +134,25 @@ def load_pins(pins_path: Path) -> dict[str, str]:
             raise ReleaseError(f"invalid 40-hex commit SHA for {k} in {pins_path}: {v!r}")
         pins[k] = v
 
-    for req in REQUIRED_MEMBERS:
-        if req not in pins:
-            raise ReleaseError(f"pins file {pins_path} missing required member {req!r}")
+    missing = [t for t in required_members() if t not in pins] if complete else []
+    if missing:
+        raise ReleaseError(
+            f"pins file {pins_path} is missing roster tools {', '.join(missing)}; "
+            f"pin them, or list them in NOT_RELEASED in {Path(__file__).name}"
+        )
     return pins
+
+
+def required_members() -> list[str]:
+    try:
+        lines = ROSTER_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ReleaseError(f"cannot read roster {ROSTER_FILE}: {exc}") from exc
+    tools = [ln.split("#", 1)[0].strip() for ln in lines]
+    tools = [t for t in tools if t]
+    if not tools:
+        raise ReleaseError(f"roster {ROSTER_FILE} names no tool")
+    return [t for t in tools if t not in NOT_RELEASED]
 
 
 def pins_digest(pins: dict[str, str]) -> str:
@@ -984,7 +1004,7 @@ def verify_release_dir(
     if not release_dir.is_dir():
         raise ReleaseError(f"release directory not found: {release_dir}")
 
-    pins = load_pins(release_dir / "pins.json")
+    pins = load_pins(release_dir / "pins.json", complete=False)
     manifest_path = release_dir / "manifest.json"
     if not manifest_path.is_file():
         raise ReleaseError(f"missing manifest.json in {release_dir}")

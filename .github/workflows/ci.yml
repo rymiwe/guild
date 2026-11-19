@@ -22,14 +22,14 @@ jobs:
         run: |
           set -eu
           if [ "${HAS_GUILD_READ_TOKEN}" != "true" ]; then
-            echo "ERROR: secrets.GUILD_READ_TOKEN is required to check out private member repos (bridgekeeper, bopeep, quartermaster, conclave)." >&2
+            echo "ERROR: secrets.GUILD_READ_TOKEN is required to check out private member repos (bridgekeeper, bopeep, quartermaster, conclave, thresher)." >&2
             exit 1
           fi
           python3 - <<'PY' >> "$GITHUB_ENV"
           import json
           from pathlib import Path
           pins = json.loads(Path("tests/member-pins.json").read_text(encoding="utf-8"))
-          for key in ("bridgekeeper", "bopeep", "quartermaster", "conclave"):
+          for key in ("bridgekeeper", "bopeep", "quartermaster", "conclave", "thresher"):
               sha = pins[key]
               if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
                   raise SystemExit(f"invalid SHA for {key}: {sha!r}")
@@ -70,6 +70,15 @@ jobs:
           ref: ${{ env.CONCLAVE_SHA }}
           token: ${{ secrets.GUILD_READ_TOKEN }}
           path: .deps/conclave
+          persist-credentials: false
+
+      - name: Check out pinned thresher
+        uses: actions/checkout@v4
+        with:
+          repository: rymiwe/thresher
+          ref: ${{ env.THRESHER_SHA }}
+          token: ${{ secrets.GUILD_READ_TOKEN }}
+          path: .deps/thresher
           persist-credentials: false
 
       - name: Run installed pr-gate cross-repo contract test
