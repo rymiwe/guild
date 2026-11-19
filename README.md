@@ -67,6 +67,18 @@ A starting org file, with made-up values:
 }
 ```
 
+## Grok Bot pace check
+
+[`bin/grokbot-pace-check`](bin/grokbot-pace-check) is the one usage stop for routines' pre-check scripts and bots. It reads quartermaster's seat-usage cache (`$SEAT_USAGE_CACHE_DIR/latest.json`, default `~/.cache/seat-usage/latest.json`) and prints one line.
+
+- **pace** = % of the week's Grok Bot usage used ÷ % of the week elapsed, both at the reading's time.
+- **One threshold, 1.1x.** Above it the check exits 1 and the caller stops and reports the line to its owner. At or below it exits 0. There are no other tiers.
+- **Fail closed.** A missing, unparseable or incomplete meter, a reading from a week that already reset, or a reading older than the staleness window exits 3. The window is 1 hour from `as_of.grokbot`; set `--max-age-s` or `GUILD_PACE_MAX_AGE_S` to change it.
+
+```sh
+grokbot-pace-check || exit 1   # in a pre-check script: stop and report its line
+```
+
 ## Changing a crest
 
 `index.html` holds the source. Its hidden SVG sprite defines each glyph as a `<symbol>`.
