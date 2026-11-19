@@ -98,3 +98,6 @@ jobs:
         env:
           GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
         run: python3 tests/test_guild_update.py -v
+
+      - name: Run the pin tool tests
+        run: python3 tests/test_guild_pin.py -v
