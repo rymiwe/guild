@@ -391,6 +391,17 @@ class ReleaseLifecycleTest(unittest.TestCase):
         self.assertEqual(gate.returncode, 0, f"stdout:\n{gate.stdout}\nstderr:\n{gate.stderr}")
         self.assertIn("pr-gate PASS", gate.stdout)
 
+        # A release-bound job reaches thresher through the release's guild-exec. --help starts nothing.
+        th = subprocess.run(
+            [str(current / "bin" / "thresher"), "--help"],
+            env={**self.git_env, "HOME": str(self.user_home), "PATH": build_clean_path()},
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(th.returncode, 0, f"stdout:\n{th.stdout}\nstderr:\n{th.stderr}")
+        self.assertIn("previews and starts nothing", th.stdout)
+
         # pstack is the user's one checkout: the release neither copies it nor binds PSTACK_HOME.
         self.assertFalse((root / "releases" / "r1" / "code" / "cursor-plugins").exists())
         self.assertNotIn("PSTACK_HOME", (current / "bin" / "guild-exec").read_text(encoding="utf-8"))
@@ -406,6 +417,15 @@ class ReleaseLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(pr.returncode, 0, f"stdout:\n{pr.stdout}\nstderr:\n{pr.stderr}")
         self.assertEqual(pr.stdout.strip(), str(user_pstack))
+
+        # A release built before the roster rule still switches, so rollback to it keeps working.
+        r1_pins = root / "releases" / "r1" / "pins.json"
+        r1_pins.write_text(
+            json.dumps({k: v for k, v in self.pins_r1.items() if k != "thresher"}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        sw = self.run_cli("switch", "--root", str(root), "--release-id", "r1")
+        self.assertEqual(sw.returncode, 0, f"stdout:\n{sw.stdout}\nstderr:\n{sw.stderr}")
 
         # Rollback with no previous release fails closed and leaves r1 active.
         rb = self.run_cli("rollback", "--root", str(root))
@@ -482,6 +502,16 @@ class ReleaseLifecycleTest(unittest.TestCase):
         )
         self.assertNotEqual(cp_hook_fail.returncode, 0)
         self.assertIn("custom check command failed", cp_hook_fail.stderr)
+
+        # Case 3: pins that leave out a roster tool are refused before anything is built.
+        incomplete_file = self.tmp / "pins-no-thresher.json"
+        incomplete = {k: v for k, v in self.pins_r1.items() if k != "thresher"}
+        incomplete_file.write_text(json.dumps(incomplete, indent=2) + "\n", encoding="utf-8")
+        cp_incomplete = self.run_cli(
+            "deploy", "--root", str(root), "--pins", str(incomplete_file), "--release-id", "r2-incomplete"
+        )
+        self.assertNotEqual(cp_incomplete.returncode, 0)
+        self.assertIn("missing roster tools thresher", cp_incomplete.stderr)
 
         # Old release remains active, retained cleanly, and callable.
         self.assertEqual(os.readlink(root / "current"), "releases/r1")

@@ -2,7 +2,7 @@
 
 **Goal.** Update the Surface to one verified set of Guild tools without copying a command into a terminal for each release. Keep the Surface guard in place and keep the previous release usable for rollback.
 
-**Status.** Steps 1 to 3 are done. Step 4 is done: the owner enabled the updater on the Surface on 2026-11-18, and its first run activated `g-086883398120` with the Quartermaster cgroup fix. Running jobs stay on the release they started on across a switch and a `bopeep-watch` restart, and `guild-release prune` removes only releases that no running process is bound to. Running `.github/workflows/ci.yml` on GitHub Actions requires the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, and `conclave`).
+**Status.** Steps 1 to 3 are done. Step 4 is done: the owner enabled the updater on the Surface on 2026-11-18, and its first run activated `g-086883398120` with the Quartermaster cgroup fix. Running jobs stay on the release they started on across a switch and a `bopeep-watch` restart, and `guild-release prune` removes only releases that no running process is bound to. Running `.github/workflows/ci.yml` on GitHub Actions requires the `GUILD_READ_TOKEN` repository secret (`contents:read` on `bridgekeeper`, `bopeep`, `quartermaster`, `conclave`, and `thresher`).
 
 | Step | Work | Done when |
 | --- | --- | --- |
@@ -56,7 +56,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
   - Every failure exits 1 and sends one `job-notify --send` ping per commit and kind. A fetch or GitHub API error retries quietly; from the eighth in a row each run fails, with one ping for the streak.
   - The updater and host `guild-exec` run from that checkout, so a new version of either takes effect only with a release that passed CI and deployed.
   - `installed/` outlives `prune`. A commit installed once is never reinstalled, so a hand rollback or switch stands until the next Guild commit.
-- **Host `guild-exec` (`bin/guild-exec-host`)**: member wrappers in `~/.local/bin` and `~/.claude/hooks` call `guild-exec TOOL PATH`. Linked as `~/.local/bin/guild-exec`, this sends a tool the active release carries to that release, and any other tool (for example `thresher`) to `~/code/quartermaster/bin/guild-exec`. With no release it sends everything there, so installing it first changes nothing.
+- **Host `guild-exec` (`bin/guild-exec-host`)**: member wrappers in `~/.local/bin` and `~/.claude/hooks` call `guild-exec TOOL PATH`. Linked as `~/.local/bin/guild-exec`, this sends a tool the active release carries to that release, and any other tool (for example `orderly`) to `~/code/quartermaster/bin/guild-exec`. With no release it sends everything there, so installing it first changes nothing.
 - **BLD verification (2026-11-18)**: `guild-release deploy` into a scratch root with `tests/member-pins.json` built `bld1` in 8 s. Through `current/bin`, `pr-gate --repo rymiwe/guild --pr 6` printed the same eleven lines as the live `~/.local/bin/pr-gate`. A second release from member trunks switched and rolled back. The Quartermaster pin [d47a182](https://github.com/rymiwe/quartermaster/commit/d47a182c8e5d03f95c681fcb4a51de34d690f8e3) is the cgroup fix ([quartermaster#109](https://github.com/rymiwe/quartermaster/pull/109)).
 - **Command**: `python3 tests/test_guild_update.py -v`. **Result**: `Ran 5 tests, OK` (waits on running or missing CI and fails once after 24 hours; a member fetch error retries quietly and fails from the eighth run in a row with one ping; failed CI pings once, installs nothing, and recovers when a re-run passes; a hand rollback stands after prune removes the rolled-away release; passed CI activates, a repeat run is a no-op, the host `guild-exec` routes release and non-release tools, and a CI-passed commit with an unfetchable pin leaves the release and the updater checkout where they were, then skips that commit).
 
@@ -71,6 +71,18 @@ systemctl --user enable --now guild-update.timer
 ```
 
 Check the launcher version: `~/.local/share/guild/current/code/quartermaster` must contain [d47a182](https://github.com/rymiwe/quartermaster/commit/d47a182c8e5d03f95c681fcb4a51de34d690f8e3). Undo: `systemctl --user disable --now guild-update.timer`, then `ln -sfn ~/code/quartermaster/bin/guild-exec ~/.local/bin/guild-exec` and `systemctl --user try-restart bopeep-watch.service`.
+
+## Every roster tool is in the release
+
+`guild-release prepare` and `deploy` refuse a pins file that leaves out a tool named in [`roster`](../roster), unless `NOT_RELEASED` in `bin/guild-release` lists it with a reason. Only `orderly` is listed: it has no `guild-exec` commands. A release-bound job runs a host wrapper's `guild-exec TOOL` through its release, and that `guild-exec` refuses a tool the release lacks. On 2026-11-19 the Surface's scheduled `thresher` harvest exited 3 for that reason: `tests/member-pins.json` had no Thresher pin. `switch` and `rollback` still accept a release built before this rule.
+
+## Normal release
+
+1. Set the member's commit in `tests/member-pins.json` and merge to `main`.
+2. CI checks out every pin and runs the three test files.
+3. Within 15 minutes of CI passing, the Surface's `guild-update.timer` builds and activates `g-<sha12>` and restarts `bopeep-watch`.
+
+A new roster tool also needs a pin, a checkout step in `.github/workflows/ci.yml`, and `contents:read` for `GUILD_READ_TOKEN`.
 
 ## Open follow-ups
 

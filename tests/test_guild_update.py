@@ -83,6 +83,7 @@ class GuildUpdateTest(unittest.TestCase):
         cls._git("clone", "-q", str(cls.guild_origin), str(cls.guild_work))
         for part in ("bin", "tests"):
             shutil.copytree(ROOT / part, cls.guild_work / part, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy2(ROOT / "roster", cls.guild_work / "roster")
         cls.commit_guild("Guild at test time")
 
         cls.stub_bin = cls.tmp / "stub-bin"
@@ -239,8 +240,8 @@ class GuildUpdateTest(unittest.TestCase):
         lint = subprocess.run([host, "bopeep", "bin/pr-lint", "--help"], env=host_env, text=True, capture_output=True)
         self.assertEqual(lint.returncode, 0, lint.stderr)
         self.assertIn("usage: pr-lint", lint.stdout)
-        other = subprocess.run([host, "thresher", "bin/thresher"], env=host_env, text=True, capture_output=True)
-        self.assertEqual(other.stdout.strip(), "fallback thresher bin/thresher")
+        other = subprocess.run([host, "orderly", "bin/ship-report"], env=host_env, text=True, capture_output=True)
+        self.assertEqual(other.stdout.strip(), "fallback orderly bin/ship-report")
 
         # A CI-passed commit whose pin cannot be checked out fails and leaves the release active.
         pins = json.loads((self.guild_work / "tests" / "member-pins.json").read_text())
