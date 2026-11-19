@@ -27,7 +27,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 ## Step 2 checks and mechanism
 
 - **Release tool (`bin/guild-release`)**: `prepare`, `check`, `switch`, `deploy`, `rollback`, and `status` manage releases under `--root`:
-  - Builds candidate checkouts, `install.sh` prefixes, and release-bound `bin/` + `hooks/` launchers (with `bin/guild-exec` binding `PATH`, `CONCLAVE_HOME`, `BRIDGEKEEPER_HOME`, `BOPEEP_HOME`, `QUARTERMASTER_HOME`, and `PSTACK_HOME` to that concrete release while keeping `HOME`, `.guild.json`, and `bopeep.state_dir` external).
+  - Builds candidate checkouts, `install.sh` prefixes, and release-bound `bin/` + `hooks/` launchers (with `bin/guild-exec` binding `PATH`, `CONCLAVE_HOME`, `BRIDGEKEEPER_HOME`, `BOPEEP_HOME`, and `QUARTERMASTER_HOME` to that concrete release while keeping `HOME`, `.guild.json`, and `bopeep.state_dir` external). pstack is not copied into a release: installers read the user's one checkout (`PSTACK_HOME`, default `~/code/cursor-plugins/pstack`), and `pstack-root` resolves it from `HOME` at run time.
   - Verifies checkout integrity, `install.sh --check`, and the installed `pr-gate` contract before promoting from `.staging/` and atomically replacing the `current` symlink while retaining `previous`.
 - **Commands**: `python3 tests/test_pr_gate_contract.py -v && python3 tests/test_release_lifecycle.py -v`
 - **Results**:
