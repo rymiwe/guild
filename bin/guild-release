@@ -207,19 +207,16 @@ def resolve_sources_dir(sources_dir: Path | None) -> Path:
     return (real_home() / "code").resolve()
 
 
-def resolve_pstack_dir(pstack_home: Path | None) -> Path | None:
-    candidates: list[Path] = []
-    if pstack_home is not None:
-        candidates.append(pstack_home.resolve())
-    elif os.environ.get("PSTACK_HOME"):
-        candidates.append(Path(os.environ["PSTACK_HOME"]).resolve())
-    else:
-        candidates.append((real_home() / "code" / "cursor-plugins" / "pstack").resolve())
-
-    for cand in candidates:
-        if (cand / "skills" / "poteto-mode" / "SKILL.md").is_file():
-            return cand
-    return None
+def resolve_pstack_dir() -> Path:
+    """The machine's one pstack checkout. Installers read it; no release copies it."""
+    env_dir = os.environ.get("PSTACK_HOME")
+    cand = Path(env_dir) if env_dir else real_home() / "code" / "cursor-plugins" / "pstack"
+    cand = cand.resolve()
+    if not (cand / "skills" / "poteto-mode" / "SKILL.md").is_file():
+        raise ReleaseError(
+            f"no skills/poteto-mode/SKILL.md under {cand}; run quartermaster's install.sh to clone pstack"
+        )
+    return cand
 
 
 def materialize_member_checkouts(
@@ -339,20 +336,6 @@ def verify_member_checkout(
         raise ReleaseError(f"{name}: expected clean checkout, got:\n{dirty}")
 
 
-def bundle_pstack(staging: Path, pstack_src: Path | None) -> Path | None:
-    if pstack_src is None:
-        return None
-    plugins_dir = staging / "code" / "cursor-plugins"
-    plugins_dir.mkdir(parents=True, exist_ok=True)
-    dest_pstack = plugins_dir / "pstack"
-    shutil.copytree(pstack_src, dest_pstack, symlinks=True)
-
-    kit_src = pstack_src.parent / "cursor-team-kit"
-    if (kit_src / "skills" / "deslop" / "SKILL.md").is_file():
-        shutil.copytree(kit_src, plugins_dir / "cursor-team-kit", symlinks=True)
-    return dest_pstack
-
-
 def member_install_order(pins: dict[str, str]) -> list[str]:
     ordered = [m for m in INSTALL_ORDER if m in pins]
     for m in sorted(pins):
@@ -372,10 +355,8 @@ def run_member_installers(
         **git_env,
         "HOME": str(release_dir),
         "PATH": build_clean_path(release_dir / ".local" / "bin"),
+        "PSTACK_HOME": str(resolve_pstack_dir()),
     }
-    bundled_pstack = release_dir / "code" / "cursor-plugins" / "pstack"
-    if (bundled_pstack / "skills" / "poteto-mode" / "SKILL.md").is_file():
-        install_env["PSTACK_HOME"] = str(bundled_pstack)
 
     for tool in member_install_order(pins):
         installer = release_dir / "code" / tool / "install.sh"
@@ -507,9 +488,6 @@ export CONCLAVE_HOME=$release_dir/code/conclave
 export BRIDGEKEEPER_HOME=$release_dir/code/bridgekeeper
 export BOPEEP_HOME=$release_dir/code/bopeep
 export QUARTERMASTER_HOME=$release_dir/code/quartermaster
-if [ -d "$release_dir/code/cursor-plugins/pstack" ]; then
-  export PSTACK_HOME=$release_dir/code/cursor-plugins/pstack
-fi
 case ":${PATH-}:" in
   ":$bindir:"*) ;;
   *) export PATH="$bindir${PATH:+:$PATH}" ;;
@@ -1061,14 +1039,12 @@ def prepare_release(
     root: Path,
     pins_path: Path,
     sources_dir: Path | None,
-    pstack_home: Path | None,
     release_id: str | None,
     check_cmd: str | None,
 ) -> dict[str, Any]:
     root = root.resolve()
     pins = load_pins(pins_path.resolve())
     resolved_sources = resolve_sources_dir(sources_dir)
-    resolved_pstack = resolve_pstack_dir(pstack_home)
     rid = choose_release_id(root, pins, release_id)
 
     releases_dir = root / "releases"
@@ -1090,7 +1066,6 @@ def prepare_release(
         git_env = clean_git_env(staging_dir)
 
         materialize_member_checkouts(staging_dir, pins, resolved_sources, system_git, git_env)
-        bundle_pstack(staging_dir, resolved_pstack)
         run_member_installers(staging_dir, pins, git_env, check_only=False)
 
         (staging_dir / "pins.json").write_text(
@@ -1215,7 +1190,6 @@ RELEASE_ENV_VARS = (
     "BRIDGEKEEPER_HOME",
     "BOPEEP_HOME",
     "QUARTERMASTER_HOME",
-    "PSTACK_HOME",
 )
 
 
@@ -1321,7 +1295,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--root", type=Path, required=True, help="release root directory")
         p.add_argument("--pins", type=Path, default=DEFAULT_PINS_FILE, help="member pins JSON")
         p.add_argument("--sources-dir", type=Path, default=None, help="directory containing member repos")
-        p.add_argument("--pstack-home", type=Path, default=None, help="path to pstack checkout")
         p.add_argument("--release-id", default=None, help="explicit release id")
         p.add_argument("--check-cmd", default=None, help="extra shell command to verify candidate")
         p.add_argument("--json", action="store_true", help="emit JSON output")
@@ -1366,7 +1339,6 @@ def main(argv: list[str] | None = None) -> int:
                 root=args.root,
                 pins_path=args.pins,
                 sources_dir=args.sources_dir,
-                pstack_home=args.pstack_home,
                 release_id=args.release_id,
                 check_cmd=args.check_cmd,
             )
@@ -1375,7 +1347,6 @@ def main(argv: list[str] | None = None) -> int:
                 root=args.root,
                 pins_path=args.pins,
                 sources_dir=args.sources_dir,
-                pstack_home=args.pstack_home,
                 release_id=args.release_id,
                 check_cmd=args.check_cmd,
             )

@@ -391,6 +391,22 @@ class ReleaseLifecycleTest(unittest.TestCase):
         self.assertEqual(gate.returncode, 0, f"stdout:\n{gate.stdout}\nstderr:\n{gate.stderr}")
         self.assertIn("pr-gate PASS", gate.stdout)
 
+        # pstack is the user's one checkout: the release neither copies it nor binds PSTACK_HOME.
+        self.assertFalse((root / "releases" / "r1" / "code" / "cursor-plugins").exists())
+        self.assertNotIn("PSTACK_HOME", (current / "bin" / "guild-exec").read_text(encoding="utf-8"))
+        user_pstack = self.user_home / "code" / "cursor-plugins" / "pstack"
+        (user_pstack / "skills" / "poteto-mode").mkdir(parents=True)
+        (user_pstack / "skills" / "poteto-mode" / "SKILL.md").write_text("---\nname: poteto-mode\n---\n")
+        pr = subprocess.run(
+            [str(current / "bin" / "guild-exec"), "quartermaster", "bin/pstack-root"],
+            env={**self.git_env, "HOME": str(self.user_home), "PATH": build_clean_path()},
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(pr.returncode, 0, f"stdout:\n{pr.stdout}\nstderr:\n{pr.stderr}")
+        self.assertEqual(pr.stdout.strip(), str(user_pstack))
+
         # Rollback with no previous release fails closed and leaves r1 active.
         rb = self.run_cli("rollback", "--root", str(root))
         self.assertNotEqual(rb.returncode, 0)
@@ -417,7 +433,6 @@ class ReleaseLifecycleTest(unittest.TestCase):
                     root=root,
                     pins_path=self.pins_r1_file,
                     sources_dir=self.sources_dir,
-                    pstack_home=self.pstack_dir,
                     release_id="r2-interrupted",
                     check_cmd=None,
                 )
