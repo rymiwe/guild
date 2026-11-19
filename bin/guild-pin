@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Move member pins to each member's trunk head, so a Guild release carries merged work.
+
+usage: guild-pin [--apply] [MEMBER ...]
+
+Reads tests/member-pins.json from origin/main of this Guild checkout. For each
+member (default: every pinned member) it reads the head of the member's default
+branch on GitHub. A head moves the pin only when every check run on it passed;
+a head with a pending or failed run keeps the old pin and is reported. A member
+with no check runs at all moves, and the plan says so.
+
+Without --apply it prints the plan and changes nothing. With --apply it commits
+the new pins on a branch in a temporary worktree, opens a pull request whose body
+lists the commits each pin carries, waits for Guild CI, and merges it. The
+Surface updater then installs the release on its own. Exit 0 with nothing to move.
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PINS_PATH = "tests/member-pins.json"
+PASSED = {"success", "skipped", "neutral"}
+
+
+@dataclass
+class Move:
+    member: str
+    old: str
+    new: str
+    blocked: str = ""
+    unchecked: bool = False
+    subjects: list[str] = field(default_factory=list)
+
+
+def sh(*cmd: str, cwd: Path = ROOT) -> str:
+    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit(f"guild-pin: {' '.join(cmd)} failed: {out.stderr.strip()}")
+    return out.stdout.strip()
+
+
+def owner() -> str:
+    url = sh("git", "config", "--get", "remote.origin.url")
+    m = re.search(r"github\.com[:/]+([^/]+)/", url)
+    if not m:
+        raise SystemExit(f"guild-pin: origin is not on GitHub: {url}")
+    return m.group(1)
+
+
+def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
+    moves = []
+    for member in members:
+        old = pins[member]
+        new = sh("gh", "api", f"repos/{org}/{member}/commits/HEAD", "--jq", ".sha")
+        if new == old:
+            continue
+        move = Move(member, old, new)
+        runs = json.loads(sh("gh", "api", f"repos/{org}/{member}/commits/{new}/check-runs",
+                             "--jq", "[.check_runs[] | {name, status, conclusion}]"))
+        bad = [r for r in runs if r["status"] != "completed" or r["conclusion"] not in PASSED]
+        if bad:
+            move.blocked = ", ".join(f"{r['name']} {r['conclusion'] or r['status']}" for r in bad)
+        move.unchecked = not runs
+        move.subjects = sh("gh", "api", f"repos/{org}/{member}/compare/{old}...{new}", "--jq",
+                           '.commits[] | .sha[0:7] + " " + (.commit.message | split("\\n")[0])').splitlines()
+        moves.append(move)
+    return moves
+
+
+def report(org: str, moves: list[Move]) -> str:
+    lines = []
+    for m in moves:
+        state = f"blocked: {m.blocked}" if m.blocked else ("no check runs" if m.unchecked else "checks passed")
+        lines.append(f"- **{m.member}** {m.old[:7]} -> {m.new[:7]} ({state})")
+        lines += [f"  - [{s[:7]}](https://github.com/{org}/{m.member}/commit/{s[:7]}){s[7:]}" for s in m.subjects]
+    return "\n".join(lines)
+
+
+def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
+    for m in ready:
+        pins[m.member] = m.new
+    names = " and ".join(f"{m.member} {m.new[:7]}" for m in ready)
+    title = f"Pin {names} at trunk"
+    branch = "pin/" + "-".join(f"{m.member}-{m.new[:7]}" for m in ready)
+    with tempfile.TemporaryDirectory(prefix="guild-pin-") as tmp:
+        wt = Path(tmp) / "wt"
+        sh("git", "worktree", "add", "-q", "-b", branch, str(wt), "origin/main")
+        try:
+            (wt / PINS_PATH).write_text(json.dumps(pins, indent=2) + "\n", encoding="utf-8")
+            sh("git", "commit", "-q", "-am", title, cwd=wt)
+            sh("git", "push", "-q", "-u", "origin", branch, cwd=wt)
+            body = "## Why\nShip merged member work to the Surface release.\n\n## Pins\n" + report(org, ready)
+            url = sh("gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", body, cwd=wt)
+            print(url)
+            checks = subprocess.run(["gh", "pr", "checks", url, "--watch", "--fail-fast"], cwd=wt)
+            if checks.returncode != 0:
+                raise SystemExit(f"guild-pin: Guild CI did not pass on {url}; not merged")
+            sh("gh", "pr", "merge", url, "--merge", "--delete-branch", cwd=wt)
+            print(f"guild-pin: merged {url}")
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, capture_output=True)
+
+
+def main(argv: list[str]) -> int:
+    do_apply = "--apply" in argv
+    names = [a for a in argv if a != "--apply"]
+    if any(a.startswith("-") for a in names):
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    sh("git", "fetch", "-q", "origin", "main")
+    pins = json.loads(sh("git", "show", f"origin/main:{PINS_PATH}"))
+    unknown = [n for n in names if n not in pins]
+    if unknown:
+        raise SystemExit(f"guild-pin: not a pinned member: {', '.join(unknown)}")
+    org = owner()
+    moves = plan(org, pins, names or list(pins))
+    if not moves:
+        print("guild-pin: every pin is at its member's trunk head")
+        return 0
+    print(report(org, moves))
+    ready = [m for m in moves if not m.blocked]
+    if do_apply and ready:
+        apply(org, pins, ready)
+    return 1 if any(m.blocked for m in moves) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
