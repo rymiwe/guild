@@ -16,8 +16,18 @@ STUB_GH = """#!/usr/bin/env python3
 import json, os, sys
 data = json.load(open(os.environ["GH_FIXTURE"]))
 path = sys.argv[2]
+with open(os.environ["GH_FIXTURE"] + ".log", "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\\n")
 for key, out in data.items():
     if path == key:
+        if isinstance(out, list):
+            # A list is the reply sequence for repeated calls; the last reply repeats.
+            seen = os.environ["GH_FIXTURE"] + "." + key
+            n = int(open(seen).read()) if os.path.exists(seen) else 0
+            open(seen, "w").write(str(n + 1))
+            out, rc = out[min(n, len(out) - 1)]
+            print(out)
+            sys.exit(rc)
         print(out)
         sys.exit(0)
 print("unexpected gh call: " + " ".join(sys.argv[1:]), file=sys.stderr)
@@ -55,7 +65,7 @@ class GuildPinTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         return out.stdout
 
-    def run_pin(self, gh: dict[str, str], *args: str) -> subprocess.CompletedProcess:
+    def run_pin(self, gh: dict, *args: str) -> subprocess.CompletedProcess:
         (self.tmp / "gh.json").write_text(json.dumps(gh))
         return subprocess.run([str(self.repo / "bin" / "guild-pin"), *args], cwd=self.repo, env=self.env,
                               capture_output=True, text=True)
@@ -97,6 +107,28 @@ class GuildPinTest(unittest.TestCase):
         out = self.run_pin(gh)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("every pin is at its member's trunk head", out.stdout)
+
+    def apply_fixture(self, checks: list) -> dict:
+        new_a = "f" * 40
+        return {"repos/acme/alpha/commits/HEAD": new_a,
+                "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
+                f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
+                "create": "https://github.com/acme/guild/pull/9", "checks": checks, "merge": ""}
+
+    def gh_calls(self) -> list[str]:
+        return (self.tmp / "gh.json.log").read_text().splitlines()
+
+    def test_apply_waits_for_checks_that_register_late_then_merges(self) -> None:
+        out = self.run_pin(self.apply_fixture([["", 1], ['[{"name": "ci"}]', 0], ["", 0]]), "--apply", "alpha")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("guild-pin: merged https://github.com/acme/guild/pull/9", out.stdout)
+        self.assertIn("pr merge https://github.com/acme/guild/pull/9 --merge --delete-branch", self.gh_calls())
+
+    def test_apply_does_not_merge_when_ci_fails(self) -> None:
+        out = self.run_pin(self.apply_fixture([['[{"name": "ci"}]', 0], ["", 1]]), "--apply", "alpha")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("Guild CI did not pass on https://github.com/acme/guild/pull/9; not merged", out.stderr)
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")], "merged after CI failed")
 
     def test_unknown_member_is_refused(self) -> None:
         out = self.run_pin({}, "gamma")
