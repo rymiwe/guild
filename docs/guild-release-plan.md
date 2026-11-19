@@ -19,11 +19,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 
 ## Step 1 checks and pins
 
-- **Pins (`tests/member-pins.json`)**:
-  - `bridgekeeper`: `6b26fb3a8e2898b2c622bec4a56a9cbee2b5fb38` (bumped 2026-11-18 so releases carry `surface-commit-guard` and `red-green`, which the Surface's git hooks run from the release)
-  - `bopeep`: `94d07f8e3ec1eb4d7e8665c58be2938360c2c746`
-  - `quartermaster`: `d47a182c8e5d03f95c681fcb4a51de34d690f8e3`
-  - `conclave`: `79775e7806ddfc8db18a8c188a2a31a7af7429c7`
+- **Pins**: `tests/member-pins.json` holds the member commits. CI and `guild-update` read that file; git history records each bump and why.
 - **Command**: `python3 tests/test_pr_gate_contract.py -v`
 - **Result**: `Ran 7 tests in 5.500s, OK` (installed wrappers, clear gate `pr-gate PASS`, blocker URL `FAIL: unanswered_threads: unanswered: https://github.com/AcmeCorp/widgets/pull/7#discussion_r456`, real `pr-lint` failure, missing `threads-check` error, missing `pr-lint` error, and unchanged host install paths; also verified against shallow detached-HEAD CI-style source clones with `GUILD_MEMBER_SOURCES_DIR`).
 - **CI workflow**: `.github/workflows/ci.yml` checks out the exact SHAs from `tests/member-pins.json` using `secrets.GUILD_READ_TOKEN` (failing closed if unset) and runs `python3 tests/test_pr_gate_contract.py -v`.
@@ -80,5 +76,4 @@ Check the launcher version: `~/.local/share/guild/current/code/quartermaster` mu
 
 - Passing `-e GUILD_RELEASE_DIR=...` and the `*_HOME` variables to `tmux new-session` in `job-launch` (quartermaster) would make a job's variables match its `PATH` and let `prune` free an old release sooner. Guild commands do not need it.
 
-- The Quartermaster cgroup fix merged, but the Surface checkout still predates it. Include that fix or a descendant in the first Surface release and verify the installed launcher version.
 - A statechart log write error in the inherited `pr-gate` can hide earlier gate results. Track that independently of release activation. The archived Conclave report is under `~/code/conclave/tmp/council/guild-pr-gate-move/`.
