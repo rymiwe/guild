@@ -77,6 +77,27 @@ class PaceCheckTest(unittest.TestCase):
         self.assertNotIn("halve", line.lower())
         self.assertNotIn("pause", line.lower())
 
+    def test_just_over_threshold_unrounded_fails(self) -> None:
+        # 1.104x prints as 1.10x but is above 1.1x, so it must stop.
+        self.write(meter(11.04, 0.10))
+        p = self.run_tool("--cache", str(self.cache))
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assert_one_line(p)
+
+    def test_future_reading_fails_closed(self) -> None:
+        self.write(meter(20.0, 0.50, age_s=-600))  # stamped 10 min after now
+        p = self.run_tool("--cache", str(self.cache))
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn("future", self.assert_one_line(p))
+
+    def test_used_pct_out_of_range_fails_closed(self) -> None:
+        for bad in (-0.5, 100.5):
+            with self.subTest(bot_pct=bad):
+                self.write(meter(bad, 0.50))
+                p = self.run_tool("--cache", str(self.cache))
+                self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+                self.assertIn("bot_pct", self.assert_one_line(p))
+
     def test_exactly_threshold_passes(self) -> None:
         self.write(meter(11.0, 0.10))  # 1.10x
         p = self.run_tool("--cache", str(self.cache))

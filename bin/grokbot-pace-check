@@ -5,7 +5,8 @@ usage: grokbot-pace-check [--cache PATH] [--max-age-s SECONDS] [--now EPOCH]
 
 pace = (% of the week's Grok Bot usage used) / (% of the week elapsed), both taken
 at the moment of the reading. One threshold: pace above 1.1x fails. At or below
-1.1x passes. Pace is rounded to 0.01 before the comparison, as printed.
+1.1x passes. The unrounded pace is compared (within 1e-9, so float noise in an
+exact 1.1x reading does not flip it); it is rounded to 0.01 only when printed.
 
 Reads quartermaster's seat-usage cache, the same file `seat-usage --cached` uses:
 $SEAT_USAGE_CACHE_DIR/latest.json (default ~/.cache/seat-usage/latest.json). On a
@@ -14,7 +15,8 @@ Fields: bot_pct, bot_reset_ts, bot_window_s, bot_exhausted, as_of.grokbot.
 Makes no network call and reads no credential.
 
 Fail closed: a missing or unparseable file, a missing or non-numeric field, a
-reading older than the staleness window, a reading from a week that has already
+bot_pct outside 0..100, a reading stamped more than 60 s in the future (clock
+skew allowance), a reading older than the staleness window, a reading from a week that has already
 reset, or bot_exhausted all fail.
 
 Staleness window: 3600 s (1 hour) by default, measured from as_of.grokbot.
@@ -36,6 +38,8 @@ import sys
 import time
 
 THRESHOLD = 1.1
+FLOAT_TOLERANCE = 1e-9
+FUTURE_SKEW_S = 60.0
 DEFAULT_MAX_AGE_S = 3600.0
 EXIT_OK, EXIT_OVER, EXIT_USAGE, EXIT_NO_METER = 0, 1, 2, 3
 
@@ -78,10 +82,15 @@ def check(path: str, max_age_s: float, now: float) -> int:
     used_pct = number(data, "bot_pct")
     reset_ts = number(data, "bot_reset_ts")
     window_s = number(data, "bot_window_s")
+    if not 0.0 <= used_pct <= 100.0:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter bot_pct {used_pct:g} is outside 0..100 ({path})")
     if window_s <= 0:
         return finish(EXIT_NO_METER, f"STOP grokbot pace: meter bot_window_s is not positive ({path})")
 
     age_s = now - read_at
+    if age_s < -FUTURE_SKEW_S:
+        return finish(EXIT_NO_METER,
+                      f"STOP grokbot pace: meter reading is {-age_s / 60:.0f} min in the future ({path})")
     if age_s > max_age_s:
         return finish(EXIT_NO_METER,
                       f"STOP grokbot pace: meter stale, reading {age_s / 60:.0f} min old"
@@ -100,8 +109,8 @@ def check(path: str, max_age_s: float, now: float) -> int:
             return finish(EXIT_OK, f"ok grokbot pace 0.00x <= {THRESHOLD}x ({detail})")
         return finish(EXIT_OVER, f"STOP grokbot pace: usage before the week started > {THRESHOLD}x ({detail})")
 
-    pace = round((used_pct / 100.0) / elapsed, 2)
-    if pace > THRESHOLD:
+    pace = (used_pct / 100.0) / elapsed
+    if pace > THRESHOLD + FLOAT_TOLERANCE:
         return finish(EXIT_OVER, f"STOP grokbot pace {pace:.2f}x above {THRESHOLD}x ({detail})")
     return finish(EXIT_OK, f"ok grokbot pace {pace:.2f}x <= {THRESHOLD}x ({detail})")
 
