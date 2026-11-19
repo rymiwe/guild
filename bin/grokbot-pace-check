@@ -5,7 +5,8 @@ usage: grokbot-pace-check [--cache PATH] [--max-age-s SECONDS] [--now EPOCH]
 
 pace = (% of the week's Grok Bot usage used) / (% of the week elapsed), both taken
 at the moment of the reading. One threshold: pace above 1.1x fails. At or below
-1.1x passes. The unrounded pace is compared (within 1e-9, so float noise in an
+1.1x passes. Below 5% used it always passes: early in the week 1.1x is a
+fraction of a percent, and one busy session would stop every routine. The unrounded pace is compared (within 1e-9, so float noise in an
 exact 1.1x reading does not flip it); it is rounded to 0.01 only when printed.
 
 Reads quartermaster's seat-usage cache, the same file `seat-usage --cached` uses:
@@ -38,6 +39,7 @@ import sys
 import time
 
 THRESHOLD = 1.1
+FLOOR_PCT = 5.0
 FLOAT_TOLERANCE = 1e-9
 FUTURE_SKEW_S = 60.0
 DEFAULT_MAX_AGE_S = 3600.0
@@ -104,6 +106,8 @@ def check(path: str, max_age_s: float, now: float) -> int:
     elapsed = 1.0 - (reset_ts - read_at) / window_s
     elapsed = max(0.0, min(1.0, elapsed))
     detail = f"{used_pct:.1f}% used at {100 * elapsed:.1f}% of week, reading {age_s / 60:.0f} min old"
+    if used_pct < FLOOR_PCT:
+        return finish(EXIT_OK, f"ok grokbot pace: under the {FLOOR_PCT:g}% floor ({detail})")
     if elapsed <= 0.0:
         if used_pct <= 0.0:
             return finish(EXIT_OK, f"ok grokbot pace 0.00x <= {THRESHOLD}x ({detail})")

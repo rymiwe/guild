@@ -110,6 +110,19 @@ class PaceCheckTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("0.40x", self.assert_one_line(p))
 
+    def test_early_week_usage_under_floor_passes(self) -> None:
+        # Two hours in, 1.1x is 1.3% used; one busy session must not stop every routine.
+        self.write(meter(4.9, 2 / 168))
+        p = self.run_tool("--cache", str(self.cache))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("floor", self.assert_one_line(p))
+
+    def test_early_week_usage_over_floor_fails(self) -> None:
+        self.write(meter(5.0, 2 / 168))
+        p = self.run_tool("--cache", str(self.cache))
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assert_one_line(p)
+
     def test_exhausted_fails(self) -> None:
         self.write(meter(10.0, 0.50, bot_exhausted=True))
         p = self.run_tool("--cache", str(self.cache))
