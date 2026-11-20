@@ -122,7 +122,15 @@ class GuildPinTest(unittest.TestCase):
         out = self.run_pin(self.apply_fixture([["", 1], ['[{"name": "ci"}]', 0], ["", 0]]), "--apply", "alpha")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("guild-pin: merged https://github.com/acme/guild/pull/9", out.stdout)
-        self.assertIn("pr merge https://github.com/acme/guild/pull/9 --merge --delete-branch", self.gh_calls())
+        self.assertIn("pr merge https://github.com/acme/guild/pull/9 --merge", self.gh_calls())
+
+    def test_apply_removes_the_pin_branch_after_the_merge(self) -> None:
+        # gh's own --delete-branch checks out main locally, which fails when another worktree holds main.
+        out = self.run_pin(self.apply_fixture([['[{"name": "ci"}]', 0], ["", 0]]), "--apply", "alpha")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("--delete-branch", " ".join(self.gh_calls()))
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "pin/*", cwd=self.repo), "")
+        self.assertEqual(self.git("branch", "--list", "pin/*", cwd=self.repo), "")
 
     def test_apply_does_not_merge_when_ci_fails(self) -> None:
         out = self.run_pin(self.apply_fixture([['[{"name": "ci"}]', 0], ["", 1]]), "--apply", "alpha")
