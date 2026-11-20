@@ -214,16 +214,23 @@ def load_json(path: Path):
         raise Unreadable(f"{path}: {exc}")
 
 
-def cited_code(council: Path, finding: dict):
+def finding_details(council: Path, finding: dict) -> tuple[str | None, str]:
     path = council / str(finding.get("ballot", "")) / "findings.json"
     if not finding.get("ballot") or not path.is_file():
-        return None
+        return None, "unknown"
     data = load_json(path)
+    verified_at = bool(data.get("verified_at")) if isinstance(data, dict) else False
     items = data if isinstance(data, list) else data.get("findings", []) if isinstance(data, dict) else []
     for item in items:
         if isinstance(item, dict) and item.get("id") == finding.get("id"):
-            return item.get("cited_code")
-    return None
+            if item.get("repro_executed") is True:
+                tier = "executed"
+            elif verified_at:
+                tier = "checked"
+            else:
+                tier = "none"
+            return item.get("cited_code"), tier
+    return None, "unknown"
 
 
 def cited_result(gh: GitHub, cache: dict, repo: str, file, code, reviewed: str, head: str) -> dict:
@@ -254,7 +261,7 @@ def later(a, b) -> bool:
 
 def backfill(council: Path) -> int:
     gh = GitHub()
-    events, outcomes = [], []
+    events, outcomes, tiered = [], [], []
     if not council.is_dir():
         raise Unreadable(f"{council}: not a directory")
     runs = sorted(council.glob("*/posted.json"))
@@ -288,8 +295,9 @@ def backfill(council: Path) -> int:
                                         "path": f.get("path"), "line": f.get("line"),
                                         "comment_id": f.get("comment_id"), "severity": f.get("severity")}})
                 who = replies.get(f.get("comment_id"), []) if f.get("comment_id") else []
+                code, tier = finding_details(council, f)
                 observed = cited_result(gh, cache, repo, f.get("path"),
-                                        cited_code(council, f), reviewed, head)
+                                        code, reviewed, head)
                 outcome = {"v": VERSION, "kind": "outcome", "source": "github", "subject": subject,
                            "at": merged_at or pr.get("closed_at"),
                            "data": {"proxy": PROXY, **observed, "pr_state": pr_state, "head_sha": head,
@@ -299,6 +307,7 @@ def backfill(council: Path) -> int:
                                                                and later(posted_at, merged_at))}}
                 events.append(outcome)
                 outcomes.append(outcome["data"])
+                tiered.append((outcome["data"], tier))
     try:
         valid = [validate(e) for e in events]
     except BadEvent as exc:
@@ -317,6 +326,16 @@ def backfill(council: Path) -> int:
           f"  untestable {sum(untestable.values())} {dict(sorted(untestable.items()))}")
     print(f"still present: author replied {replied}  no author reply {len(present) - replied}")
     print(f"posted after merge {sum(1 for o in outcomes if o['posted_after_merge'])}")
+    tiers = []
+    for tier in ("executed", "checked", "none", "unknown"):
+        rows = [o for o, t in tiered if t == tier]
+        if not rows:
+            continue
+        t_testable = sum(1 for o in rows if o["result"] != "untestable")
+        t_gone = sum(1 for o in rows if o["result"] == "gone")
+        tiers.append(f"{tier} {t_gone}/{t_testable} gone ({len(rows)} total)")
+    if tiers:
+        print("by verification: " + "  ".join(tiers))
     print(f"events appended {sum(added)}  already in ledger {len(added) - sum(added)}  REST calls {gh.calls}")
     return EXIT_OK
 
