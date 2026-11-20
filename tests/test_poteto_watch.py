@@ -47,8 +47,9 @@ if args[:2] == ["pr", "list"]:
             "url": pr["url"],
             "state": pr["state"],
             "isDraft": pr["isDraft"],
+            "headRefOid": pr["headRefOid"],
             "title": pr["title"],
-            "createdAt": "2026-11-20T12:00:00Z",
+            "createdAt": pr.get("createdAt", "2026-11-20T12:00:00Z"),
         })
     print(json.dumps(out))
     sys.exit(0)
@@ -90,6 +91,7 @@ if args[:2] == ["pr", "view"]:
                 "isDraft": pr["isDraft"],
                 "reviewRequests": pr["reviewRequests"],
                 "headRefOid": pr["headRefOid"],
+                "createdAt": pr.get("createdAt", "2026-11-20T12:00:00Z"),
                 "state": pr["state"],
                 "mergedAt": pr["mergedAt"],
             }))
@@ -567,21 +569,109 @@ sys.exit(0 if mode == "pass" else 11)
         git(wt, "add", "docs/one.md")
         git(wt, "commit", "-m", "Add one.md")
 
-        # Pre-push the branch directly so remote already exists; open-pr must hold instead of force-pushing.
+        # Pre-push a different commit on the same branch; open-pr must hold instead of force-pushing.
         git(wt, "push", "origin", in_res["branch"])
+        (wt / "docs" / "two.md").write_text("second commit\n", encoding="utf-8")
+        git(wt, "add", "docs/two.md")
+        git(wt, "commit", "-m", "Add two.md")
         cp_exists = self.run_tool("open-pr", str(prop_file), "--worktree", str(wt))
         self.assertEqual(cp_exists.returncode, 11)
         self.assertIn("already exists", cp_exists.stderr)
 
-        # Delete remote branch, open PR #1, then confirm daily cap = 1 blocks a second post on same PT day.
+        # Replace remote branch with exact current HEAD (simulating crash after git push, before gh pr create).
+        # Retrying open-pr must resume cleanly and open PR #1 without force-pushing.
         git(wt, "push", "origin", "--delete", in_res["branch"])
+        git(wt, "push", "origin", in_res["branch"])
         cp_ok = self.run_tool("open-pr", str(prop_file), "--worktree", str(wt))
         self.assertEqual(cp_ok.returncode, 0, cp_ok.stderr)
+        self.assertEqual(json.loads(cp_ok.stdout)["status"], "opened")
 
         cp_cap = self.run_tool("precheck", "--mode", "live", env_extra={"POTETO_WATCH_DAILY_CAP": "1"})
         self.assertEqual(cp_cap.returncode, 11)
         self.assertIn("daily draft PR cap reached", cp_cap.stderr)
 
+
+    def test_open_pr_reconciles_state_after_crash_post_pr_create(self) -> None:
+        prop = self.sample_sheaf(
+            post_id="2117437607940689999",
+            post_url="https://x.com/poteto/status/2117437607940689999",
+            repo="example-owner/guild",
+            slug="crash-reconcile",
+            mode="live",
+            test_cmd="true",
+        )
+        prop_file = self.write_proposal(prop, "crash-reconcile.json")
+        in_res = json.loads(self.run_tool("intake", str(prop_file)).stdout)
+        wt = Path(in_res["worktree"])
+        (wt / "docs").mkdir(parents=True, exist_ok=True)
+        (wt / "docs" / "reconcile.md").write_text("reconcile\n", encoding="utf-8")
+        git(wt, "add", "docs/reconcile.md")
+        git(wt, "commit", "-m", "Add reconcile.md")
+        head_sha = git(wt, "rev-parse", "HEAD")
+
+        # Simulate gh pr create having succeeded before a crash prevented events/cursor/ledger writes.
+        self.fake_gh_state.write_text(
+            json.dumps(
+                {
+                    "next": 2,
+                    "prs": [
+                        {
+                            "repo": "example-owner/guild",
+                            "number": 1,
+                            "head": in_res["branch"],
+                            "title": "poteto(2117437607940689999): test",
+                            "url": "https://github.com/example-owner/guild/pull/1",
+                            "state": "OPEN",
+                            "isDraft": True,
+                            "reviewRequests": [],
+                            "headRefOid": head_sha,
+                            "createdAt": "2026-11-20T19:00:00Z",
+                            "mergedAt": None,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cp1 = self.run_tool(
+            "open-pr",
+            str(prop_file),
+            "--worktree",
+            str(wt),
+            env_extra={"POTETO_WATCH_NOW": "2026-11-20T19:05:00Z"},
+        )
+        self.assertEqual(cp1.returncode, 0, cp1.stderr)
+        res1 = json.loads(cp1.stdout)
+        self.assertEqual(res1["status"], "duplicate")
+        self.assertEqual(res1["pr_number"], 1)
+
+        events = [json.loads(line) for line in (self.state / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        opened_events = [e for e in events if e.get("kind") == "draft_pr_opened"]
+        self.assertEqual(len(opened_events), 1)
+        self.assertEqual(opened_events[0]["pr_number"], 1)
+
+        cursor = json.loads((self.state / "cursor.json").read_text(encoding="utf-8"))
+        self.assertEqual(cursor["last_post_id"], "2117437607940689999")
+
+        ledger_lines = [json.loads(line) for line in self.ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(ledger_lines), 1)
+        self.assertEqual(ledger_lines[0]["subject"]["sha"], head_sha)
+        self.assertEqual(ledger_lines[0]["at"], "2026-11-20T19:00:00Z")
+
+        # A second retry at a later wall-clock time must not append duplicate events or ledger rows.
+        cp2 = self.run_tool(
+            "open-pr",
+            str(prop_file),
+            "--worktree",
+            str(wt),
+            env_extra={"POTETO_WATCH_NOW": "2026-11-20T20:15:00Z"},
+        )
+        self.assertEqual(cp2.returncode, 0, cp2.stderr)
+        events2 = [json.loads(line) for line in (self.state / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len([e for e in events2 if e.get("kind") == "draft_pr_opened"]), 1)
+        ledger_lines2 = [json.loads(line) for line in self.ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(ledger_lines2), 1)
 
 if __name__ == "__main__":
     unittest.main()
