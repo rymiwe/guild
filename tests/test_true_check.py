@@ -112,7 +112,7 @@ HEAD = "0123456789abcdef0123456789abcdef01234567"
 
 
 def pr(**over):
-    p = {"head": HEAD, "is_draft": False, "labels": ["risk:low"], "risk_sha": HEAD[:7]}
+    p = {"head": HEAD, "is_draft": False, "labels": ["risk:low"], "risk_sha": HEAD}
     p.update(over)
     return p
 
@@ -145,9 +145,13 @@ class RiskTier(Base):
             self.assertEqual(rc, 11, labels)
 
     def test_stale_sha_holds(self):
-        rc, u = self.u(pr=pr(risk_sha="fedcba9"))
+        rc, u = self.u(pr=pr(risk_sha="f" * 40))
         self.assertEqual(rc, 11)
         self.assertIn("stale", u["evidence"])
+
+    def test_short_sha_matching_the_head_prefix_holds(self):
+        rc, u = self.u(pr=pr(risk_sha=HEAD[:7]))
+        self.assertEqual(rc, 11)
 
     def test_short_or_missing_sha_holds(self):
         for sha in (None, "", "0123", "zzzzzzz"):
@@ -155,7 +159,7 @@ class RiskTier(Base):
             self.assertEqual(rc, 11, sha)
 
     def test_head_must_be_full_sha(self):
-        rc, u = self.u(pr=pr(head=HEAD[:12], risk_sha=HEAD[:7]))
+        rc, u = self.u(pr=pr(head=HEAD[:12], risk_sha=HEAD[:12]))
         self.assertEqual(rc, 11)
 
     def test_draft_holds(self):
@@ -178,6 +182,10 @@ class Actions(Base):
                                    "personal_github_owners": ["you"]}))
         self.ledger = self.tmp / "ledger.json"
         self.env.update(WORK_ACCOUNT_CONFIG=str(cfg), GUILD_GATE_LEDGER=str(self.ledger))
+        self.checkout = self.tmp / "personal"
+        subprocess.run(["git", "init", "-q", str(self.checkout)], check=True)
+        subprocess.run(["git", "-C", str(self.checkout), "remote", "add", "origin",
+                        "git@github.com:you/tool.git"], check=True)
         self.rows([])
 
     def rows(self, rows):
@@ -192,7 +200,7 @@ class Actions(Base):
         self.assertEqual((rc, out["allowed"]), (0, True))
 
     def test_personal_merge_allowed_on_pass(self):
-        rc, out = self.act(action="merge", repo="you/tool", path=str(self.tmp / "personal"), pr=pr())
+        rc, out = self.act(action="merge", repo="you/tool", path=str(self.checkout), pr=pr())
         self.assertEqual((rc, out["allowed"]), (0, True))
         self.assertIn("personal", out["allow_reason"])
 
@@ -210,9 +218,23 @@ class Actions(Base):
         self.assertIn("work repo", out["allow_reason"])
 
     def test_unlisted_owner_is_not_personal(self):
-        rc, out = self.act(action="merge", repo="stranger/tool", path=str(self.tmp / "personal"), pr=pr())
+        rc, out = self.act(action="merge", repo="stranger/tool", path=str(self.checkout), pr=pr())
         self.assertEqual((rc, out["status"], out["allowed"]), (11, "pass", False))
         self.assertIn("personal owner", out["allow_reason"])
+
+    def test_personal_path_must_be_a_checkout_of_the_repo(self):
+        for path in ("/", str(self.tmp / "absent")):
+            rc, out = self.act(action="merge", repo="you/tool", path=path, pr=pr())
+            self.assertEqual((rc, out["allowed"]), (11, False), path)
+        rc, out = self.act(action="merge", repo="you/other", path=str(self.checkout), pr=pr())
+        self.assertEqual((rc, out["allowed"]), (11, False))
+        self.assertIn("not a checkout", out["allow_reason"])
+
+    def test_malformed_ledger_row_holds(self):
+        self.rows([{"id": "g", "actions": "force-push", "repos": ["acmecorp/widgets"], "status": "approved"}])
+        rc, out = self.act(action="push", repo="acmecorp/widgets", gate="g", pr=pr())
+        self.assertEqual((rc, out["allowed"]), (11, False))
+        self.assertIn("malformed", out["allow_reason"])
 
     def test_work_path_counts_as_work(self):
         rc, out = self.act(action="merge", repo="you/tool", path=str(self.tmp / "work" / "tool"), pr=pr())
@@ -282,6 +304,11 @@ class Retry(Base):
         self.answers([jev(e="fail", p="unknown"), jev()])
         rc, out, _ = self.run_eval(subject())
         self.assertEqual((rc, out["failed"], self.calls()), (11, ["E"], 1))
+
+    def test_fail_on_retry_holds_a_letter_that_first_passed(self):
+        self.answers([jev(p="unknown"), jev(e="fail")])
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual((rc, out["failed"], self.calls()), (11, ["E"], 2))
 
     def test_unknown_twice_holds(self):
         self.answers([jev(e="unknown")])

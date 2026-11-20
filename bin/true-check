@@ -45,7 +45,7 @@ SUBJECT.json:
             "patch": "optional excerpt for Jev"},
    "force_push": false,
    "pr": {"head": "<40 hex>", "is_draft": false, "labels": ["risk:low"],
-          "risk_sha": "<the SHA the risk review covered, 7+ hex>"}}
+          "risk_sha": "<the full 40-hex SHA the risk review covered>"}}
 
 Jev is reached through `jev-ask REQUEST.json` on PATH, which reads its own key.
 TRUE_CHECK_JEV_ASK names another command, for tests.
@@ -144,7 +144,6 @@ def check_r(subject: dict) -> dict:
 
 PR_ACTIONS = ("merge", "post", "reply")
 SHA40 = re.compile(r"[0-9a-f]{40}")
-SHA_PREFIX = re.compile(r"[0-9a-f]{7,40}")
 TIER_LABELS = ("risk:low", "risk:medium", "risk:high", "risk:stale")
 
 
@@ -162,9 +161,9 @@ def check_risk(pr) -> str | None:
     if tiers != ["risk:low"]:
         return f"needs risk:low and no other tier label, has {tiers or 'none'}"
     sha = str(pr.get("risk_sha") or "").lower()
-    if not SHA_PREFIX.fullmatch(sha):
-        return "risk_sha missing or not a hex SHA of 7+ characters"
-    if not head.startswith(sha):
+    if not SHA40.fullmatch(sha):
+        return "risk_sha missing or not a full 40-hex SHA"
+    if sha != head:
         return f"stale: risk:low covers {sha}, head is {head[:12]}"
     return None
 
@@ -257,7 +256,8 @@ def judge_ep(subject: dict) -> tuple[dict, int]:
     if "fail" in verdicts or "unknown" not in verdicts:
         return got, 1
     retry = jev_letters(*ask_jev(req))
-    return {key: retry[key] if answer["verdict"] == "unknown" else answer
+    # A fail on either call holds; the retry only replaces an unknown.
+    return {key: retry[key] if answer["verdict"] == "unknown" or retry[key]["verdict"] == "fail" else answer
             for key, answer in got.items()}, 2
 
 
@@ -309,6 +309,17 @@ def work_config() -> tuple[list[str], set[str], set[str]] | None:
     return [real(p) for p in prefixes if p.strip()], norm(owners), norm(mine)
 
 
+def origin_repo(path: str) -> str | None:
+    """OWNER/NAME of the checkout's origin remote, casefolded, or None."""
+    try:
+        cp = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                            text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"github\.com[:/]([A-Za-z0-9-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$", cp.stdout.strip())
+    return m.group(1).casefold() if cp.returncode == 0 and m else None
+
+
 def personal_repo(subject: dict) -> tuple[bool, str]:
     cfg = work_config()
     if cfg is None:
@@ -327,6 +338,8 @@ def personal_repo(subject: dict) -> tuple[bool, str]:
     rp = os.path.realpath(os.path.expanduser(path))
     if any(rp == p or rp.startswith(p.rstrip("/") + "/") for p in prefixes):
         return False, f"work repo: {path} is under a work path"
+    if origin_repo(rp) != subject["repo"].casefold():
+        return False, f"{path} is not a checkout whose origin is {subject['repo']}"
     return True, f"personal repo {subject['repo']}"
 
 
@@ -346,11 +359,14 @@ def ledger_row(subject: dict) -> tuple[bool, str]:
     for row in rows:
         if not isinstance(row, dict) or row.get("id") != gate:
             continue
+        actions, repos = row.get("actions"), row.get("repos")
+        if not all(isinstance(xs, list) and all(isinstance(x, str) for x in xs) for xs in (actions, repos)):
+            return False, f"gate row {gate} is malformed: actions and repos must be string lists"
         if row.get("status") != "approved":
             return False, f"gate row {gate} is {row.get('status')!r}, not approved"
-        if subject["action"] not in (row.get("actions") or []):
+        if subject["action"] not in actions:
             return False, f"gate row {gate} does not cover action {subject['action']}"
-        repos = [str(r).casefold() for r in row.get("repos") or []]
+        repos = [r.casefold() for r in repos]
         if not any(r == repo or (r.endswith("/*") and repo.startswith(r[:-1])) for r in repos):
             return False, f"gate row {gate} does not cover {subject['repo']}"
         return True, f"gate row {gate} approves {subject['action']} on {subject['repo']}"
