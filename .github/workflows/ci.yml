@@ -81,6 +81,9 @@ jobs:
           path: .deps/thresher
           persist-credentials: false
 
+      - name: Run true-check tests
+        run: python3 tests/test_true_check.py -v
+
       - name: Run installed pr-gate cross-repo contract test
         env:
           GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
