@@ -107,6 +107,7 @@ def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
     names = " and ".join(f"{m.member} {m.new[:7]}" for m in ready)
     title = f"Pin {names} at trunk"
     branch = "pin/" + "-".join(f"{m.member}-{m.new[:7]}" for m in ready)
+    merged = False
     with tempfile.TemporaryDirectory(prefix="guild-pin-") as tmp:
         wt = Path(tmp) / "wt"
         sh("git", "worktree", "add", "-q", "-b", branch, str(wt), "origin/main")
@@ -119,10 +120,17 @@ def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
             print(url)
             if not ci_passed(url, wt):
                 raise SystemExit(f"guild-pin: Guild CI did not pass on {url}; not merged")
-            sh("gh", "pr", "merge", url, "--merge", "--delete-branch", cwd=wt)
+            sh("gh", "pr", "merge", url, "--merge", cwd=wt)
+            merged = True
             print(f"guild-pin: merged {url}")
         finally:
             subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, capture_output=True)
+            if merged:
+                # Not gh's --delete-branch: it checks out main here, which fails when another worktree holds main.
+                for cmd in (["git", "push", "-q", "origin", "--delete", branch], ["git", "branch", "-q", "-D", branch]):
+                    done = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+                    if done.returncode != 0:
+                        print(f"guild-pin: left branch {branch} behind: {done.stderr.strip()}", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
