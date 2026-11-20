@@ -58,6 +58,27 @@ class PaceCheckTest(unittest.TestCase):
         self.assertEqual(len(out.splitlines()), 1, out)
         return out
 
+    def test_invalid_meter_fields_hold(self) -> None:
+        for overrides in ({"bot_exhausted": None}, {"bot_exhausted": 1},
+                          {"bot_window_s": 1}, {"bot_pct": 10 ** 400}):
+            with self.subTest(overrides=overrides):
+                self.write(meter(4.0, 0.5, **overrides))
+                result = self.run_tool("--cache", str(self.cache))
+                self.assertEqual(result.returncode, 3)
+                self.assert_one_line(result)
+
+    def test_full_allowance_stops_even_when_under_pace(self) -> None:
+        self.write(meter(100.0, 0.95))
+        result = self.run_tool("--cache", str(self.cache))
+        self.assertEqual(result.returncode, 1)
+        self.assert_one_line(result)
+
+    def test_nonfinite_clock_is_bad_usage(self) -> None:
+        self.write(meter(4.0, 0.5))
+        result = self.run_tool("--cache", str(self.cache), "--now", "nan")
+        self.assertEqual(result.returncode, 2)
+        self.assert_one_line(result)
+
     # --- the threshold -------------------------------------------------
 
     def test_above_threshold_fails(self) -> None:

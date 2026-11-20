@@ -58,9 +58,13 @@ def finish(code: int, line: str) -> int:
 
 def number(data: dict, key: str):
     value = data.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 def check(path: str, max_age_s: float, now: float) -> int:
@@ -69,7 +73,7 @@ def check(path: str, max_age_s: float, now: float) -> int:
             data = json.load(fh)
     except FileNotFoundError:
         return finish(EXIT_NO_METER, f"STOP grokbot pace: meter missing ({path})")
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         return finish(EXIT_NO_METER, f"STOP grokbot pace: meter unreadable ({path}: {type(e).__name__})")
     if not isinstance(data, dict):
         return finish(EXIT_NO_METER, f"STOP grokbot pace: meter is not a JSON object ({path})")
@@ -89,23 +93,29 @@ def check(path: str, max_age_s: float, now: float) -> int:
     if window_s <= 0:
         return finish(EXIT_NO_METER, f"STOP grokbot pace: meter bot_window_s is not positive ({path})")
 
+    remaining_s = reset_ts - read_at
+    if not 0 < remaining_s <= window_s:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter reading is outside its reported week ({path})")
+    exhausted = data.get("bot_exhausted")
+    if not isinstance(exhausted, bool):
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter has no boolean bot_exhausted ({path})")
+
     age_s = now - read_at
     if age_s < -FUTURE_SKEW_S:
         return finish(EXIT_NO_METER,
                       f"STOP grokbot pace: meter reading is {-age_s / 60:.0f} min in the future ({path})")
     if age_s > max_age_s:
         return finish(EXIT_NO_METER,
-                      f"STOP grokbot pace: meter stale, reading {age_s / 60:.0f} min old"
+                      f"STOP grokbot pace: meter stale, reading {max(0.0, age_s) / 60:.0f} min old"
                       f" > {max_age_s / 60:.0f} min max ({path})")
     if now >= reset_ts:
         return finish(EXIT_NO_METER, f"STOP grokbot pace: meter is from a week that already reset ({path})")
 
-    if data.get("bot_exhausted") is True:
+    if exhausted or used_pct == 100:
         return finish(EXIT_OVER, f"STOP grokbot pace: weekly allowance exhausted ({used_pct:.1f}% used)")
 
-    elapsed = 1.0 - (reset_ts - read_at) / window_s
-    elapsed = max(0.0, min(1.0, elapsed))
-    detail = f"{used_pct:.1f}% used at {100 * elapsed:.1f}% of week, reading {age_s / 60:.0f} min old"
+    elapsed = 1.0 - remaining_s / window_s
+    detail = f"{used_pct:.1f}% used at {100 * elapsed:.1f}% of week, reading {max(0.0, age_s) / 60:.0f} min old"
     if used_pct < FLOOR_PCT:
         return finish(EXIT_OK, f"ok grokbot pace: under the {FLOOR_PCT:g}% floor ({detail})")
     if elapsed <= 0.0:
@@ -138,6 +148,8 @@ def main(argv: list[str]) -> int:
         return finish(EXIT_USAGE, "STOP grokbot pace: staleness window must be a positive number of seconds")
 
     now = args.now if args.now is not None else time.time()
+    if not math.isfinite(now):
+        return finish(EXIT_USAGE, "STOP grokbot pace: clock must be finite")
     return check(args.cache or default_cache(), max_age_s, now)
 
 
