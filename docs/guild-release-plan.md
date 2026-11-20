@@ -13,7 +13,7 @@
 
 ## Scope
 
-Member repos own their unit and component tests. Guild owns the installed command contracts and release lifecycle. Keep machine configuration, credentials, and live job state outside release directories. A change that makes shared state unreadable by the previous release needs its own rollout decision.
+Member repos own their unit and component tests. Guild owns the installed command contracts and release lifecycle. A member suite that needs a sibling's file exits 77 in its own CI and runs in Guild CI against both pins. Bridgekeeper's three posting suites (`test-evidence-check.sh`, `test-post-gated-review.sh`, `test-review-lint.sh`) need Conclave's label checker and run that way. Keep machine configuration, credentials, and live job state outside release directories. A change that makes shared state unreadable by the previous release needs its own rollout decision.
 
 Do not add a rollout format or scheduler in step 1. The first deliverable is the integration test and its exact input pins. Record the test command and result in the change that closes each step.
 
