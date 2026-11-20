@@ -85,9 +85,11 @@ def is_bot_login(login: str, typ: str | None = None) -> bool:
 
 
 def colleague_status(requester: dict | None, prefs: dict | None = None) -> dict:
-    """G1: a human work-org member (prefs org_members) requesting Ryan. Not Ryan, not a bot, not Wes.
+    """G1: the PR author is a human work-org member (prefs org_members). Not Ryan, not a bot, not Wes.
 
     Unknown requester (missing login, or login not in the member list) asks.
+    That the PR requests Ryan is decided upstream: work-review-requests-check.sh
+    emits only PRs from its review-requested search, or ones Ryan already reviewed.
     """
     prefs = prefs or {}
     ryan = _lower(prefs.get("ryan_login") or RYAN_LOGIN)
@@ -109,12 +111,6 @@ def colleague_status(requester: dict | None, prefs: dict | None = None) -> dict:
     member_set = {_lower(x) for x in members}
     if login not in member_set:
         return {"ok": False, "reason": "unknown requester"}
-    target = _lower(req.get("requested") or req.get("requested_reviewer") or ryan)
-    teams = {_lower(x) for x in (req.get("requested_teams") or prefs.get("ryan_teams") or [])}
-    if target != ryan and target not in teams and ryan not in teams:
-        # Request must be for Ryan or a team Ryan is on.
-        if not req.get("requests_ryan", True):
-            return {"ok": False, "reason": "request does not target Ryan"}
     return {"ok": True, "reason": None, "login": login}
 
 
@@ -443,32 +439,6 @@ def _gh_json(path: str, timeout: int = 60):
         return None
 
 
-def _requester_from_pull(repo: str, number: int, pull: dict, ryan: str) -> dict:
-    """Best-effort requester from the pull user or requested-reviewer list.
-
-    A missing or unknown actor is left for colleague_status to ask (G1).
-    """
-    user = pull.get("user") or {}
-    reviewers = pull.get("requested_reviewers") or []
-    teams = []
-    for team in pull.get("requested_teams") or []:
-        slug = team.get("slug") or team.get("name") if isinstance(team, dict) else team
-        if slug:
-            teams.append(slug)
-    logins = []
-    for rev in reviewers:
-        if isinstance(rev, dict) and rev.get("login"):
-            logins.append(rev["login"])
-    requests_ryan = _lower(ryan) in {_lower(x) for x in logins} or bool(teams)
-    return {
-        "login": user.get("login"),
-        "type": user.get("type"),
-        "requested_reviewer": ryan,
-        "requested_teams": teams,
-        "requests_ryan": True if requests_ryan or not logins else requests_ryan,
-    }
-
-
 def build_hook_row(key: str, kind: str = "NEW") -> dict | None:
     """Build one hook PR row from github metadata (no diffs, no code)."""
     key = (key or "").strip()
@@ -491,7 +461,7 @@ def build_hook_row(key: str, kind: str = "NEW") -> dict | None:
             labels.append(item["name"])
         elif item:
             labels.append(str(item))
-    requester = _requester_from_pull(repo, number, pull, RYAN_LOGIN)
+    user = pull.get("user") or {}
     return {
         "repo": repo,
         "pr": number,
@@ -504,7 +474,7 @@ def build_hook_row(key: str, kind: str = "NEW") -> dict | None:
         "labels": labels,
         "is_draft": bool(pull.get("draft") or pull.get("is_draft")),
         "colleague_request": True,
-        "requester": requester,
+        "requester": {"login": user.get("login"), "type": user.get("type")},
         "kind": kind,
     }
 
