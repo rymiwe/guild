@@ -252,6 +252,20 @@ class LedgerTest(unittest.TestCase):
         # f4's control failed, so its head copy is never fetched.
         self.assertNotIn(contents("lib/moved.rb", HEAD), calls)
 
+    def test_backfill_reports_outcomes_by_verification_tier(self) -> None:
+        self.fixture()
+        f7 = self.council / "run-7" / "findings.json"
+        doc = json.loads(f7.read_text(encoding="utf-8"))
+        doc["verified_at"] = REVIEWED
+        doc["findings"][0]["repro_executed"] = True
+        f7.write_text(json.dumps(doc), encoding="utf-8")
+        p = self.run_tool("backfill", "--council-dir", str(self.council))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(
+            "by verification: executed 1/1 gone (1 total)  checked 0/3 gone (6 total)  none 0/1 gone (1 total)",
+            p.stdout,
+        )
+
     def test_rerun_adds_nothing(self) -> None:
         self.fixture()
         self.assertEqual(self.run_tool("backfill", "--council-dir", str(self.council)).returncode, 0)
