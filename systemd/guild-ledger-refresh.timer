@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the Guild outcome ledger once a day
+
+[Timer]
+OnCalendar=daily
+# BLD is not always on at midnight: run the missed refresh at the next start.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -2,7 +2,7 @@
 
 **Goal.** Every Guild tool records what it decided. None records what happened next, so no gate, council or route can be tuned. The ledger is one shared, append-only record of both. The number it unlocks is human touches per merged PR, with escapes per merged PR as its counterweight.
 
-Unit 1 is the event schema, the writer (`guild-ledger append`), and a backfill (`guild-ledger backfill`) that joins posted council findings to what happened on GitHub. Unit 2 adds `guild-ledger backfill-prs`, each merged or closed PR's lifecycle, so cycle time and reverts have a 30-day baseline. Tools writing events at run time come later, one unit each.
+Unit 1 is the event schema, the writer (`guild-ledger append`), and a backfill (`guild-ledger backfill`) that joins posted council findings to what happened on GitHub. Unit 2 adds `guild-ledger backfill-prs`, each merged or closed PR's lifecycle, so cycle time and reverts have a 30-day baseline. Unit 3 runs both backfills once a day on BLD and pings when one fails. Tools writing events at run time come later, one unit each.
 
 **Done when** (unit 1): on the owner's machine the backfill reproduces the read-only prototype of 2026-11-19 (18 posted findings, 15 testable, cited code gone in 8 and still present in 7, the author replied on 4 of those 7 and 3 got no response), and a second run adds 0 events.
 
@@ -71,12 +71,33 @@ The cited block's longest line, with whitespace collapsed, is the needle. A thre
 - `reviewers` counts only GitHub review submissions. On a repo with one author it is near zero: a council review posted under the owner's login on the owner's own PR counts as the author's.
 - `hours_open` starts at PR creation, not at the first commit or the first request for review.
 
+## Scheduled refresh (BLD only)
+
+`guild-ledger refresh` runs `backfill`, then `backfill-prs` with the default 30-day window. `guild-ledger-refresh.timer` starts it once a day, and at the next boot when BLD was off at midnight. It runs on BLD only: Conclave's run folders and the ledger are local state there. Nothing enables it on the Surface.
+
+- **Which repos.** Guild itself, each tool in `roster` under Guild's GitHub owner (read from the checkout's origin URL), then the list at `guild-config --org guild-ledger.pr_repos`, for example `{"guild-ledger": {"pr_repos": ["OWNER/NAME"]}}` in the org `.guild.json`. Repos outside Guild are named only there, never in this repo. A missing or malformed key fails the PR step. An empty list adds no repo.
+- **How the unit reaches the tool.** `ExecStart` is `guild-exec guild bin/guild-ledger refresh`, so it runs the main checkout `~/code/guild` and refuses (exit 3) when that checkout is dirty or off its default branch. `bopeep sync` fast-forwards it. The unit's `PATH` puts linuxbrew before `/usr/bin`, because BLD's system `python3` is 3.10.
+- **Failure.** A step that fails (exit 3, or an unexpected input shape) does not stop the other step. Each failed kind (`council` or `prs`) sends one `job-notify --send` ping, `job guild`, `session guild-ledger-refresh`, `FAILED`, and writes `refresh-pinged/<kind>` beside the ledger. A run where that kind passes removes the marker, so the next failure pings again. Any failed step exits 3, and the journal (`journalctl --user -u guild-ledger-refresh`) keeps the output.
+- **Cost.** About 52 REST calls for the council backfill plus 1 per page and 1 per closed PR in the window for each repo.
+
+Install on BLD, from the main checkout:
+
+```sh
+systemctl --user link ~/code/guild/systemd/guild-ledger-refresh.service
+systemctl --user enable --now ~/code/guild/systemd/guild-ledger-refresh.timer
+```
+
+Undo: `systemctl --user disable --now guild-ledger-refresh.timer guild-ledger-refresh.service`. That removes both links and leaves the ledger as it is.
+
 ## Commands
 
 ```sh
 echo '<event json>' | guild-ledger append   # prints "appended <id>" or "exists <id>"
 guild-ledger backfill [--council-dir DIR]    # prints counts; default DIR ~/code/conclave/tmp/council
 guild-ledger backfill-prs --repo OWNER/NAME [--repo ...] [--days N]   # prints per-repo cycle time and reverts
+guild-ledger refresh [--council-dir DIR]     # both backfills, one ping per failed kind (the daily timer)
 ```
 
-Exit: 0 done; 2 a malformed event or bad arguments, nothing written; 3 the ledger, an input file or GitHub could not be read. Earlier events from a failed backfill stay, and a rerun skips them.
+The council dir is `--council-dir`, else `$GUILD_LEDGER_COUNCIL_DIR`, else `~/code/conclave/tmp/council`.
+
+Exit: 0 done; 2 a malformed event or bad arguments, nothing written; 3 the ledger, an input file, the config or GitHub could not be read, or for `refresh`, any step failed. Earlier events from a failed backfill stay, and a rerun skips them.
