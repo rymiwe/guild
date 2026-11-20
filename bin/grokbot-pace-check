@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Stop when the Grok Bot weekly allowance is being spent faster than the week passes.
+
+usage: grokbot-pace-check [--cache PATH] [--max-age-s SECONDS] [--now EPOCH]
+
+pace = (% of the week's Grok Bot usage used) / (% of the week elapsed), both taken
+at the moment of the reading. One threshold: pace above 1.1x fails. At or below
+1.1x passes. Below 5% used it always passes: early in the week 1.1x is a
+fraction of a percent, and one busy session would stop every routine. The unrounded pace is compared (within 1e-9, so float noise in an
+exact 1.1x reading does not flip it); it is rounded to 0.01 only when printed.
+
+Reads quartermaster's seat-usage cache, the same file `seat-usage --cached` uses:
+$SEAT_USAGE_CACHE_DIR/latest.json (default ~/.cache/seat-usage/latest.json). On a
+machine that pulls the meters (`seat-usage-push --pull`), that is BLD's copy.
+Fields: bot_pct, bot_reset_ts, bot_window_s, bot_exhausted, as_of.grokbot.
+Makes no network call and reads no credential.
+
+Fail closed: a missing or unparseable file, a missing or non-numeric field, a
+bot_pct outside 0..100, a reading stamped more than 60 s in the future (clock
+skew allowance), a reading older than the staleness window, a reading from a week that has already
+reset, or bot_exhausted all fail.
+
+Staleness window: 3600 s (1 hour) by default, measured from as_of.grokbot.
+BLD refreshes the meter every 10 min and pushes at most every 5, so a good
+pulled copy is 5 to 15 min old; an hour allows a few missed pushes before
+pre-checks stop. Override with --max-age-s or GUILD_PACE_MAX_AGE_S.
+
+Output: exactly one line on stdout.
+Exit:   0 at or below 1.1x; 1 above 1.1x or exhausted; 3 meter missing,
+        unparseable, incomplete or stale; 2 bad arguments.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+
+THRESHOLD = 1.1
+FLOOR_PCT = 5.0
+FLOAT_TOLERANCE = 1e-9
+FUTURE_SKEW_S = 60.0
+DEFAULT_MAX_AGE_S = 3600.0
+EXIT_OK, EXIT_OVER, EXIT_USAGE, EXIT_NO_METER = 0, 1, 2, 3
+
+
+def default_cache() -> str:
+    cache_dir = os.environ.get("SEAT_USAGE_CACHE_DIR") or os.path.expanduser("~/.cache/seat-usage")
+    return os.path.join(cache_dir, "latest.json")
+
+
+def finish(code: int, line: str) -> int:
+    print(line)
+    return code
+
+
+def number(data: dict, key: str):
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def check(path: str, max_age_s: float, now: float) -> int:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter missing ({path})")
+    except (OSError, ValueError, RecursionError) as e:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter unreadable ({path}: {type(e).__name__})")
+    if not isinstance(data, dict):
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter is not a JSON object ({path})")
+
+    as_of = data.get("as_of") if isinstance(data.get("as_of"), dict) else {}
+    read_at = number(as_of, "grokbot")
+    if read_at is None:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter has no as_of.grokbot reading time ({path})")
+    for key in ("bot_pct", "bot_reset_ts", "bot_window_s"):
+        if number(data, key) is None:
+            return finish(EXIT_NO_METER, f"STOP grokbot pace: meter has no numeric {key} ({path})")
+    used_pct = number(data, "bot_pct")
+    reset_ts = number(data, "bot_reset_ts")
+    window_s = number(data, "bot_window_s")
+    if not 0.0 <= used_pct <= 100.0:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter bot_pct {used_pct:g} is outside 0..100 ({path})")
+    if window_s <= 0:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter bot_window_s is not positive ({path})")
+
+    remaining_s = reset_ts - read_at
+    if not 0 < remaining_s <= window_s:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter reading is outside its reported week ({path})")
+    exhausted = data.get("bot_exhausted")
+    if not isinstance(exhausted, bool):
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter has no boolean bot_exhausted ({path})")
+
+    age_s = now - read_at
+    if age_s < -FUTURE_SKEW_S:
+        return finish(EXIT_NO_METER,
+                      f"STOP grokbot pace: meter reading is {-age_s / 60:.0f} min in the future ({path})")
+    if age_s > max_age_s:
+        return finish(EXIT_NO_METER,
+                      f"STOP grokbot pace: meter stale, reading {max(0.0, age_s) / 60:.0f} min old"
+                      f" > {max_age_s / 60:.0f} min max ({path})")
+    if now >= reset_ts:
+        return finish(EXIT_NO_METER, f"STOP grokbot pace: meter is from a week that already reset ({path})")
+
+    if exhausted or used_pct == 100:
+        return finish(EXIT_OVER, f"STOP grokbot pace: weekly allowance exhausted ({used_pct:.1f}% used)")
+
+    elapsed = 1.0 - remaining_s / window_s
+    detail = f"{used_pct:.1f}% used at {100 * elapsed:.1f}% of week, reading {max(0.0, age_s) / 60:.0f} min old"
+    if used_pct < FLOOR_PCT:
+        return finish(EXIT_OK, f"ok grokbot pace: under the {FLOOR_PCT:g}% floor ({detail})")
+    if elapsed <= 0.0:
+        if used_pct <= 0.0:
+            return finish(EXIT_OK, f"ok grokbot pace 0.00x <= {THRESHOLD}x ({detail})")
+        return finish(EXIT_OVER, f"STOP grokbot pace: usage before the week started > {THRESHOLD}x ({detail})")
+
+    pace = (used_pct / 100.0) / elapsed
+    if pace > THRESHOLD + FLOAT_TOLERANCE:
+        return finish(EXIT_OVER, f"STOP grokbot pace {pace:.2f}x above {THRESHOLD}x ({detail})")
+    return finish(EXIT_OK, f"ok grokbot pace {pace:.2f}x <= {THRESHOLD}x ({detail})")
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="grokbot-pace-check", description=__doc__.splitlines()[0])
+    ap.add_argument("--cache", default=None, help="meter file (default $SEAT_USAGE_CACHE_DIR/latest.json)")
+    ap.add_argument("--max-age-s", type=float, default=None,
+                    help=f"staleness window in seconds (default $GUILD_PACE_MAX_AGE_S or {DEFAULT_MAX_AGE_S:.0f})")
+    ap.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)  # tests pin the clock
+    args = ap.parse_args(argv)
+
+    max_age_s = args.max_age_s
+    if max_age_s is None:
+        env = os.environ.get("GUILD_PACE_MAX_AGE_S")
+        try:
+            max_age_s = float(env) if env else DEFAULT_MAX_AGE_S
+        except ValueError:
+            return finish(EXIT_USAGE, f"STOP grokbot pace: GUILD_PACE_MAX_AGE_S is not a number ({env!r})")
+    if not math.isfinite(max_age_s) or max_age_s <= 0:
+        return finish(EXIT_USAGE, "STOP grokbot pace: staleness window must be a positive number of seconds")
+
+    now = args.now if args.now is not None else time.time()
+    if not math.isfinite(now):
+        return finish(EXIT_USAGE, "STOP grokbot pace: clock must be finite")
+    return check(args.cache or default_cache(), max_age_s, now)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
