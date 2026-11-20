@@ -4,6 +4,7 @@
 usage: guild-ledger append                      < one event as JSON on stdin
        guild-ledger backfill [--council-dir DIR]
        guild-ledger backfill-prs --repo OWNER/NAME [--repo ...] [--days N]
+       guild-ledger refresh [--council-dir DIR]
 
 Ledger: $GUILD_LEDGER (default ~/.local/state/guild/ledger.jsonl), append-only
 JSONL. The schema and the backfill's proxy are in docs/outcome-ledger.md.
@@ -17,9 +18,16 @@ backfill-prs
          appends an outcome per PR merged or closed in the last N days (default
          30) on each repo, from GitHub (REST only), and prints per-repo cycle
          time and reverts. A rerun on unchanged state appends nothing.
+refresh  runs backfill, then backfill-prs over Guild, each roster tool and the
+         org's guild-ledger.pr_repos (guild-config --org). A failed step sends
+         one job-notify ping per kind until that step passes again; the other
+         step still runs. guild-ledger-refresh.timer runs it daily.
+
+Council dir: --council-dir, else $GUILD_LEDGER_COUNCIL_DIR, else
+~/code/conclave/tmp/council.
 
 Exit: 0 done; 2 malformed event or bad arguments, nothing written; 3 the ledger,
-an input file or GitHub could not be read.
+an input file, the config or GitHub could not be read (refresh: any step failed).
 """
 from __future__ import annotations
 
@@ -391,6 +399,91 @@ def backfill_prs(repos: list[str], days: int) -> int:
     return EXIT_OK
 
 
+# --- refresh ---------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+PR_REPOS_KEY = "guild-ledger.pr_repos"
+REFRESH_DAYS = 30
+SHAPE_ERRORS = (KeyError, TypeError, ValueError, AttributeError)
+
+
+def council_default() -> str:
+    return os.environ.get("GUILD_LEDGER_COUNCIL_DIR") or os.path.expanduser("~/code/conclave/tmp/council")
+
+
+def run_text(args: list[str], what: str) -> str:
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Unreadable(f"{what}: {exc}")
+    if out.returncode != 0:
+        raise Unreadable(f"{what}: exit {out.returncode}: {out.stderr.strip()}")
+    return out.stdout
+
+
+def refresh_repos() -> list[str]:
+    """Guild itself, each roster tool under Guild's owner, then the org's PR_REPOS_KEY.
+    The org list lives outside this public repo; a missing key fails closed."""
+    url = run_text(["git", "-C", str(ROOT), "remote", "get-url", "origin"], f"origin of {ROOT}").strip()
+    m = re.search(r"github\.com[:/]+([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$", url)
+    if not m:
+        raise Unreadable(f"{ROOT}: cannot read OWNER/NAME from the origin URL")
+    owner, name = m.groups()
+    try:
+        roster = (ROOT / "roster").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise Unreadable(f"{ROOT / 'roster'}: {exc.strerror or exc}")
+    tools = [line.split("#")[0].strip() for line in roster]
+    org = json.loads(run_text(["guild-config", "--org", PR_REPOS_KEY], f"guild-config --org {PR_REPOS_KEY}"))
+    if not isinstance(org, list) or not all(isinstance(r, str) and REPO_RE.match(r) for r in org):
+        raise Unreadable(f"{PR_REPOS_KEY} must be a list of OWNER/NAME")
+    repos = [f"{owner}/{name}", *(f"{owner}/{t}" for t in tools if t), *org]
+    bad = [r for r in repos if not REPO_RE.match(r)]
+    if bad:
+        raise Unreadable(f"not OWNER/NAME: {bad}")
+    return list(dict.fromkeys(repos))
+
+
+def ping_once(kind: str, message: str) -> None:
+    """One job-notify ping per failure kind; refresh clears the marker when the kind passes."""
+    marker = ledger_path().parent / "refresh-pinged" / kind
+    if marker.exists():
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError as exc:
+        print(f"guild-ledger refresh: cannot write {marker}: {exc.strerror or exc}", file=sys.stderr)
+    reason = "".join(c for c in f"{kind}: {message}" if c.isprintable() and c not in '\\"')[:300]
+    try:
+        out = subprocess.run(["job-notify", "--send", str(ledger_path().parent), "guild-ledger-refresh",
+                              "FAILED", reason], capture_output=True, text=True, timeout=120)
+        if out.returncode != 0:
+            print(f"guild-ledger refresh: job-notify exit {out.returncode}", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"guild-ledger refresh: job-notify failed: {exc}", file=sys.stderr)
+
+
+def refresh(council: Path) -> int:
+    steps = {"council": lambda: backfill(council),
+             "prs": lambda: backfill_prs(refresh_repos(), REFRESH_DAYS)}
+    failed = []
+    for kind, step in steps.items():
+        print(f"== {kind}", flush=True)
+        try:
+            step()
+        except (Unreadable, *SHAPE_ERRORS) as exc:
+            message = str(exc) if isinstance(exc, Unreadable) else f"unexpected shape: {exc!r}"
+            print(f"guild-ledger refresh: {kind} failed: {message}", file=sys.stderr, flush=True)
+            failed.append(kind)
+            ping_once(kind, message)
+        else:
+            (ledger_path().parent / "refresh-pinged" / kind).unlink(missing_ok=True)
+        sys.stdout.flush()
+    print(f"refresh {'FAILED: ' + ' '.join(failed) if failed else 'ok'}")
+    return EXIT_UNREADABLE if failed else EXIT_OK
+
+
 # --- entry ---------------------------------------------------------------
 
 def repo_arg(value: str) -> str:
@@ -410,10 +503,12 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("append", help="append one event read from stdin")
     bf = sub.add_parser("backfill", help="join posted council findings to GitHub")
-    bf.add_argument("--council-dir", default=os.path.expanduser("~/code/conclave/tmp/council"))
+    bf.add_argument("--council-dir", default=council_default())
     bp = sub.add_parser("backfill-prs", help="record each merged or closed PR's lifecycle from GitHub")
     bp.add_argument("--repo", action="append", required=True, type=repo_arg, metavar="OWNER/NAME")
     bp.add_argument("--days", type=days_arg, default=30)
+    rf = sub.add_parser("refresh", help="run both backfills and ping on a failure (the daily timer)")
+    rf.add_argument("--council-dir", default=council_default())
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -427,11 +522,13 @@ def main(argv: list[str]) -> int:
             new = append_events([event])[0]
             print(f"{'appended' if new else 'exists'} {event['id']}")
             return EXIT_OK
+        if args.cmd == "refresh":
+            return refresh(Path(args.council_dir))
         try:
             if args.cmd == "backfill-prs":
                 return backfill_prs(list(dict.fromkeys(args.repo)), args.days)
             return backfill(Path(args.council_dir))
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except SHAPE_ERRORS as exc:
             raise Unreadable(f"unexpected shape in a council run or GitHub response: {exc!r}")
     except BadEvent as exc:
         print(f"guild-ledger: malformed event: {exc}", file=sys.stderr)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,11 +73,14 @@ class LedgerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp_ctx.cleanup()
 
-    def run_tool(self, *args, stdin=None):
+    def run_tool(self, *args, stdin=None, tool=TOOL):
         env = dict(os.environ, GUILD_LEDGER=str(self.ledger), FAKE_GH_LOG=str(self.log),
                    FAKE_GH_ROUTES=str(self.routes_file),
+                   FAKE_GUILD_CONFIG=str(self.tmp / "guild.json"),
+                   FAKE_NOTIFY_LOG=str(self.tmp / "notify.log"),
                    PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}")
-        return subprocess.run([sys.executable, str(TOOL), *args], input=stdin, capture_output=True,
+        env.pop("GUILD_LEDGER_COUNCIL_DIR", None)
+        return subprocess.run([sys.executable, str(tool), *args], input=stdin, capture_output=True,
                               text=True, env=env, timeout=60)
 
     def lines(self):
@@ -401,6 +405,117 @@ class LedgerTest(unittest.TestCase):
                 p = self.run_tool("backfill-prs", *args)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertFalse(self.log.exists())
+
+
+    # --- refresh ---------------------------------------------------------
+
+    ORG_REPO = "OtherOrg/app"
+    TOOLS = ["AcmeCorp/guild", "AcmeCorp/tool-a", "AcmeCorp/tool-b"]
+
+    def refresh_fixture(self, org_key=True) -> Path:
+        """A Guild checkout under AcmeCorp with a two-tool roster, the council fixture, one
+        closed PR on the org repo, and fake guild-config and job-notify."""
+        checkout = self.tmp / "guild"
+        (checkout / "bin").mkdir(parents=True)
+        shutil.copy(TOOL, checkout / "bin" / "guild-ledger")
+        (checkout / "roster").write_text("# tools\ntool-a\n\ntool-b  # second\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",
+                        "git@github.com:AcmeCorp/guild.git"], check=True)
+        for name, body in {
+            "guild-config": """\
+                #!/usr/bin/env python3
+                import json, os, sys
+                key = sys.argv[-1]
+                try:
+                    cfg = json.load(open(os.environ["FAKE_GUILD_CONFIG"]))
+                    for part in key.split("."):
+                        cfg = cfg[part]
+                except (OSError, KeyError):
+                    sys.stderr.write(f"guild-config: guild.json: missing key {key}\\n")
+                    sys.exit(3)
+                print(json.dumps(cfg))
+                """,
+            "job-notify": """\
+                #!/usr/bin/env python3
+                import json, os, sys
+                with open(os.environ["FAKE_NOTIFY_LOG"], "a") as log:
+                    log.write(json.dumps(sys.argv[1:]) + "\\n")
+                """,
+        }.items():
+            path = self.bin / name
+            path.write_text(textwrap.dedent(body), encoding="utf-8")
+            path.chmod(0o755)
+        if org_key:
+            (self.tmp / "guild.json").write_text(
+                json.dumps({"guild-ledger": {"pr_repos": [self.ORG_REPO]}}), encoding="utf-8")
+        self.fixture()
+        routes = json.loads(self.routes_file.read_text(encoding="utf-8"))
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for repo in [*self.TOOLS, self.ORG_REPO]:
+            routes[f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1"] = []
+        routes[f"repos/{self.ORG_REPO}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1"] = [
+            {"number": 4, "user": {"login": "alex-acme", "type": "User"}, "head": {"sha": "e" * 40},
+             "title": "Add a widget", "body": "", "created_at": now, "closed_at": now,
+             "merged_at": now, "updated_at": now}]
+        routes[f"repos/{self.ORG_REPO}/pulls/4/reviews?per_page=100"] = []
+        self.routes_file.write_text(json.dumps(routes), encoding="utf-8")
+        return checkout / "bin" / "guild-ledger"
+
+    def pings(self):
+        log = self.tmp / "notify.log"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def test_refresh_runs_both_backfills_and_a_rerun_adds_nothing(self) -> None:
+        tool = self.refresh_fixture()
+        p = self.run_tool("refresh", "--council-dir", str(self.council), tool=tool)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(self.lines()), 20)  # 19 from the council fixture, 1 PR lifecycle
+        listed = [json.loads(line)[-1].split("/pulls?")[0].removeprefix("repos/")
+                  for line in self.log.read_text().splitlines() if "/pulls?state=closed" in line]
+        self.assertEqual(listed, [*self.TOOLS, self.ORG_REPO])
+        self.assertTrue(p.stdout.rstrip().endswith("refresh ok"), p.stdout)
+        before = self.ledger.read_text(encoding="utf-8")
+        again = self.run_tool("refresh", "--council-dir", str(self.council), tool=tool)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(self.ledger.read_text(encoding="utf-8"), before)
+        self.assertEqual(again.stdout.count("events appended 0"), 2, again.stdout)
+        self.assertEqual(self.pings(), [])
+
+    def test_refresh_failure_pings_once_per_kind_until_it_passes(self) -> None:
+        tool = self.refresh_fixture()
+        missing = str(self.tmp / "nope")
+        p = self.run_tool("refresh", "--council-dir", missing, tool=tool)
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertEqual(len(self.lines()), 1)  # the PR step still ran
+        self.assertIn("refresh FAILED: council", p.stdout)
+        pings = self.pings()
+        self.assertEqual(len(pings), 1, pings)
+        self.assertEqual(pings[0][:4], ["--send", str(self.ledger.parent), "guild-ledger-refresh", "FAILED"])
+        self.assertTrue(pings[0][4].startswith("council: ") and "not a directory" in pings[0][4], pings)
+        self.assertEqual(self.run_tool("refresh", "--council-dir", missing, tool=tool).returncode, 3)
+        self.assertEqual(len(self.pings()), 1)  # same kind, no second ping
+        self.assertEqual(self.run_tool("refresh", "--council-dir", str(self.council), tool=tool).returncode, 0)
+        self.assertEqual(self.run_tool("refresh", "--council-dir", missing, tool=tool).returncode, 3)
+        self.assertEqual(len(self.pings()), 2)  # a pass in between re-arms the ping
+
+    def test_refresh_without_the_org_key_fails_closed(self) -> None:
+        tool = self.refresh_fixture(org_key=False)
+        p = self.run_tool("refresh", "--council-dir", str(self.council), tool=tool)
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn("guild-ledger.pr_repos", p.stderr)
+        self.assertEqual(len(self.lines()), 19)  # the council step still ran; no PR was listed
+        self.assertNotIn("/pulls?state=closed", self.log.read_text())
+        pings = self.pings()
+        self.assertEqual(len(pings), 1, pings)
+        self.assertTrue(pings[0][4].startswith("prs: "), pings)
+
+    def test_council_dir_comes_from_the_environment(self) -> None:
+        env = dict(os.environ, GUILD_LEDGER=str(self.ledger), GUILD_LEDGER_COUNCIL_DIR=str(self.tmp / "nope"))
+        p = subprocess.run([sys.executable, str(TOOL), "backfill"], capture_output=True, text=True,
+                           env=env, timeout=60)
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn(str(self.tmp / "nope"), p.stderr)
 
 
 if __name__ == "__main__":

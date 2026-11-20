@@ -82,7 +82,7 @@ grokbot-pace-check || exit "$?"   # preserve the checker’s exit code
 
 ## Outcome ledger
 
-[`bin/guild-ledger`](bin/guild-ledger) keeps one append-only record of what each tool decided and what happened next, in `${GUILD_LEDGER:-~/.local/state/guild/ledger.jsonl}`. `guild-ledger append` writes one validated event from stdin and skips an id already present. `guild-ledger backfill` joins Conclave's posted review findings to GitHub over REST. No wrapper is installed: run it from the Guild checkout. Schema, proxy and limits: [`docs/outcome-ledger.md`](docs/outcome-ledger.md).
+[`bin/guild-ledger`](bin/guild-ledger) keeps one append-only record of what each tool decided and what happened next, in `${GUILD_LEDGER:-~/.local/state/guild/ledger.jsonl}`. `guild-ledger append` writes one validated event from stdin and skips an id already present. `guild-ledger backfill` joins Conclave's posted review findings to GitHub over REST. `guild-ledger-refresh.timer` runs both backfills daily on BLD and pings on a failure. No wrapper is installed: run it from the Guild checkout. Schema, proxy and limits: [`docs/outcome-ledger.md`](docs/outcome-ledger.md).
 
 ## Changing a crest
 
