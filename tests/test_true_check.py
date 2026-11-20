@@ -171,6 +171,19 @@ class Letters(Base):
             self.assertEqual(rc, 11, patch[:60])
             self.assertNotEqual(out["status"], "pass", patch[:60])
 
+    def test_patches_git_would_read_another_way_hold(self):
+        hunk = "@@ -1 +1 @@\n-x\n+y\n"
+        for patch in (
+            "diff --git db/migrate/001_x.rb db/migrate/001_x.rb\n--- db/migrate/001_x.rb\n+++ db/migrate/001_x.rb\n" + hunk,
+            "diff --git a/.github/workflows/ci.yml b/lib/a.py\n--- a/.github/workflows/ci.yml\n+++ b/lib/a.py\n" + hunk,
+            "diff --git a/lib/a.py b/lib/a.py\n--- a/.github/workflows/ci.yml\n+++ b/lib/a.py\n" + hunk,
+            "diff --git a/bin/helper b/bin/helper\nindex 1111111..2222222 160000\n--- a/bin/helper\n+++ b/bin/helper\n"
+            "@@ -1 +1 @@\n-Subproject commit " + "1" * 40 + "\n+Subproject commit " + "2" * 40 + "\n",
+        ):
+            rc, out, _ = self.run_eval(subject(diff={"patch": patch}))
+            self.assertEqual(rc, 11, patch[:50])
+            self.assertIn("R", out["failed"], patch[:50])
+
     def test_test_shaped_paths_in_dot_directories_hold(self):
         for path in (".gitlab/ci/test/build.sh", ".buildkite/test_pipeline.py"):
             rc, out, _ = self.run_eval(subject(diff=D((path, 1, 0))))
@@ -347,6 +360,19 @@ class Actions(Base):
                         "commit", "-q", "--allow-empty", "-m", "x"], check=True)
         wt = self.tmp / "wt2"
         subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+        rc, out = self.act(action="merge", repo="you/tool", path=str(wt), pr=pr())
+        self.assertEqual((rc, out["allowed"]), (11, False))
+
+    def test_worktree_origin_must_match_the_main_checkout(self):
+        main = self.tmp / "app"
+        subprocess.run(["git", "init", "-q", str(main)], check=True)
+        g = lambda *a: subprocess.run(["git", "-C", str(main), *a], check=True)
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        g("config", "extensions.worktreeConfig", "true")
+        wt = self.tmp / "wt3"
+        g("worktree", "add", "-q", str(wt))
+        subprocess.run(["git", "-C", str(wt), "config", "--worktree", "remote.origin.url",
+                        "git@github.com:you/tool.git"], check=True)
         rc, out = self.act(action="merge", repo="you/tool", path=str(wt), pr=pr())
         self.assertEqual((rc, out["allowed"]), (11, False))
 

@@ -123,6 +123,29 @@ def git_apply(patch: str, *args: str) -> str | None:
     return cp.stdout if cp.returncode == 0 else None
 
 
+def same_paths(patch: str) -> bool:
+    """Every section keeps one path, with git's a/ and b/ prefixes, and no gitlink.
+
+    git apply strips one component and infers an undeclared rename from ---/+++,
+    so a no-prefix diff or a mismatched ---/+++ pair would hide the real path.
+    """
+    if not patch.startswith("diff --git "):
+        return False
+    for line in patch.split("\n"):
+        if line.startswith("diff --git "):
+            m = re.fullmatch(r"diff --git a/(\S+) b/(\S+)", line)
+            if not m or m.group(1) != m.group(2):
+                return False
+            cur = m.group(1)
+        elif line.startswith(("--- ", "+++ ")):
+            side = "a/" if line[0] == "-" else "b/"
+            if line[4:] != "/dev/null" and line[4:] != side + cur:
+                return False
+        elif "160000" in line.split() or line.startswith(("Subproject commit", "-Subproject", "+Subproject")):
+            return False
+    return True
+
+
 def diff_files(subject: dict) -> list[dict] | None:
     """The files and line counts in diff.patch, as git itself reads it.
 
@@ -134,6 +157,8 @@ def diff_files(subject: dict) -> list[dict] | None:
     diff = subject.get("diff")
     patch = diff.get("patch") if isinstance(diff, dict) else None
     if not isinstance(patch, str) or not patch.strip():
+        return None
+    if not same_paths(patch):
         return None
     summary = git_apply(patch, "--summary")
     stat = git_apply(patch, "--numstat", "-z")
@@ -374,7 +399,8 @@ def git(path: str, *args: str) -> str | None:
 
 def origin_repo(path: str) -> str | None:
     """OWNER/NAME of the checkout's origin remote, casefolded, or None."""
-    m = ORIGIN_RE.fullmatch(git(path, "remote", "get-url", "origin") or "")
+    urls = (git(path, "remote", "get-url", "--all", "origin") or "").split("\n")
+    m = ORIGIN_RE.fullmatch(urls[0]) if len(urls) == 1 else None
     return m.group(1).casefold() if m else None
 
 
@@ -410,7 +436,7 @@ def personal_repo(subject: dict) -> tuple[bool, str]:
     for where in (rp, home):
         if any(where == p or where.startswith(p.rstrip("/") + "/") for p in prefixes):
             return False, f"work repo: {where} is under a work path"
-    if origin_repo(rp) != subject["repo"].casefold():
+    if {origin_repo(rp), origin_repo(home)} != {subject["repo"].casefold()}:
         return False, f"{path} is not a checkout whose origin is {subject['repo']}"
     return True, f"personal repo {subject['repo']}"
 
