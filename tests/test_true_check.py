@@ -157,6 +157,25 @@ class Letters(Base):
         rc, out, _ = self.run_eval(subject(diff=D(*renames)))
         self.assertIn("T", out["failed"])
 
+    def test_rules_see_the_paths_git_sees(self):
+        hunk = "@@ -1 +1 @@\n-x\n+y\n"
+        for patch in (
+            "diff --git a/docs/note.md b/docs/note.md\n--- a/db/migrate/001.rb\n+++ b/db/migrate/001.rb\n" + hunk,
+            patch_of([("docs/a.md", 1, 1)]) + "--- a/.github/w.yml\n+++ b/.github/w.yml\n" + hunk,
+            "diff --git a/lib/a.py b/lib/a.py\nsimilarity index 90%\nrename from .github/w.yml\nrename to lib/a.py\n"
+            "--- a/.github/w.yml\n+++ b/lib/a.py\n" + hunk,
+            "diff --git a/db/schema.rb b/lib/a.py\nsimilarity index 90%\ncopy from db/schema.rb\ncopy to lib/a.py\n"
+            "--- a/db/schema.rb\n+++ b/lib/a.py\n" + hunk,
+        ):
+            rc, out, _ = self.run_eval(subject(diff={"patch": patch}))
+            self.assertEqual(rc, 11, patch[:60])
+            self.assertNotEqual(out["status"], "pass", patch[:60])
+
+    def test_test_shaped_paths_in_dot_directories_hold(self):
+        for path in (".gitlab/ci/test/build.sh", ".buildkite/test_pipeline.py"):
+            rc, out, _ = self.run_eval(subject(diff=D((path, 1, 0))))
+            self.assertIn("U", out["failed"], path)
+
     def test_case_and_dot_directories_hold(self):
         for path in ("DB/Migrate/1_x.rb", ".buildkite/pipeline.sh", ".gitlab/ci/build.sh", ".devcontainer/setup.sh"):
             rc, out, _ = self.run_eval(subject(diff=D((path, 1, 0))))
@@ -319,6 +338,17 @@ class Actions(Base):
         rc, out = self.act(action="merge", repo="you/tool", path=str(wt), pr=pr())
         self.assertEqual((rc, out["allowed"]), (11, False))
         self.assertIn("work path", out["allow_reason"])
+
+    def test_worktree_with_separate_git_dir_is_work(self):
+        main, gd = self.tmp / "work" / "app", self.tmp / "gd"
+        subprocess.run(["git", "init", "-q", f"--separate-git-dir={gd}", str(main)], check=True)
+        subprocess.run(["git", "-C", str(main), "remote", "add", "origin", "git@github.com:you/tool.git"], check=True)
+        subprocess.run(["git", "-C", str(main), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        wt = self.tmp / "wt2"
+        subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+        rc, out = self.act(action="merge", repo="you/tool", path=str(wt), pr=pr())
+        self.assertEqual((rc, out["allowed"]), (11, False))
 
     def test_work_path_counts_as_work(self):
         rc, out = self.act(action="merge", repo="you/tool", path=str(self.tmp / "work" / "tool"), pr=pr())

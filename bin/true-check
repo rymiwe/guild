@@ -23,8 +23,7 @@ The ledger is $GUILD_GATE_LEDGER or ~/.config/guild/gate-ledger.json.
 
 Letters:
   T trivial      rule: at most MAX_FILES files and MAX_LINES lines outside tests.
-  R reversible   rule: one git revert undoes it: every path (a rename's
-                 old_path too) is a test or on the ORDINARY allowlist, none
+  R reversible   rule: one git revert undoes it: every path is a test or on the ORDINARY allowlist, none
                  is a migration, schema, lockfile or dependency, and no
                  force-push.
   U unrisky      rule: every path is a test or ORDINARY, and none is an auth,
@@ -110,51 +109,53 @@ def subject_sha(subject: dict) -> str:
 
 
 SAFE_PATH = re.compile(r"[A-Za-z0-9_.@+-]+(/[A-Za-z0-9_.@+-]+)*")
-HEADER = re.compile(r"diff --git a/(\S+) b/(\S+)")
+
+
+def git_apply(patch: str, *args: str) -> str | None:
+    """git apply's reading of PATCH (it applies nothing), or None when git rejects it."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    with tempfile.TemporaryDirectory() as empty:
+        try:
+            cp = subprocess.run(["git", "apply", *args, "-"], input=patch, text=True,
+                                capture_output=True, timeout=30, cwd=empty, env=env)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return cp.stdout if cp.returncode == 0 else None
 
 
 def diff_files(subject: dict) -> list[dict] | None:
-    """Parse the files, renames and line counts out of diff.patch, a git diff.
+    """The files and line counts in diff.patch, as git itself reads it.
 
-    The patch is the one source: the rule letters and Jev read the same change.
-    None (a hold) for anything this parser does not fully understand.
+    The patch is the one source: the rule letters and Jev read the same change,
+    and git, not a hand-written parser, names the paths. None (a hold) when git
+    rejects the patch, for a binary file, and for a rename or copy, whose old
+    path git's numstat does not report.
     """
     diff = subject.get("diff")
     patch = diff.get("patch") if isinstance(diff, dict) else None
-    if not isinstance(patch, str) or not patch.startswith("diff --git "):
+    if not isinstance(patch, str) or not patch.strip():
         return None
-    files, cur = [], None
-    for line in patch.split("\n"):
-        if line.startswith("diff --git "):
-            m = HEADER.fullmatch(line)
-            if not m:
-                return None
-            cur = {"path": m.group(2), "added": 0, "deleted": 0}
-            if m.group(1) != m.group(2):
-                cur["old_path"] = m.group(1)
-            files.append(cur)
-        elif line.startswith(("Binary files ", "GIT binary patch")):
+    summary = git_apply(patch, "--summary")
+    stat = git_apply(patch, "--numstat", "-z")
+    if summary is None or not stat or any(l.startswith((" rename ", " copy ")) for l in summary.splitlines()):
+        return None
+    files = []
+    for rec in stat.split("\0")[:-1]:
+        parts = rec.split("\t")
+        if len(parts) != 3 or not (parts[0].isdigit() and parts[1].isdigit()):
             return None
-        elif line.startswith(("+++ ", "--- ", "index ", "new file mode ", "deleted file mode ",
-                              "old mode ", "new mode ", "similarity index ", "rename from ",
-                              "rename to ", "@@ ", "\\ No newline")):
-            continue
-        elif line.startswith("+"):
-            cur["added"] += 1
-        elif line.startswith("-"):
-            cur["deleted"] += 1
-    for f in files:
-        for path in (f["path"], f.get("old_path", "x")):
-            if not SAFE_PATH.fullmatch(path) or any(x in (".", "..") for x in path.split("/")):
-                return None
-    return files
+        path = parts[2]
+        if not SAFE_PATH.fullmatch(path) or any(x in (".", "..") for x in path.split("/")):
+            return None
+        files.append({"path": path, "added": int(parts[0]), "deleted": int(parts[1])})
+    return files or None
 
 
 def check_t(subject: dict) -> dict:
     files = diff_files(subject)
     if files is None:
         return letter("fail", "missing-evidence: diff.files with path, added and deleted")
-    code = [f for f in files if not all(TEST_PATH.search(p) for p in (f["path"], f.get("old_path") or f["path"]))]
+    code = [f for f in files if not TEST_PATH.search(f["path"])]
     lines = sum(f["added"] + f["deleted"] for f in code)
     if len(code) > MAX_FILES:
         return letter("fail", f"{len(code)} files outside tests, limit {MAX_FILES}")
@@ -163,13 +164,10 @@ def check_t(subject: dict) -> dict:
     return letter("pass", f"{len(code)} files and {lines} lines outside tests (limits {MAX_FILES}, {MAX_LINES})")
 
 
-def paths(files: list[dict]) -> list[str]:
-    """Every path a file touches: a rename counts its old path too."""
-    return [p for f in files for p in (f["path"], f.get("old_path")) if p]
-
-
 def first_match(files: list[dict], rules) -> str | None:
-    for path in paths(files):
+    for path in (f["path"] for f in files):
+        if any(seg.startswith(".") for seg in path.split("/")):
+            return f"dot-directory or dotfile: {path}"
         if not (TEST_PATH.search(path) or ORDINARY.fullmatch(path)):
             return f"unlisted file type: {path}"
         for name, rx in rules:
@@ -381,9 +379,13 @@ def origin_repo(path: str) -> str | None:
 
 
 def main_checkout(path: str) -> str | None:
-    """Where the repository lives: a linked worktree resolves to its main checkout."""
-    common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    return os.path.dirname(os.path.realpath(common)) if common else None
+    """Where the repository lives: git lists the main worktree first, wherever its git dir is."""
+    first = (git(path, "worktree", "list", "--porcelain") or "").split("\n")[0]
+    if not first.startswith("worktree /"):
+        return None
+    main = os.path.realpath(first[len("worktree "):])
+    # With a separate git dir, git names the git dir here and the checkout is unknowable.
+    return main if os.path.exists(os.path.join(main, ".git")) else None
 
 
 def personal_repo(subject: dict) -> tuple[bool, str]:
@@ -404,7 +406,7 @@ def personal_repo(subject: dict) -> tuple[bool, str]:
     rp = os.path.realpath(os.path.expanduser(path))
     home = main_checkout(rp)
     if home is None:
-        return False, f"{path} is not a git checkout"
+        return False, f"cannot locate the main checkout of {path}"
     for where in (rp, home):
         if any(where == p or where.startswith(p.rstrip("/") + "/") for p in prefixes):
             return False, f"work repo: {where} is under a work path"
