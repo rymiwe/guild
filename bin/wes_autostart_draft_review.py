@@ -89,7 +89,7 @@ def colleague_status(requester: dict | None, prefs: dict | None = None) -> dict:
 
     Unknown requester (missing login, or login not in the member list) asks.
     That the PR requests Ryan is decided upstream: work-review-requests-check.sh
-    emits only PRs from its review-requested search, or ones Ryan already reviewed.
+    emits only PRs from its review-requested search.
     """
     prefs = prefs or {}
     ryan = _lower(prefs.get("ryan_login") or RYAN_LOGIN)
