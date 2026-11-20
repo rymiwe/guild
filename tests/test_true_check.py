@@ -31,6 +31,7 @@ def subject(**over):
          "diff": {"files": [{"path": "bin/parse", "added": 2, "deleted": 5},
                             {"path": "tests/test_parse.py", "added": 40, "deleted": 0}]},
          "force_push": False}
+    s["diff"]["patch"] = "--- a/bin/parse\n+++ b/bin/parse\n-dead branch\n"
     s.update(over)
     return s
 
@@ -101,6 +102,22 @@ class Letters(Base):
         del s["force_push"]
         rc, out, _ = self.run_eval(s)
         self.assertEqual(out["failed"], ["R"])
+
+    def test_jev_must_read_the_whole_patch(self):
+        files = subject()["diff"]["files"]
+        for patch in (None, "", "x" * 6001):
+            rc, out, _ = self.run_eval(subject(diff={"files": files, "patch": patch}))
+            self.assertEqual((rc, out["failed"]), (11, ["E", "P"]), repr(patch)[:20])
+        self.assertEqual(self.calls(), 0)
+
+    def test_malformed_counts_and_paths_hold(self):
+        for f in ({"path": "bin/x", "added": True, "deleted": 0},
+                  {"path": "tests/../bin/parse", "added": 81, "deleted": 0},
+                  {"path": "/etc/x", "added": 1, "deleted": 0},
+                  {"path": "./bin/x", "added": 1, "deleted": 0}):
+            rc, out, _ = self.run_eval(subject(diff={"files": [f], "patch": "p"}))
+            self.assertEqual(rc, 11, f)
+            self.assertIn("T", out["failed"], f)
 
     def test_jev_fail_holds_without_retry(self):
         self.answers([jev(p="fail")])
@@ -235,6 +252,18 @@ class Actions(Base):
         rc, out = self.act(action="push", repo="acmecorp/widgets", gate="g", pr=pr())
         self.assertEqual((rc, out["allowed"]), (11, False))
         self.assertIn("malformed", out["allow_reason"])
+
+    def test_origin_must_be_github_itself(self):
+        for url in ("https://notgithub.com/you/tool", "git@notgithub.com:you/tool.git",
+                    "https://evil.example/github.com/you/tool"):
+            subprocess.run(["git", "-C", str(self.checkout), "remote", "set-url", "origin", url], check=True)
+            rc, out = self.act(action="merge", repo="you/tool", path=str(self.checkout), pr=pr())
+            self.assertEqual((rc, out["allowed"]), (11, False), url)
+
+    def test_git_dir_in_env_cannot_stand_in_for_the_path(self):
+        self.env["GIT_DIR"] = str(self.checkout / ".git")
+        rc, out = self.act(action="merge", repo="you/tool", path="/", pr=pr())
+        self.assertEqual((rc, out["allowed"]), (11, False))
 
     def test_work_path_counts_as_work(self):
         rc, out = self.act(action="merge", repo="you/tool", path=str(self.tmp / "work" / "tool"), pr=pr())
