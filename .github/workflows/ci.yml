@@ -133,3 +133,6 @@ jobs:
 
       - name: Run the outcome ledger tests
         run: python3 tests/test_guild_ledger.py -v
+
+      - name: Run the poteto-watch tests
+        run: python3 tests/test_poteto_watch.py -v

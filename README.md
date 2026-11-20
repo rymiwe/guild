@@ -84,6 +84,10 @@ grokbot-pace-check || exit "$?"   # preserve the checker’s exit code
 
 [`bin/guild-ledger`](bin/guild-ledger) keeps one append-only record of what each tool decided and what happened next, in `${GUILD_LEDGER:-~/.local/state/guild/ledger.jsonl}`. `guild-ledger append` writes one validated event from stdin and skips an id already present. `guild-ledger backfill` joins Conclave's posted review findings to GitHub over REST. `guild-ledger-refresh.timer` runs both backfills daily on BLD and pings on a failure. No wrapper is installed: run it from the Guild checkout. Schema, proxy and limits: [`docs/outcome-ledger.md`](docs/outcome-ledger.md).
 
+## Poteto watch
+
+[`bin/poteto-watch`](bin/poteto-watch) is the deterministic BLD boundary for the Grok Bot automation that reads `@poteto` posts on X and opens small, tested draft PRs in public Guild repositories (`guild` plus [`roster`](roster)). It enforces the personal-repo allowlist, kill switch (`~/.config/guild/poteto-watch.off`), `grokbot-pace-check`, idempotent post deduplication, daily/open PR caps, diff/secret/work-owner guards, `true-check` reporting, and `guild-ledger` logging. Standing instructions and rollout phases: [`docs/poteto-watch.md`](docs/poteto-watch.md).
+
 ## Changing a crest
 
 `index.html` holds the source. Its hidden SVG sprite defines each glyph as a `<symbol>`.
