@@ -42,7 +42,6 @@ def prefs(td: Path, **overrides):
         "wes_logins": ["work-wes", "wes-bot"],
         "org_members": ["cole", "dana", "paul", "casey"],
         "classified_repos": ["app", "work-org/app", "api", "work-org/api"],
-        "ryan_teams": ["eng-team"],
     }
     data.update(overrides)
     return data
@@ -64,7 +63,7 @@ def pr4004(**overrides):
         "confidence": "full",
         "is_draft": False,
         "colleague_request": True,
-        "requester": {"login": "cole", "type": "User", "requested_reviewer": "rymiwe"},
+        "requester": {"login": "cole", "type": "User"},
         "seating_ok": True,
     }
     data.update(overrides)
@@ -216,8 +215,26 @@ class GateFixtures(unittest.TestCase):
         self.assertIn("unknown requester", d["reason"])
 
     def test_g1_org_member_starts(self):
-        d = self.decide(pr4004(requester={"login": "dana", "type": "User", "requested_reviewer": "rymiwe"}))
+        d = self.decide(pr4004(requester={"login": "dana", "type": "User"}))
         self.assertEqual(d["action"], "start", d)
+
+    def test_g1_hook_row_does_not_check_who_was_requested(self):
+        # The review-requested search upstream decides that Ryan was asked; G1 checks only the author.
+        pulls = {
+            "repos/work-org/app/pulls/4010": {"user": {"login": "dana", "type": "User"},
+                                              "requested_reviewers": [{"login": "paul"}], "head": {"sha": "a" * 40}},
+            "repos/work-org/app/pulls/4011": {"user": {"login": "dependabot[bot]", "type": "Bot"},
+                                              "requested_reviewers": [{"login": "rymiwe"}], "head": {"sha": "b" * 40}},
+        }
+        orig = self.m._gh_json
+        self.m._gh_json = lambda path, timeout=60: pulls.get(path)
+        try:
+            human = self.m.build_hook_row("work-org/app#4010", "UPDATED")
+            bot = self.m.build_hook_row("work-org/app#4011")
+        finally:
+            self.m._gh_json = orig
+        self.assertTrue(self.m.colleague_status(human["requester"], self.p)["ok"])
+        self.assertEqual(self.m.colleague_status(bot["requester"], self.p)["reason"], "requester is a bot")
 
     def test_no_classified_repos_in_prefs_asks(self):
         p = dict(self.p)
