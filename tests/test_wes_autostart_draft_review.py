@@ -105,6 +105,18 @@ class GateFixtures(unittest.TestCase):
         self.assertEqual(out["status"], "ask")
         self.assertFalse((self.td / "drafts").exists() and any((self.td / "drafts").iterdir()))
 
+    def test_empty_env_ignores_process_env(self):
+        p = prefs(self.td, enabled=False)
+        old = os.environ.get("WES_AUTO_START_DRAFT")
+        os.environ["WES_AUTO_START_DRAFT"] = "1"
+        try:
+            self.assertFalse(self.m.is_enabled(p, env={}))
+        finally:
+            if old is None:
+                os.environ.pop("WES_AUTO_START_DRAFT")
+            else:
+                os.environ["WES_AUTO_START_DRAFT"] = old
+
     def test_4004_would_auto_start(self):
         d = self.decide(pr4004())
         self.assertEqual(d["action"], "start", d)
