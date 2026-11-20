@@ -91,6 +91,24 @@ class Letters(Base):
             rc, out, _ = self.run_eval(subject(diff={"files": [{"path": path, "added": 1, "deleted": 0}]}))
             self.assertIn("U", out["failed"], path)
 
+    def test_unlisted_files_hold_r_and_u(self):
+        for path in ("composer.lock", "Pipfile.lock", "npm-shrinkwrap.json", "setup.py", "Jenkinsfile",
+                     ".husky/pre-commit", ".pre-commit-config.yaml", "CODEOWNERS", ".claude/settings.json"):
+            rc, out, _ = self.run_eval(subject(diff={"files": [{"path": path, "added": 1, "deleted": 0}],
+                                                     "patch": "p"}))
+            self.assertEqual(rc, 11, path)
+            self.assertIn("R" if path == "setup.py" else "U", out["failed"], path)
+
+    def test_rename_checks_the_old_path(self):
+        f = {"path": "bin/pr-check", "old_path": "bin/pr-gate", "added": 0, "deleted": 0}
+        rc, out, _ = self.run_eval(subject(diff={"files": [f], "patch": "p"}))
+        self.assertIn("U", out["failed"])
+
+    def test_ordinary_source_and_docs_pass(self):
+        files = [{"path": p, "added": 1, "deleted": 0} for p in ("lib/x.py", "docs/how.md", "bin/tool")]
+        rc, out, _ = self.run_eval(subject(diff={"files": files, "patch": "p"}))
+        self.assertEqual((rc, out["status"]), (0, "pass"))
+
     def test_missing_evidence_holds(self):
         rc, out, _ = self.run_eval(subject(diff={}))
         self.assertEqual((rc, out["failed"], out["unknown"]), (11, ["T", "R", "U"], ["E", "P"]))

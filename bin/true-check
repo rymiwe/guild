@@ -23,9 +23,12 @@ The ledger is $GUILD_GATE_LEDGER or ~/.config/guild/gate-ledger.json.
 
 Letters:
   T trivial      rule: at most MAX_FILES files and MAX_LINES lines outside tests.
-  R reversible   rule: one git revert undoes it: no migration, schema, lockfile
-                 or dependency change, and no force-push.
-  U unrisky      rule: no auth, permission, secret, CI or gate path. On a PR
+  R reversible   rule: one git revert undoes it: every path (a rename's
+                 old_path too) is a test or on the ORDINARY allowlist, none
+                 is a migration, schema, lockfile or dependency, and no
+                 force-push.
+  U unrisky      rule: every path is a test or ORDINARY, and none is an auth,
+                 permission, secret, CI or gate path. On a PR
                  (action merge, post or reply, or any subject with "pr"),
                  risk-tier v2 too: exactly the risk:low tier label, bound to
                  the exact head SHA, and not a draft. Missing, stale or draft
@@ -44,7 +47,8 @@ gets one more call; unknown again is a hold.
 SUBJECT.json:
   {"action": "local-build",
    "goal": "one sentence: what gets better",
-   "diff": {"files": [{"path": "bin/x", "added": 3, "deleted": 1}],
+   "diff": {"files": [{"path": "bin/x", "added": 3, "deleted": 1,
+                       "old_path": "only on a rename"}],
             "patch": "the whole diff, at most PATCH_MAX characters"},
    "force_push": false,
    "pr": {"head": "<40 hex>", "is_draft": false, "labels": ["risk:low"],
@@ -74,7 +78,13 @@ EXIT = {"pass": 0, "hold": 11}
 
 PATCH_MAX = 6000
 TEST_PATH = re.compile(r"(^|/)(spec|test|tests|__tests__)/|_spec\.rb$|_test\.(rb|py)$|(^|/)test_[^/]*\.py$|\.(test|spec)\.(js|ts|jsx|tsx)$")
+# R and U pass only files on this allowlist. A file nobody listed holds, so a
+# lockfile, CI config or hook the blocklists below never named cannot pass.
+SOURCE_EXT = ("py", "rb", "erb", "js", "jsx", "ts", "tsx", "go", "rs", "sh", "css", "scss", "html", "md")
+ORDINARY = re.compile(r"(^|/)docs/[^/]+\.md$|^bin/[a-z0-9][a-z0-9_-]*$|"
+                      r"(^|/)[a-z0-9][A-Za-z0-9_.-]*\.(" + "|".join(SOURCE_EXT) + r")$")
 ONE_WAY = [
+    ("setup script", re.compile(r"(^|/)setup\.py$")),
     ("migration/schema", re.compile(r"(^|/)db/(migrate|schema\.rb|structure\.sql)|(^|/)migrations?/|(^|/)schema\.(rb|sql)$|structure\.sql$")),
     ("lockfile/dependency", re.compile(r"(^|/)(gemfile(\.lock)?|[^/]*\.gemspec|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|"
                                        r"requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|uv\.lock|go\.(mod|sum)|cargo\.(toml|lock))$|(^|/)vendor/", re.I)),
@@ -110,9 +120,10 @@ def diff_files(subject: dict) -> list[dict] | None:
         if (not isinstance(f, dict) or not isinstance(f.get("path"), str) or not f["path"]
                 or not all(type(f.get(k)) is int and f[k] >= 0 for k in ("added", "deleted"))):
             return None
-        parts = f["path"].split("/")
-        if f["path"].startswith("/") or "\\" in f["path"] or any(x in ("", ".", "..") for x in parts):
-            return None
+        for p in (f["path"], f.get("old_path", "x")):
+            if (not isinstance(p, str) or p.startswith("/") or "\\" in p
+                    or any(x in ("", ".", "..") for x in p.split("/"))):
+                return None
     return files
 
 
@@ -129,11 +140,18 @@ def check_t(subject: dict) -> dict:
     return letter("pass", f"{len(code)} files and {lines} lines outside tests (limits {MAX_FILES}, {MAX_LINES})")
 
 
+def paths(files: list[dict]) -> list[str]:
+    """Every path a file touches: a rename counts its old path too."""
+    return [p for f in files for p in (f["path"], f.get("old_path")) if p]
+
+
 def first_match(files: list[dict], rules) -> str | None:
-    for f in files:
+    for path in paths(files):
+        if not (TEST_PATH.search(path) or ORDINARY.search(path)):
+            return f"unlisted file type: {path}"
         for name, rx in rules:
-            if rx.search(f["path"]):
-                return f"{name}: {f['path']}"
+            if rx.search(path):
+                return f"{name}: {path}"
     return None
 
 
@@ -145,7 +163,7 @@ def check_r(subject: dict) -> dict:
         return letter("fail", "force_push must be false (a history rewrite is one-way)")
     hit = first_match(files, ONE_WAY)
     if hit:
-        return letter("fail", f"one-way path {hit}")
+        return letter("fail", f"not shown reversible: {hit}")
     return letter("pass", "no migration, schema, lockfile or dependency path; no force-push")
 
 
@@ -181,7 +199,7 @@ def check_u(subject: dict) -> dict:
         return letter("fail", "missing-evidence: diff.files")
     hit = first_match(files, RISKY)
     if hit:
-        return letter("fail", f"risky path {hit}")
+        return letter("fail", f"not shown unrisky: {hit}")
     if subject.get("action") in PR_ACTIONS or "pr" in subject:
         why = check_risk(subject.get("pr"))
         if why:
