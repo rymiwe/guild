@@ -174,7 +174,8 @@ class Actions(Base):
     def setUp(self):
         super().setUp()
         cfg = self.tmp / "work-account.json"
-        cfg.write_text(json.dumps({"work_path_prefixes": [str(self.tmp / "work")], "work_github_owners": ["AcmeCorp"]}))
+        cfg.write_text(json.dumps({"work_path_prefixes": [str(self.tmp / "work")], "work_github_owners": ["AcmeCorp"],
+                                   "personal_github_owners": ["you"]}))
         self.ledger = self.tmp / "ledger.json"
         self.env.update(WORK_ACCOUNT_CONFIG=str(cfg), GUILD_GATE_LEDGER=str(self.ledger))
         self.rows([])
@@ -207,6 +208,11 @@ class Actions(Base):
         rc, out = self.act(action="merge", repo="acmecorp/widgets", pr=pr())
         self.assertEqual((rc, out["status"], out["allowed"]), (11, "pass", False))
         self.assertIn("work repo", out["allow_reason"])
+
+    def test_unlisted_owner_is_not_personal(self):
+        rc, out = self.act(action="merge", repo="stranger/tool", path=str(self.tmp / "personal"), pr=pr())
+        self.assertEqual((rc, out["status"], out["allowed"]), (11, "pass", False))
+        self.assertIn("personal owner", out["allow_reason"])
 
     def test_work_path_counts_as_work(self):
         rc, out = self.act(action="merge", repo="you/tool", path=str(self.tmp / "work" / "tool"), pr=pr())
@@ -318,10 +324,33 @@ class Verify(Base):
         v = lambda: subprocess.run(["python3", str(BIN), "verify", str(res), str(sp)],
                                    text=True, capture_output=True, env=self.env).returncode
         self.assertEqual(v(), 0)
-        calls = self.calls()
         sp.write_text(json.dumps(subject(goal="something else")))
         self.assertEqual(v(), 11)
-        self.assertEqual(self.calls(), calls, "verify never calls Jev")
+
+    def test_verify_judges_e_and_p_again(self):
+        res = self.tmp / "result.json"
+        rc, _, _ = self.run_eval(subject(), ["--out", str(res)])
+        self.assertEqual(rc, 0)
+        calls = self.calls()
+        self.answers([jev(e="fail")])
+        cp = subprocess.run(["python3", str(BIN), "verify", str(res), str(self.tmp / "subject.json")],
+                            text=True, capture_output=True, env=self.env)
+        self.assertEqual((cp.returncode, cp.stdout.strip()), (11, "VERIFY HOLD"))
+        self.assertGreater(self.calls(), calls, "verify asks Jev again")
+
+    def test_forged_ep_with_passing_rules_holds(self):
+        subj = subject()
+        sp = self.tmp / "subject.json"
+        sp.write_text(json.dumps(subj))
+        _, real, _ = self.run_eval(subj)
+        forged = {"status": "pass", "subject_sha256": real["subject_sha256"],
+                  "letters": {k: {"verdict": "pass", "evidence": "fixture"} for k in "TRUEP"}}
+        path = self.tmp / "forged.json"
+        path.write_text(json.dumps(forged))
+        self.answers([jev(p="fail")])
+        cp = subprocess.run(["python3", str(BIN), "verify", str(path), str(sp)],
+                            text=True, capture_output=True, env=self.env)
+        self.assertEqual((cp.returncode, cp.stdout.strip()), (11, "VERIFY HOLD"))
 
     def test_verify_rechecks_rule_letters(self):
         subj = subject(force_push=True)
