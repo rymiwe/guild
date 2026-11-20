@@ -19,7 +19,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 
 ## Step 1 checks and pins
 
-- **Pins**: `tests/member-pins.json` holds the member commits. CI and `guild-update` read that file; git history records each bump and why.
+- **Pins**: `tests/member-pins.json` holds the member commits. CI and `guild-update` read that file; git history records each bump and why. `bin/guild-pin` prints which pins would move to their member's trunk head and the commits each carries. `bin/guild-pin --apply` opens the bump PR, waits for Guild CI, and merges it. A member head with a failed or pending check keeps its old pin.
 - **Command**: `python3 tests/test_pr_gate_contract.py -v`
 - **Result**: `Ran 7 tests in 5.500s, OK` (installed wrappers, clear gate `pr-gate PASS`, blocker URL `FAIL: unanswered_threads: unanswered: https://github.com/AcmeCorp/widgets/pull/7#discussion_r456`, real `pr-lint` failure, missing `threads-check` error, missing `pr-lint` error, and unchanged host install paths; also verified against shallow detached-HEAD CI-style source clones with `GUILD_MEMBER_SOURCES_DIR`).
 - **CI workflow**: `.github/workflows/ci.yml` checks out the exact SHAs from `tests/member-pins.json` using `secrets.GUILD_READ_TOKEN` (failing closed if unset) and runs `python3 tests/test_pr_gate_contract.py -v`.
