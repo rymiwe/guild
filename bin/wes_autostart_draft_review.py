@@ -49,7 +49,7 @@ def today_pt(now: datetime | None = None) -> str:
 
 def is_enabled(prefs: dict | None = None, *, env: dict | None = None) -> bool:
     prefs = prefs or {}
-    env = env or os.environ
+    env = env if env is not None else os.environ
     raw = env.get(ENABLED_ENV)
     if raw is not None and str(raw).strip() != "":
         return str(raw).strip() not in ("0", "false", "False", "off", "no")

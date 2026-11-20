@@ -280,6 +280,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 now = int(os.environ.get("WRRC_NOW") or time.time()); t = datetime.fromtimestamp(now, PT)
+stamp = t.isoformat(timespec="seconds")
 if not (t.weekday() < 5 and 7 <= t.hour < 19): sys.exit(0)
 pinged = set()
 try: rows = open(os.environ.get("WRRC_RUNS_LOG") or "/home/box/agent-data/fleet/routine-runs.log").read().splitlines()
@@ -294,7 +295,7 @@ out = []
 for l in sys.stdin.read().splitlines():
     k, kind = l.split("\t")
     if k in pinged: continue
-    print(f"poller-missed {k} {kind}", file=sys.stderr); out.append(f"{t.isoformat(timespec="seconds")}\tpoller-missed\t{k}\t{kind}\n")
+    print(f"poller-missed {k} {kind}", file=sys.stderr); out.append(f"{stamp}\tpoller-missed\t{k}\t{kind}\n")
 if out and os.environ["WRRC_DRY"] != "1":
     open(os.environ["WRRC_MISSED"], "a").write("".join(out))
 ' || true
