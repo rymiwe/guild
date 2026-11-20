@@ -2,6 +2,8 @@
 """Tests for work-review-requests-check.sh (PR-update re-review, Paul verdict 2026-11-09 U1/U2).
 Usage: run_tests.py [SCRIPT]   (default: ../work-review-requests-check.sh). Fake gh only; no network.
 Prints PASS/FAIL per case and a summary line; exit 1 when any case fails."""
+import atexit
+import shutil
 import hashlib, json, os, subprocess, sys, tempfile, time, pathlib
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else HERE.parent.parent / "bin" / "work-review-requests-check.sh").resolve()
@@ -43,7 +45,7 @@ def mirror_text(lines, ts=NOW):
 
 class Env:
     def __init__(self):
-        self.d = pathlib.Path(tempfile.mkdtemp(prefix="wrrc-"))
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="wrrc-")); atexit.register(shutil.rmtree, str(self.d), True)
         (self.d / "bin").mkdir(); os.symlink(HERE / "fake-gh", self.d / "bin" / "gh")
         os.symlink(HERE / "fake-guild-config", self.d / "bin" / "guild-config")
         self.org = {"review_requests": {"repos": [SK, QU], "update_repos": [SM]}}
@@ -310,7 +312,7 @@ def t_ledger_copy_fail_keeps_legacy():
     fixture["api"][f"repos/{SK}/pulls/701"] = pull(701, A); fixture["api"][f"repos/{SK}/pulls/701/reviews"] = []
     rc, out, _ = e.run(fixture); assert rc == 4 and out.startswith(f"{SK}#701\t") and lines(out, "MIRROR_FAIL"), f"rc={rc} out={out!r}"
 def mirror_tool(src_text, now=NOW):
-    d = pathlib.Path(tempfile.mkdtemp(prefix="wsm-")); src = d / "extract.txt"; src.write_text(src_text)
+    d = pathlib.Path(tempfile.mkdtemp(prefix="wsm-")); atexit.register(shutil.rmtree, str(d), True); src = d / "extract.txt"; src.write_text(src_text)
     out = d / "state" / "wes-starts.mirror.log"
     p = subprocess.run([str(MIRROR_TOOL), "--from", str(src), "--out", str(out)], capture_output=True, text=True,
                        env=dict(os.environ, WRRC_NOW=str(now)), timeout=30)
