@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -287,6 +288,119 @@ class LedgerTest(unittest.TestCase):
     def test_missing_council_dir_fails_closed(self) -> None:
         p = self.run_tool("backfill", "--council-dir", str(self.tmp / "nope"))
         self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+
+
+    # --- backfill-prs ----------------------------------------------------
+
+    def pulls_page(self, page):
+        return (f"repos/{REPO}/pulls?state=closed&sort=updated&direction=desc"
+                f"&per_page=100&page={page}")
+
+    def pr_fixture(self, old_last_on_page_one=False):
+        """101 merged PRs over two list pages, one revert, one closed unmerged, one old PR.
+
+        With old_last_on_page_one the first page ends on a PR last updated before the
+        window, so the list must stop there without asking for page 2."""
+        now = datetime.now(timezone.utc)
+        iso = lambda hours_ago: (now - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        author = {"login": "alex-acme", "type": "User"}
+
+        def pr(n, opened, ended, merged=True, title="Add a widget", body=""):
+            return {"number": n, "user": author, "head": {"sha": f"{n:040x}"}, "title": title,
+                    "body": body, "created_at": iso(opened), "closed_at": iso(ended),
+                    "merged_at": iso(ended) if merged else None, "updated_at": iso(ended - 0.01)}
+        # Newest-updated first, as GitHub sorts it. PR n merged n hours ago after n/100 hours open.
+        merged = [pr(n, n + n / 100, n) for n in range(1, 102)]
+        merged[4] = pr(5, 6, 5, title='Revert "Add a widget"', body="Reverts AcmeCorp/widgets#3")
+        merged[5] = pr(6, 7, 6, title="Revert the gadget", body="It broke the build.")
+        unmerged = pr(102, 200, 150, merged=False)
+        old = pr(103, 2000, 1000)
+        routes = {}
+        if old_last_on_page_one:
+            routes[self.pulls_page(1)] = merged[:99] + [old]
+            listed = merged[:99]
+        else:
+            routes[self.pulls_page(1)] = merged[:100]
+            routes[self.pulls_page(2)] = [merged[100], unmerged, old]
+            listed = merged + [unmerged]
+        for item in listed:
+            routes[f"repos/{REPO}/pulls/{item['number']}/reviews?per_page=100"] = []
+        routes[f"repos/{REPO}/pulls/7/reviews?per_page=100"] = [
+            {"user": {"login": "pat-acme", "type": "User"}, "state": "CHANGES_REQUESTED"},
+            {"user": {"login": "pat-acme", "type": "User"}, "state": "APPROVED"},
+            {"user": {"login": "sam-acme", "type": "User"}, "state": "COMMENTED"},
+            {"user": {"login": "sam-acme", "type": "User"}, "state": "PENDING"},
+            {"user": author, "state": "COMMENTED"},
+            {"user": {"login": "lint-bot", "type": "Bot"}, "state": "COMMENTED"},
+            {"user": {"login": "scanner[bot]", "type": "User"}, "state": "COMMENTED"},
+        ]
+        self.routes_file.write_text(json.dumps(routes), encoding="utf-8")
+
+    def pr_outcomes(self):
+        return {e["subject"]["pr"]: e for e in self.lines()}
+
+    def test_backfill_prs_records_each_closed_pr(self) -> None:
+        self.pr_fixture()
+        p = self.run_tool("backfill-prs", "--repo", REPO, "--days", "30")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        out = self.pr_outcomes()
+        self.assertEqual(sorted(out), list(range(1, 103)))  # past page 1; PR 103 closed too early
+        e = out[7]
+        self.assertEqual((e["kind"], e["source"], e["subject"]["sha"], e["subject"]["finding"]),
+                         ("outcome", "github", f"{7:040x}", None))
+        self.assertEqual(e["at"], e["data"]["merged_at"])
+        self.assertEqual((e["data"]["proxy"], e["data"]["state"], e["data"]["author"]),
+                         ("pr-lifecycle", "merged", "alex-acme"))
+        # pat twice and sam once; the author, both bots and the pending review do not count.
+        self.assertEqual((e["data"]["reviewers"], e["data"]["reviews"]), (2, 3))
+        self.assertAlmostEqual(e["data"]["hours_open"], 0.07, places=2)
+        self.assertEqual((out[5]["data"]["is_revert"], out[5]["data"]["reverts_pr"]), (True, 3))
+        self.assertEqual((out[6]["data"]["is_revert"], out[6]["data"]["reverts_pr"]), (True, None))
+        self.assertEqual((out[8]["data"]["is_revert"], out[8]["data"]["reverts_pr"]), (False, None))
+        closed = out[102]
+        self.assertEqual((closed["data"]["state"], closed["at"]), ("closed", closed["data"]["closed_at"]))
+        self.assertNotIn("merged_at", closed["data"])
+        self.assertAlmostEqual(closed["data"]["hours_open"], 50, places=2)
+        # Hours open are n/100 for PR n, except the two reverts at 1 h. Of 101: median rank 51,
+        # nearest-rank p90 rank 91.
+        self.assertIn(f"{REPO}: merged 101  closed unmerged 1  median 0.53 h  p90 0.93 h"
+                      "  reverts 2 [3]  authors 1  reviewed by others 1", p.stdout)
+        self.assertIn("events appended 102  already in ledger 0", p.stdout)
+        self.assertNotIn("graphql", self.log.read_text(encoding="utf-8"))
+
+    def test_backfill_prs_rerun_adds_nothing(self) -> None:
+        self.pr_fixture()
+        self.assertEqual(self.run_tool("backfill-prs", "--repo", REPO).returncode, 0)
+        before = self.ledger.read_text(encoding="utf-8")
+        p = self.run_tool("backfill-prs", "--repo", REPO)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("events appended 0  already in ledger 102", p.stdout)
+        self.assertEqual(self.ledger.read_text(encoding="utf-8"), before)
+
+    def test_backfill_prs_stops_paging_at_the_window(self) -> None:
+        self.pr_fixture(old_last_on_page_one=True)  # no page 2 route: asking for it fails
+        p = self.run_tool("backfill-prs", "--repo", REPO)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(sorted(self.pr_outcomes()), list(range(1, 100)))
+        self.assertNotIn("page=2", self.log.read_text(encoding="utf-8"))
+
+    def test_backfill_prs_github_error_fails_closed(self) -> None:
+        self.pr_fixture()
+        routes = json.loads(self.routes_file.read_text(encoding="utf-8"))
+        del routes[f"repos/{REPO}/pulls/101/reviews?per_page=100"]  # the fake answers HTTP 500
+        self.routes_file.write_text(json.dumps(routes), encoding="utf-8")
+        p = self.run_tool("backfill-prs", "--repo", REPO)
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn("HTTP 500", p.stderr)
+        self.assertEqual(self.lines(), [])
+
+    def test_backfill_prs_bad_arguments(self) -> None:
+        for args in ([], ["--repo", "nope"], ["--repo", REPO, "--days", "0"],
+                     ["--repo", REPO, "--days", "x"]):
+            with self.subTest(args=args):
+                p = self.run_tool("backfill-prs", *args)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertFalse(self.log.exists())
 
 
 if __name__ == "__main__":

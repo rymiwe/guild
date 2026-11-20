@@ -3,6 +3,7 @@
 
 usage: guild-ledger append                      < one event as JSON on stdin
        guild-ledger backfill [--council-dir DIR]
+       guild-ledger backfill-prs --repo OWNER/NAME [--repo ...] [--days N]
 
 Ledger: $GUILD_LEDGER (default ~/.local/state/guild/ledger.jsonl), append-only
 JSONL. The schema and the backfill's proxy are in docs/outcome-ledger.md.
@@ -12,6 +13,10 @@ append   validates one event, computes its id, and appends it unless that id is
 backfill reads Conclave's posted.json and findings.json runs and appends a
          decision per posted review and finding, and an outcome per finding
          from GitHub (REST only). A rerun on unchanged state appends nothing.
+backfill-prs
+         appends an outcome per PR merged or closed in the last N days (default
+         30) on each repo, from GitHub (REST only), and prints per-repo cycle
+         time and reverts. A rerun on unchanged state appends nothing.
 
 Exit: 0 done; 2 malformed event or bad arguments, nothing written; 3 the ledger,
 an input file or GitHub could not be read.
@@ -24,10 +29,12 @@ import hashlib
 import json
 import os
 import re
+import math
+import statistics
 import subprocess
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -38,6 +45,9 @@ SUBJECT_FIELDS = {"repo", "pr", "sha", "finding"}
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 PROXY = "cited-code-at-head"
+PR_PROXY = "pr-lifecycle"
+PAGE = 100
+REVERTS_RE = re.compile(r"\bReverts\s+\[?(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(\d+)")
 EXIT_OK, EXIT_BAD_EVENT, EXIT_UNREADABLE = 0, 2, 3
 
 
@@ -303,7 +313,97 @@ def backfill(council: Path) -> int:
     return EXIT_OK
 
 
+# --- backfill-prs ----------------------------------------------------------
+
+def parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def is_bot(user) -> bool:
+    return not user or user.get("type") == "Bot" or user.get("login", "").endswith("[bot]")
+
+
+def closed_prs(gh: GitHub, repo: str, since: datetime) -> list[dict]:
+    """PRs closed at or after since. Pages newest-updated first and stops once a page
+    reaches PRs last updated before since: a PR's close is never after its last update."""
+    found, page = [], 1
+    while True:
+        batch = gh.json(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc"
+                        f"&per_page={PAGE}&page={page}")
+        found += [pr for pr in batch if pr.get("closed_at") and parse_time(pr["closed_at"]) >= since]
+        if len(batch) < PAGE or parse_time(batch[-1]["updated_at"]) < since:
+            return sorted(found, key=lambda pr: pr["number"])
+        page += 1
+
+
+def lifecycle(gh: GitHub, repo: str, pr: dict) -> dict:
+    author = pr["user"]["login"]
+    reviews = gh.json(f"repos/{repo}/pulls/{pr['number']}/reviews?per_page={PAGE}", paginate=True)
+    counted = [r for r in reviews if r.get("state") != "PENDING" and not is_bot(r.get("user"))
+               and r["user"]["login"] != author]
+    merged_at = pr.get("merged_at")
+    ended = merged_at or pr["closed_at"]
+    title = pr.get("title") or ""
+    is_revert = title.startswith("Revert")
+    named = REVERTS_RE.search(pr.get("body") or "") if is_revert else None
+    hours = (parse_time(ended) - parse_time(pr["created_at"])).total_seconds() / 3600
+    return {"v": VERSION, "kind": "outcome", "source": "github",
+            "subject": {"repo": repo, "pr": pr["number"], "sha": pr["head"]["sha"], "finding": None},
+            "at": ended,
+            "data": {"proxy": PR_PROXY, "state": "merged" if merged_at else "closed",
+                     "author": author, "created_at": pr["created_at"],
+                     ("merged_at" if merged_at else "closed_at"): ended,
+                     "hours_open": round(hours, 4),
+                     "reviewers": len({r["user"]["login"] for r in counted}),
+                     "reviews": len(counted), "is_revert": is_revert,
+                     "reverts_pr": int(named.group(1)) if named else None}}
+
+
+def quantile(values: list[float], q: float) -> float:
+    """Nearest rank: the smallest value with at least q of the values at or below it."""
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+
+def backfill_prs(repos: list[str], days: int) -> int:
+    gh = GitHub()
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    per_repo = {repo: [lifecycle(gh, repo, pr) for pr in closed_prs(gh, repo, since)] for repo in repos}
+    try:
+        valid = [validate(e) for events in per_repo.values() for e in events]
+    except BadEvent as exc:
+        raise Unreadable(f"GitHub response makes a malformed event: {exc}")
+    added = append_events(valid)
+
+    print(f"window {since.isoformat(timespec='seconds')} to now ({days} days)")
+    for repo, events in per_repo.items():
+        data = [e["data"] for e in events]
+        merged = [d for d in data if d["state"] == "merged"]
+        hours = [d["hours_open"] for d in merged]
+        cycle = (f"median {statistics.median(hours):.2f} h  p90 {quantile(hours, 0.9):.2f} h"
+                 if hours else "median - h  p90 - h")
+        reverts = [d for d in merged if d["is_revert"]]
+        named = sorted(d["reverts_pr"] for d in reverts if d["reverts_pr"])
+        print(f"{repo}: merged {len(merged)}  closed unmerged {len(data) - len(merged)}  {cycle}"
+              f"  reverts {len(reverts)} {named}  authors {len({d['author'] for d in data})}"
+              f"  reviewed by others {sum(1 for d in merged if d['reviewers'])}")
+    print(f"events appended {sum(added)}  already in ledger {len(added) - sum(added)}  REST calls {gh.calls}")
+    return EXIT_OK
+
+
 # --- entry ---------------------------------------------------------------
+
+def repo_arg(value: str) -> str:
+    if not REPO_RE.match(value):
+        raise argparse.ArgumentTypeError("must be OWNER/NAME")
+    return value
+
+
+def days_arg(value: str) -> int:
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return int(value)
+
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="guild-ledger", description=__doc__.split("\n")[0])
@@ -311,6 +411,9 @@ def main(argv: list[str]) -> int:
     sub.add_parser("append", help="append one event read from stdin")
     bf = sub.add_parser("backfill", help="join posted council findings to GitHub")
     bf.add_argument("--council-dir", default=os.path.expanduser("~/code/conclave/tmp/council"))
+    bp = sub.add_parser("backfill-prs", help="record each merged or closed PR's lifecycle from GitHub")
+    bp.add_argument("--repo", action="append", required=True, type=repo_arg, metavar="OWNER/NAME")
+    bp.add_argument("--days", type=days_arg, default=30)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -325,6 +428,8 @@ def main(argv: list[str]) -> int:
             print(f"{'appended' if new else 'exists'} {event['id']}")
             return EXIT_OK
         try:
+            if args.cmd == "backfill-prs":
+                return backfill_prs(list(dict.fromkeys(args.repo)), args.days)
             return backfill(Path(args.council_dir))
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise Unreadable(f"unexpected shape in a council run or GitHub response: {exc!r}")
