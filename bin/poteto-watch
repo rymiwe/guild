@@ -384,29 +384,32 @@ def read_cursor() -> dict | None:
 
 
 def advance_cursor(post_id: str, published_at: str | None = None, *, force: bool = False) -> dict:
-    """Monotonically advance cursor.json via atomic temp-file rename."""
-    cur = read_cursor()
-    if cur and not force and int(post_id) <= int(cur["last_post_id"]):
-        return cur
-    payload = {
-        "v": 1,
-        "last_post_id": post_id,
-        "last_published_at": published_at,
-        "updated_at": now_utc().isoformat(timespec="seconds"),
-    }
+    """Monotonically advance cursor.json under flock via atomic temp-file rename."""
     path = cursor_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".cursor.", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-            fh.flush()
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-    return payload
+    lock_path = path.parent / ".cursor.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        cur = read_cursor()
+        if cur and not force and int(post_id) <= int(cur["last_post_id"]):
+            return cur
+        payload = {
+            "v": 1,
+            "last_post_id": post_id,
+            "last_published_at": published_at,
+            "updated_at": now_utc().isoformat(timespec="seconds"),
+        }
+        fd, tmp = tempfile.mkstemp(prefix=".cursor.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        return payload
 
 
 def seen_post(events: list[dict], post_id: str, repo: str | None = None, decision: str | None = None) -> dict | None:
@@ -490,7 +493,7 @@ def existing_pr_for_post(repo: str, post_id: str) -> dict | None:
             "--limit",
             "100",
             "--json",
-            "number,headRefName,url,state,isDraft",
+            "number,headRefName,url,state,isDraft,headRefOid,createdAt",
         ],
         timeout=30,
     )
@@ -762,7 +765,15 @@ def run_true_check(goal: str, patch: str) -> dict:
     }
 
 
-def append_guild_ledger(proposal: dict, pr_number: int, head_sha: str, pr_url: str) -> tuple[bool, str]:
+def append_guild_ledger(
+    proposal: dict,
+    pr_number: int,
+    head_sha: str,
+    pr_url: str,
+    *,
+    branch: str | None = None,
+    created_at: str | None = None,
+) -> tuple[bool, str]:
     cmd = os.environ.get("POTETO_WATCH_GUILD_LEDGER") or str(GUILD_LEDGER_DEFAULT)
     if not Path(cmd).exists() and not shutil.which(cmd):
         return False, f"guild-ledger not found ({cmd})"
@@ -773,16 +784,16 @@ def append_guild_ledger(proposal: dict, pr_number: int, head_sha: str, pr_url: s
         "subject": {
             "repo": proposal["repo"],
             "pr": pr_number,
-            "sha": head_sha,
+            "sha": head_sha.lower(),
             "finding": None,
         },
-        "at": now_utc().isoformat(timespec="seconds"),
+        "at": created_at if is_iso8601(created_at) else now_utc().isoformat(timespec="seconds"),
         "data": {
             "action": "draft_pr_opened",
             "mode": proposal["mode"],
             "post_id": proposal["post_id"],
             "post_url": proposal["post_url"],
-            "branch": proposal["branch"],
+            "branch": branch or proposal["branch"],
             "pr_url": pr_url,
         },
     }
@@ -790,6 +801,43 @@ def append_guild_ledger(proposal: dict, pr_number: int, head_sha: str, pr_url: s
     if cp.returncode != 0:
         return False, (cp.stderr or cp.stdout).strip()
     return True, cp.stdout.strip()
+
+
+def record_opened_pr(
+    proposal: dict,
+    branch: str,
+    pr_number: int,
+    head_sha: str,
+    pr_url: str,
+    created_at: str | None = None,
+) -> tuple[bool, str]:
+    event: dict = {
+        "v": 1,
+        "kind": "draft_pr_opened",
+        "post_id": proposal["post_id"],
+        "post_url": proposal["post_url"],
+        "published_at": proposal["published_at"],
+        "mode": proposal["mode"],
+        "repo": proposal["repo"],
+        "branch": branch,
+        "reason": proposal["reason"],
+        "pr_url": pr_url,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+    }
+    if is_iso8601(created_at):
+        event["pr_created_at"] = created_at
+    append_event(event)
+    if proposal["mode"] == "live":
+        advance_cursor(proposal["post_id"], proposal["published_at"])
+    return append_guild_ledger(
+        proposal,
+        pr_number,
+        head_sha,
+        pr_url,
+        branch=branch,
+        created_at=created_at,
+    )
 
 
 def render_pr_body(proposal: dict, files: list[dict], test_summary: str, tc: dict) -> str:
@@ -1135,6 +1183,17 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
             and ev.get("post_id") == proposal["post_id"]
             and str(ev.get("repo") or "").casefold() == proposal["repo"].casefold()
         ):
+            if not args.dry_run and isinstance(ev.get("pr_number"), int) and ev.get("head_sha") and ev.get("pr_url"):
+                if proposal["mode"] == "live":
+                    advance_cursor(proposal["post_id"], proposal["published_at"])
+                append_guild_ledger(
+                    proposal,
+                    ev["pr_number"],
+                    str(ev["head_sha"]),
+                    str(ev["pr_url"]),
+                    branch=str(ev.get("branch") or proposal["branch"]),
+                    created_at=ev.get("pr_created_at"),
+                )
             print(
                 json.dumps(
                     {
@@ -1150,16 +1209,26 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
             )
             return EXIT_OK
 
-    today = pt_date(now_utc())
-    daily_cap = env_int("POTETO_WATCH_DAILY_CAP", DEFAULT_DAILY_CAP)
-    open_cap = env_int("POTETO_WATCH_OPEN_CAP", DEFAULT_OPEN_CAP)
-    daily_used = opened_today_count(events, today)
-    if daily_used >= daily_cap:
-        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today} PT)")
-
     if not args.offline:
         gh_dup = existing_pr_for_post(proposal["repo"], proposal["post_id"])
         if gh_dup:
+            if not args.dry_run and gh_dup.get("number") and gh_dup.get("url"):
+                dup_num = int(gh_dup["number"])
+                dup_url = str(gh_dup["url"])
+                dup_branch = str(gh_dup.get("headRefName") or proposal["branch"])
+                dup_sha = str(gh_dup.get("headRefOid") or "")
+                dup_created = gh_dup.get("createdAt")
+                if not dup_sha or not is_iso8601(dup_created):
+                    view = run_cmd(
+                        [gh_bin(), "pr", "view", dup_url, "--repo", proposal["repo"], "--json", "headRefOid,createdAt"],
+                        timeout=30,
+                    )
+                    if view.returncode == 0:
+                        extra = json.loads(view.stdout)
+                        dup_sha = dup_sha or str(extra.get("headRefOid") or "")
+                        dup_created = dup_created or extra.get("createdAt")
+                if dup_sha:
+                    record_opened_pr(proposal, dup_branch, dup_num, dup_sha, dup_url, dup_created)
             print(
                 json.dumps(
                     {
@@ -1174,6 +1243,15 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
                 )
             )
             return EXIT_OK
+
+    today = pt_date(now_utc())
+    daily_cap = env_int("POTETO_WATCH_DAILY_CAP", DEFAULT_DAILY_CAP)
+    open_cap = env_int("POTETO_WATCH_OPEN_CAP", DEFAULT_OPEN_CAP)
+    daily_used = opened_today_count(events, today)
+    if daily_used >= daily_cap:
+        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today} PT)")
+
+    if not args.offline:
         open_prs = list_open_poteto_prs(sorted(allowlist.values()))
         if len(open_prs) >= open_cap:
             raise HoldError(f"open poteto/ PR cap reached ({len(open_prs)}/{open_cap})")
@@ -1246,11 +1324,15 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
     if args.offline:
         raise UsageError("--offline can only be combined with --dry-run on open-pr")
 
-    remote_exists = git(worktree, "ls-remote", "--heads", "origin", branch).stdout.strip()
-    if remote_exists:
-        raise HoldError(f"remote branch origin/{branch} already exists (refusing overwrite)")
-
-    git(worktree, "push", "-u", "origin", branch)
+    remote_line = git(worktree, "ls-remote", "--heads", "origin", branch).stdout.strip()
+    if remote_line:
+        remote_head = remote_line.split()[0]
+        if remote_head != head_sha:
+            raise HoldError(
+                f"remote branch origin/{branch} already exists at {remote_head[:12]} != {head_sha[:12]} (refusing overwrite)"
+            )
+    else:
+        git(worktree, "push", "-u", "origin", branch)
 
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
         fh.write(body)
@@ -1284,7 +1366,7 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
     pr_url = cp.stdout.strip().splitlines()[-1].strip()
 
     view = run_cmd(
-        [gh_bin(), "pr", "view", pr_url, "--repo", proposal["repo"], "--json", "number,isDraft,reviewRequests,headRefOid"],
+        [gh_bin(), "pr", "view", pr_url, "--repo", proposal["repo"], "--json", "number,isDraft,reviewRequests,headRefOid,createdAt"],
         timeout=30,
     )
     if view.returncode != 0:
@@ -1296,27 +1378,9 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
         raise ConfigError(f"opened PR {pr_url} unexpectedly has review requests")
     pr_number = int(meta["number"])
     remote_sha = str(meta.get("headRefOid") or head_sha)
+    pr_created_at = meta.get("createdAt")
 
-    append_event(
-        {
-            "v": 1,
-            "kind": "draft_pr_opened",
-            "post_id": proposal["post_id"],
-            "post_url": proposal["post_url"],
-            "published_at": proposal["published_at"],
-            "mode": proposal["mode"],
-            "repo": proposal["repo"],
-            "branch": branch,
-            "reason": proposal["reason"],
-            "pr_url": pr_url,
-            "pr_number": pr_number,
-            "head_sha": remote_sha,
-        }
-    )
-    if proposal["mode"] == "live":
-        advance_cursor(proposal["post_id"], proposal["published_at"])
-
-    ledger_ok, ledger_msg = append_guild_ledger(proposal, pr_number, remote_sha, pr_url)
+    ledger_ok, ledger_msg = record_opened_pr(proposal, branch, pr_number, remote_sha, pr_url, pr_created_at)
     print(
         json.dumps(
             {
