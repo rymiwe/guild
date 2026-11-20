@@ -11,7 +11,9 @@ and stay until Ryan says to delete them.
 
 Org facts stay out of this repo. The check reads its repos from
 `guild-config --org`: `review_requests.repos` and, with `--pr-updates`,
-`review_requests.update_repos`, both JSON lists of `owner/name`. A missing or
+`review_requests.update_repos`, both JSON lists of `owner/name`.
+`--pr-updates` appends `update_repos` to `repos` without removing duplicates,
+so list only the extra repos there. A missing or
 bad key exits 3 before any GitHub call. The autostart gate reads
 `classified_repos` and `org_members` from its prefs file; with no
 `classified_repos` it asks.
