@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""The Guild outcome ledger: what each tool decided, and what happened next.
+
+usage: guild-ledger append                      < one event as JSON on stdin
+       guild-ledger backfill [--council-dir DIR]
+
+Ledger: $GUILD_LEDGER (default ~/.local/state/guild/ledger.jsonl), append-only
+JSONL. The schema and the backfill's proxy are in docs/outcome-ledger.md.
+
+append   validates one event, computes its id, and appends it unless that id is
+         already in the ledger. Prints "appended <id>" or "exists <id>".
+backfill reads Conclave's posted.json and findings.json runs and appends a
+         decision per posted review and finding, and an outcome per finding
+         from GitHub (REST only). A rerun on unchanged state appends nothing.
+
+Exit: 0 done; 2 malformed event or bad arguments, nothing written; 3 the ledger,
+an input file or GitHub could not be read.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+VERSION = 1
+KINDS = {"decision": "action", "outcome": "proxy"}  # kind -> required data key
+FIELDS = {"v", "id", "kind", "source", "subject", "at", "data", "recorded_at"}
+SUBJECT_FIELDS = {"repo", "pr", "sha", "finding"}
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+PROXY = "cited-code-at-head"
+EXIT_OK, EXIT_BAD_EVENT, EXIT_UNREADABLE = 0, 2, 3
+
+
+class BadEvent(Exception):
+    pass
+
+
+class Unreadable(Exception):
+    pass
+
+
+# --- schema ------------------------------------------------------------
+
+def ledger_path() -> Path:
+    return Path(os.environ.get("GUILD_LEDGER") or os.path.expanduser("~/.local/state/guild/ledger.jsonl"))
+
+
+def event_id(event: dict) -> str:
+    body = {k: v for k, v in event.items() if k not in ("id", "recorded_at")}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def is_time(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def validate(event) -> dict:
+    """Return the event with id and recorded_at set, or raise BadEvent."""
+    if not isinstance(event, dict):
+        raise BadEvent("event must be a JSON object")
+    extra = set(event) - FIELDS
+    if extra:
+        raise BadEvent(f"unknown fields: {sorted(extra)}")
+    if event.get("v") != VERSION or isinstance(event.get("v"), bool):
+        raise BadEvent(f"v must be {VERSION}")
+    kind = event.get("kind")
+    if kind not in KINDS:
+        raise BadEvent(f"kind must be one of {sorted(KINDS)}")
+    if not isinstance(event.get("source"), str) or not event["source"].strip():
+        raise BadEvent("source must be a non-empty string")
+    subject = event.get("subject")
+    if not isinstance(subject, dict) or set(subject) - SUBJECT_FIELDS:
+        raise BadEvent(f"subject must be an object with only {sorted(SUBJECT_FIELDS)}")
+    if not isinstance(subject.get("repo"), str) or not REPO_RE.match(subject["repo"]):
+        raise BadEvent("subject.repo must be OWNER/NAME")
+    pr = subject.get("pr")
+    if not isinstance(pr, int) or isinstance(pr, bool) or pr < 1:
+        raise BadEvent("subject.pr must be a positive integer")
+    if not isinstance(subject.get("sha"), str) or not SHA_RE.match(subject["sha"]):
+        raise BadEvent("subject.sha must be a 40-character lowercase hex commit")
+    finding = subject.get("finding")
+    if finding is not None and (not isinstance(finding, str) or not finding.strip()):
+        raise BadEvent("subject.finding must be a non-empty string or null")
+    if "at" not in event or (event["at"] is not None and not is_time(event["at"])):
+        raise BadEvent("at must be an ISO 8601 time or null")
+    data = event.get("data")
+    need = KINDS[kind]
+    if not isinstance(data, dict) or not isinstance(data.get(need), str) or not data[need]:
+        raise BadEvent(f"data must be an object with a {need} string for a {kind}")
+    if "recorded_at" in event and not is_time(event["recorded_at"]):
+        raise BadEvent("recorded_at must be an ISO 8601 time")
+    clean = {k: v for k, v in event.items() if k not in ("id", "recorded_at")}
+    clean["subject"] = {"repo": subject["repo"], "pr": pr, "sha": subject["sha"], "finding": finding}
+    computed = event_id(clean)
+    if "id" in event and event["id"] != computed:
+        raise BadEvent(f"id {event['id']!r} does not match the event's content ({computed})")
+    clean["id"] = computed
+    clean["recorded_at"] = event.get("recorded_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return clean
+
+
+def append_events(events: list[dict]) -> list[bool]:
+    """Append each validated event whose id is new. One lock for the whole batch."""
+    path = ledger_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            seen = set()
+            for n, line in enumerate(fh, 1):
+                if not line.strip():
+                    continue
+                try:
+                    seen.add(json.loads(line)["id"])
+                except (ValueError, KeyError, TypeError):
+                    raise Unreadable(f"{path}:{n}: malformed ledger line")
+            added = []
+            for event in events:
+                new = event["id"] not in seen
+                if new:
+                    fh.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
+                    seen.add(event["id"])
+                added.append(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+            return added
+    except OSError as exc:
+        raise Unreadable(f"{path}: {exc.strerror or exc}")
+
+
+# --- GitHub (REST only) --------------------------------------------------
+
+class GitHub:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        self.calls += 1
+        try:
+            return subprocess.run(["gh", "api", *args], capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Unreadable(f"gh api {args[-1]}: {exc}")
+
+    def json(self, path: str, paginate: bool = False):
+        args = ["--paginate", "--slurp", path] if paginate else [path]
+        out = self._run(args)
+        if out.returncode != 0:
+            raise Unreadable(f"gh api {path}: {out.stderr.strip() or out.returncode}")
+        try:
+            data = json.loads(out.stdout)
+        except ValueError:
+            raise Unreadable(f"gh api {path}: unparseable response")
+        if paginate:
+            return [item for page in data for item in page]
+        return data
+
+    def raw(self, repo: str, file: str, sha: str):
+        """The file's text at sha, or None when GitHub says it is not there."""
+        path = f"repos/{repo}/contents/{quote(file, safe='/')}?ref={sha}"
+        out = self._run(["-H", "Accept: application/vnd.github.raw", path])
+        if out.returncode == 0:
+            return out.stdout
+        if "(HTTP 404)" in out.stderr:
+            return None
+        raise Unreadable(f"gh api {path}: {out.stderr.strip() or out.returncode}")
+
+
+# --- backfill ------------------------------------------------------------
+
+def norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def load_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Unreadable(f"{path}: {exc}")
+
+
+def cited_code(council: Path, finding: dict):
+    path = council / str(finding.get("ballot", "")) / "findings.json"
+    if not finding.get("ballot") or not path.is_file():
+        return None
+    data = load_json(path)
+    items = data if isinstance(data, list) else data.get("findings", []) if isinstance(data, dict) else []
+    for item in items:
+        if isinstance(item, dict) and item.get("id") == finding.get("id"):
+            return item.get("cited_code")
+    return None
+
+
+def cited_result(gh: GitHub, cache: dict, repo: str, file, code, reviewed: str, head: str) -> dict:
+    if not file:
+        return {"result": "untestable", "reason": "no_path"}
+    needle = norm(max(code.splitlines(), key=len)) if isinstance(code, str) and code.strip() else ""
+    if not needle:
+        return {"result": "untestable", "reason": "no_cited_code"}
+
+    def text(sha):
+        if (file, sha) not in cache:
+            cache[(file, sha)] = gh.raw(repo, file, sha)
+        return cache[(file, sha)]
+
+    before = text(reviewed)
+    if before is None or needle not in norm(before):
+        return {"result": "untestable", "reason": "control_failed"}
+    after = text(head)
+    if after is None:
+        return {"result": "file_deleted"}
+    return {"result": "present" if needle in norm(after) else "gone"}
+
+
+def later(a, b) -> bool:
+    parse = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return parse(a) > parse(b)
+
+
+def backfill(council: Path) -> int:
+    gh = GitHub()
+    events, outcomes = [], []
+    if not council.is_dir():
+        raise Unreadable(f"{council}: not a directory")
+    runs = sorted(council.glob("*/posted.json"))
+    for posted_path in runs:
+        posted = load_json(posted_path)
+        repo = posted.get("repo")
+        for num, review in sorted(posted.get("reviews", {}).items(), key=lambda kv: int(kv[0])):
+            pr = gh.json(f"repos/{repo}/pulls/{num}")
+            comments = gh.json(f"repos/{repo}/pulls/{num}/comments?per_page=100", paginate=True)
+            author = pr["user"]["login"]
+            head = pr["head"]["sha"]
+            merged_at = pr.get("merged_at")
+            pr_state = "merged" if merged_at else pr["state"]
+            replies: dict[int, list[str]] = {}
+            for c in comments:
+                if c.get("in_reply_to_id"):
+                    replies.setdefault(c["in_reply_to_id"], []).append(c["user"]["login"])
+            reviewed = review.get("commit_id")
+            posted_at = review.get("posted_at")
+            base = {"repo": repo, "pr": int(num), "sha": reviewed}
+            events.append({"v": VERSION, "kind": "decision", "source": "conclave",
+                           "subject": {**base, "finding": None}, "at": posted_at,
+                           "data": {"action": "review_posted", "state": review.get("state"),
+                                    "review_id": review.get("review_id")}})
+            cache: dict = {}
+            for key, f in sorted(review.get("findings", {}).items()):
+                subject = {**base, "finding": f.get("id") or key}
+                events.append({"v": VERSION, "kind": "decision", "source": "conclave",
+                               "subject": subject, "at": posted_at,
+                               "data": {"action": "finding_posted", "posted_as": f.get("posted_as"),
+                                        "path": f.get("path"), "line": f.get("line"),
+                                        "comment_id": f.get("comment_id"), "severity": f.get("severity")}})
+                who = replies.get(f.get("comment_id"), []) if f.get("comment_id") else []
+                observed = cited_result(gh, cache, repo, f.get("path"),
+                                        cited_code(council, f), reviewed, head)
+                outcome = {"v": VERSION, "kind": "outcome", "source": "github", "subject": subject,
+                           "at": merged_at or pr.get("closed_at"),
+                           "data": {"proxy": PROXY, **observed, "pr_state": pr_state, "head_sha": head,
+                                    "merged_at": merged_at, "replies": len(who),
+                                    "author_replied": author in who,
+                                    "posted_after_merge": bool(merged_at and posted_at
+                                                               and later(posted_at, merged_at))}}
+                events.append(outcome)
+                outcomes.append(outcome["data"])
+    try:
+        valid = [validate(e) for e in events]
+    except BadEvent as exc:
+        raise Unreadable(f"{council}: input makes a malformed event: {exc}")
+    added = append_events(valid)
+
+    results = Counter(o["result"] for o in outcomes)
+    testable = [o for o in outcomes if o["result"] != "untestable"]
+    present = [o for o in outcomes if o["result"] == "present"]
+    replied = sum(1 for o in present if o["author_replied"])
+    untestable = Counter(o.get("reason") for o in outcomes if o["result"] == "untestable")
+    reviews = sum(1 for e in valid if e["data"].get("action") == "review_posted")
+    print(f"posted reviews {reviews}  posted findings {len(outcomes)}  testable {len(testable)}")
+    print(f"cited code at head: gone {results['gone']}  present {results['present']}"
+          f"  file_deleted {results['file_deleted']}"
+          f"  untestable {sum(untestable.values())} {dict(sorted(untestable.items()))}")
+    print(f"still present: author replied {replied}  no author reply {len(present) - replied}")
+    print(f"posted after merge {sum(1 for o in outcomes if o['posted_after_merge'])}")
+    print(f"events appended {sum(added)}  already in ledger {len(added) - sum(added)}  REST calls {gh.calls}")
+    return EXIT_OK
+
+
+# --- entry ---------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="guild-ledger", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("append", help="append one event read from stdin")
+    bf = sub.add_parser("backfill", help="join posted council findings to GitHub")
+    bf.add_argument("--council-dir", default=os.path.expanduser("~/code/conclave/tmp/council"))
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return EXIT_BAD_EVENT if exc.code else EXIT_OK
+    try:
+        if args.cmd == "append":
+            try:
+                event = validate(json.loads(sys.stdin.read()))
+            except ValueError as exc:
+                raise BadEvent(f"not JSON: {exc}")
+            new = append_events([event])[0]
+            print(f"{'appended' if new else 'exists'} {event['id']}")
+            return EXIT_OK
+        try:
+            return backfill(Path(args.council_dir))
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise Unreadable(f"unexpected shape in a council run or GitHub response: {exc!r}")
+    except BadEvent as exc:
+        print(f"guild-ledger: malformed event: {exc}", file=sys.stderr)
+        return EXIT_BAD_EVENT
+    except Unreadable as exc:
+        print(f"guild-ledger: {exc}", file=sys.stderr)
+        return EXIT_UNREADABLE
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
