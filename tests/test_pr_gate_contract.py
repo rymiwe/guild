@@ -306,11 +306,16 @@ class PrGateContractTest(unittest.TestCase):
         (kit_dir / "skills" / "deslop").mkdir(parents=True)
         (kit_dir / "skills" / "deslop" / "SKILL.md").write_text("---\nname: deslop\n---\n", encoding="utf-8")
 
+        installer_home = cls.tmp / "installer-home"
+        installer_home.mkdir()
         install_env = {
             **git_env,
-            "PATH": build_clean_path(cls.prefix / ".local" / "bin"),
+            "PATH": build_clean_path(
+                cls.prefix / ".local" / "share" / "quartermaster" / "bin",
+                cls.prefix / ".local" / "bin",
+            ),
             "PSTACK_HOME": str(pstack_dir),
-            "HOME": str(cls.prefix),
+            "HOME": str(installer_home),
         }
         for tool in ("quartermaster", "bridgekeeper", "bopeep"):
             installer = code_dir / tool / "install.sh"

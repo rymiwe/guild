@@ -371,38 +371,42 @@ def run_member_installers(
     *,
     check_only: bool = False,
 ) -> None:
-    install_env = {
-        **git_env,
-        "HOME": str(release_dir),
-        "PATH": build_clean_path(release_dir / ".local" / "bin"),
-        "PSTACK_HOME": str(resolve_pstack_dir()),
-    }
+    with tempfile.TemporaryDirectory(prefix="guild-installer-home-") as installer_home:
+        install_env = {
+            **git_env,
+            "HOME": installer_home,
+            "PATH": build_clean_path(
+                release_dir / ".local" / "share" / "quartermaster" / "bin",
+                release_dir / ".local" / "bin",
+            ),
+            "PSTACK_HOME": str(resolve_pstack_dir()),
+        }
 
-    for tool in member_install_order(pins):
-        installer = release_dir / "code" / tool / "install.sh"
-        if not installer.is_file():
-            continue
-        if not check_only:
-            cp = subprocess.run(
-                ["bash", str(installer), "--prefix", str(release_dir)],
+        for tool in member_install_order(pins):
+            installer = release_dir / "code" / tool / "install.sh"
+            if not installer.is_file():
+                continue
+            if not check_only:
+                cp = subprocess.run(
+                    ["bash", str(installer), "--prefix", str(release_dir)],
+                    env=install_env,
+                    text=True,
+                    capture_output=True,
+                )
+                if cp.returncode != 0:
+                    raise ReleaseError(
+                        f"{tool}/install.sh failed ({cp.returncode}):\n{cp.stdout}\n{cp.stderr}"
+                    )
+            chk = subprocess.run(
+                ["bash", str(installer), "--prefix", str(release_dir), "--check"],
                 env=install_env,
                 text=True,
                 capture_output=True,
             )
-            if cp.returncode != 0:
+            if chk.returncode != 0:
                 raise ReleaseError(
-                    f"{tool}/install.sh failed ({cp.returncode}):\n{cp.stdout}\n{cp.stderr}"
+                    f"{tool}/install.sh --check failed ({chk.returncode}):\n{chk.stdout}\n{chk.stderr}"
                 )
-        chk = subprocess.run(
-            ["bash", str(installer), "--prefix", str(release_dir), "--check"],
-            env=install_env,
-            text=True,
-            capture_output=True,
-        )
-        if chk.returncode != 0:
-            raise ReleaseError(
-                f"{tool}/install.sh --check failed ({chk.returncode}):\n{chk.stdout}\n{chk.stderr}"
-            )
 
 
 def parse_wrapper(path: Path) -> tuple[str, str]:
