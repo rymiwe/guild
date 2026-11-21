@@ -1,0 +1,9 @@
+[Unit]
+Description=Pin green Guild member trunk heads every 15 minutes
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

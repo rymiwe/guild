@@ -78,9 +78,10 @@ Check the launcher version: `~/.local/share/guild/current/code/quartermaster` mu
 
 ## Normal release
 
-1. Set the member's commit in `tests/member-pins.json` and merge to `main`.
-2. CI checks out every pin and runs the three test files.
-3. Within 15 minutes of CI passing, the Surface's `guild-update.timer` builds and activates `g-<sha12>` and restarts `bopeep-watch`.
+1. Surface's `guild-pin.timer` runs `bin/guild-pin --auto` every 15 minutes to open, CI-wait, and merge a pin bump PR for any member trunk head whose checks passed (manual runs can still use `bin/guild-pin --apply`).
+2. CI checks out every pin and runs the release and contract test suites.
+3. Within 15 minutes of CI passing, Surface's `guild-update.timer` builds and activates `g-<sha12>` and restarts `bopeep-watch`.
+4. On BLD (where `guild-exec` runs directly from `~/code/<tool>`), `guild-host-sync.timer` runs `bin/guild-host-sync` every 15 minutes to fast-forward `guild`, `roster` checkouts, and `pstack`, and `try-restart` `orderly.service` when `orderly` advances.
 
 A new roster tool also needs a pin, a checkout step in `.github/workflows/ci.yml`, and `contents:read` for `GUILD_READ_TOKEN`.
 

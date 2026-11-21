@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Fast-forward local Guild checkouts on a host and restart changed host services.
+
+usage: guild-host-sync
+
+Syncs the Guild checkout, every tool checkout named in `roster`, and `pstack`
+(from `pstack-root`, when present) to each repo's remote default branch when
+clean and on that branch. Restarts `orderly.service` (`try-restart`) when the
+`orderly` checkout advances, and sends one `job-notify --send` ping per failure
+key until the failure clears.
+"""
+from __future__ import annotations
+
+import fcntl
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def sync_repos() -> list[Path]:
+    env = os.environ.get("GUILD_SYNC_REPOS")
+    if env:
+        return [Path(p) for p in env.split(":") if p]
+    roster = ROOT / "roster"
+    lines = roster.read_text(encoding="utf-8").splitlines()
+    names = [ln.split("#", 1)[0].strip() for ln in lines]
+    names = [n for n in names if n]
+    if not names:
+        raise RuntimeError(f"guild-host-sync: no tools listed in {roster}")
+    repos = [ROOT] + [Path(os.environ.get(f"{n.upper()}_HOME", Path.home() / "code" / n)) for n in names]
+    pstack_bin = shutil.which("pstack-root")
+    if pstack_bin:
+        out = subprocess.run([pstack_bin], capture_output=True, text=True)
+        p = out.stdout.strip()
+        if out.returncode == 0 and p:
+            repos.append(Path(p))
+    return repos
+
+
+def state_dir() -> Path:
+    env = os.environ.get("GUILD_HOST_SYNC_STATE_DIR")
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg) / "guild" / "host-sync-state"
+
+
+def notify_once(sdir: Path, key: str, message: str) -> None:
+    pinged = sdir / "pinged"
+    pinged.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", key)
+    marker = pinged / safe
+    if marker.exists():
+        return
+    marker.touch()
+    jn = shutil.which("job-notify")
+    if not jn:
+        print("guild-host-sync: job-notify not on PATH", file=sys.stderr)
+        return
+    clean = "".join(ch for ch in message if ch.isprintable() and ch not in '\\"')
+    done = subprocess.run([jn, "--send", str(sdir.parent), "guild-host-sync", "FAILED", clean],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        print("guild-host-sync: job-notify failed", file=sys.stderr)
+
+
+def clear_other_pings(sdir: Path, active_keys: set[str]) -> None:
+    pinged = sdir / "pinged"
+    if not pinged.is_dir():
+        return
+    safe_active = {re.sub(r"[^A-Za-z0-9._-]", "_", k) for k in active_keys}
+    for p in pinged.iterdir():
+        if p.name not in safe_active:
+            p.unlink(missing_ok=True)
+
+
+def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
+def sync_one(repo: Path) -> tuple[bool, bool, str]:
+    """Return (ok, advanced, message)."""
+    if git(repo, "rev-parse", "--git-dir").returncode != 0:
+        return False, False, f"{repo}: missing; clone it there"
+    fetch = git(repo, "fetch", "-q", "origin")
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout).strip()
+        return False, False, f"{repo}: fetch failed ({detail})"
+    ref = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").stdout.strip()
+    if not ref:
+        git(repo, "remote", "set-head", "origin", "--auto")
+        ref = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").stdout.strip()
+    if "/" not in ref:
+        return False, False, f"{repo}: no origin/HEAD"
+    default = ref.split("/", 1)[-1]
+    branch = git(repo, "branch", "--show-current").stdout.strip()
+    if branch != default:
+        return False, False, f"{repo}: on {branch or 'detached HEAD'}, not {default}; skipped"
+    if git(repo, "status", "--porcelain", "-uno").stdout.strip():
+        return False, False, f"{repo}: uncommitted tracked changes; skipped"
+    old = git(repo, "rev-parse", "HEAD").stdout.strip()
+    merge = git(repo, "merge", "--ff-only", "-q", ref)
+    new = git(repo, "rev-parse", "HEAD").stdout.strip()
+    if merge.returncode != 0:
+        return False, False, f"{repo}: cannot fast-forward to {ref}; skipped"
+    if old != new:
+        return True, True, f"{repo}: {default} {old[:7]}..{new[:7]}"
+    return True, False, f"{repo}: {default} at {new[:7]}, up to date"
+
+
+def main(argv: list[str]) -> int:
+    if argv:
+        print("usage: guild-host-sync", file=sys.stderr)
+        return 2
+
+    sdir = state_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    lock_file = open(sdir / "lock", "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("guild-host-sync: another run is in progress", file=sys.stderr)
+        return 0
+
+    try:
+        repos = sync_repos()
+    except (OSError, RuntimeError) as exc:
+        msg = str(exc)
+        print(msg, file=sys.stderr)
+        notify_once(sdir, "setup", msg)
+        lock_file.close()
+        return 1
+
+    active_keys: set[str] = set()
+    restart_unit = os.environ.get("GUILD_HOST_SYNC_RESTART", "orderly.service").strip()
+    try:
+        for repo in repos:
+            ok, advanced, msg = sync_one(repo)
+            print(msg, file=sys.stdout if ok else sys.stderr)
+            if not ok:
+                key = f"repo-{repo.name}"
+                active_keys.add(key)
+                notify_once(sdir, key, msg)
+                continue
+            if advanced and repo.name == "orderly" and restart_unit:
+                sc = shutil.which("systemctl")
+                if sc:
+                    res = subprocess.run([sc, "--user", "try-restart", restart_unit],
+                                         capture_output=True, text=True)
+                    if res.returncode != 0:
+                        key = f"restart-{restart_unit}"
+                        err = f"try-restart {restart_unit} failed: {(res.stderr or res.stdout).strip()}"
+                        print(f"guild-host-sync: {err}", file=sys.stderr)
+                        active_keys.add(key)
+                        notify_once(sdir, key, err)
+        clear_other_pings(sdir, active_keys)
+        return 1 if active_keys else 0
+    finally:
+        lock_file.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

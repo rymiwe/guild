@@ -1,0 +1,8 @@
+[Unit]
+Description=Pin green Guild member trunk heads in tests/member-pins.json
+
+[Service]
+Type=oneshot
+TimeoutStartSec=15min
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/share/guild/src/bin/guild-pin --auto

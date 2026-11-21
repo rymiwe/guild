@@ -47,6 +47,12 @@ class GuildPinTest(unittest.TestCase):
         (self.tmp / "bin").mkdir()
         (self.tmp / "bin" / "gh").write_text(STUB_GH)
         (self.tmp / "bin" / "gh").chmod(0o755)
+        (self.tmp / "bin" / "job-notify").write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NOTIFY_LOG\"\n"
+        )
+        (self.tmp / "bin" / "job-notify").chmod(0o755)
+        env["NOTIFY_LOG"] = str(self.tmp / "notify.log")
+        env["GUILD_PIN_STATE_DIR"] = str(self.tmp / "pin-state")
         bare, self.repo = self.tmp / "origin.git", self.tmp / "guild"
         self.git("init", "-q", "--bare", "-b", "main", str(bare), cwd=self.tmp)
         (self.repo / "bin").mkdir(parents=True)
@@ -69,6 +75,10 @@ class GuildPinTest(unittest.TestCase):
         (self.tmp / "gh.json").write_text(json.dumps(gh))
         return subprocess.run([str(self.repo / "bin" / "guild-pin"), *args], cwd=self.repo, env=self.env,
                               capture_output=True, text=True)
+
+    def notifications(self) -> list[str]:
+        p = self.tmp / "notify.log"
+        return p.read_text().splitlines() if p.exists() else []
 
     def state(self) -> str:
         return self.git("for-each-ref", cwd=self.repo) + self.git("status", "--porcelain", cwd=self.repo)
@@ -137,6 +147,64 @@ class GuildPinTest(unittest.TestCase):
         self.assertEqual(out.returncode, 1, out.stderr)
         self.assertIn("Guild CI did not pass on https://github.com/acme/guild/pull/9; not merged", out.stderr)
         self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")], "merged after CI failed")
+
+    def test_auto_skips_when_open_pin_pr_exists(self) -> None:
+        gh = {
+            "list": json.dumps([{"number": 40, "headRefName": "pin/alpha-ccccccc",
+                                "url": "https://github.com/acme/guild/pull/40"}]),
+        }
+        out = self.run_pin(gh, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("open pin PR already exists: https://github.com/acme/guild/pull/40", out.stdout)
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr create")])
+        self.assertEqual(self.notifications(), [])
+
+    def test_auto_waits_with_exit_0_and_no_ping_when_checks_pending(self) -> None:
+        new_a = "c" * 40
+        gh = {
+            "list": "[]",
+            "repos/acme/alpha/commits/HEAD": new_a,
+            "repos/acme/alpha/commits/" + new_a + "/check-runs": json.dumps(
+                [{"name": "test", "status": "in_progress", "conclusion": None}]),
+            f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
+            "repos/acme/beta/commits/HEAD": OLD["beta"],
+        }
+        out = self.run_pin(gh, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.notifications(), [])
+
+    def test_auto_pings_once_on_failed_check_and_clears_on_recovery(self) -> None:
+        new_b = "d" * 40
+        bad_gh = {
+            "list": "[]",
+            "repos/acme/alpha/commits/HEAD": OLD["alpha"],
+            "repos/acme/beta/commits/HEAD": new_b,
+            "repos/acme/beta/commits/" + new_b + "/check-runs": json.dumps(
+                [{"name": "suite", "status": "completed", "conclusion": "failure"}]),
+            f"repos/acme/beta/compare/{OLD['beta']}...{new_b}": "",
+        }
+        self.assertEqual(self.run_pin(bad_gh, "--auto").returncode, 1)
+        self.assertEqual(self.run_pin(bad_gh, "--auto").returncode, 1)
+        self.assertEqual(len(self.notifications()), 1)
+        self.assertIn("guild-pin FAILED", self.notifications()[0])
+
+        ok_gh = {
+            "list": "[]",
+            "repos/acme/alpha/commits/HEAD": OLD["alpha"],
+            "repos/acme/beta/commits/HEAD": OLD["beta"],
+        }
+        self.assertEqual(self.run_pin(ok_gh, "--auto").returncode, 0)
+        self.assertEqual(list((self.tmp / "pin-state" / "pinged").iterdir()), [])
+
+    def test_auto_skips_when_locked(self) -> None:
+        import fcntl
+        sdir = self.tmp / "pin-state"
+        sdir.mkdir(parents=True, exist_ok=True)
+        with open(sdir / "lock", "w", encoding="utf-8") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            out = self.run_pin({}, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("another run is in progress", out.stderr)
 
     def test_unknown_member_is_refused(self) -> None:
         out = self.run_pin({}, "gamma")

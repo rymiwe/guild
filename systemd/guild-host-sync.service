@@ -1,0 +1,9 @@
+[Unit]
+Description=Fast-forward local Guild checkouts and restart changed host services
+
+[Service]
+Type=oneshot
+TimeoutStartSec=5min
+# linuxbrew comes before /usr/bin: the system python3 on BLD is too old.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/guild-exec guild bin/guild-host-sync
