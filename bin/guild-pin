@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Move member pins to each member's trunk head, so a Guild release carries merged work.
 
-usage: guild-pin [--apply] [MEMBER ...]
+usage: guild-pin [--apply] [--auto] [MEMBER ...]
 
 Reads tests/member-pins.json from origin/main of this Guild checkout. For each
 member (default: every pinned member) it reads the head of the member's default
@@ -13,11 +13,18 @@ Without --apply it prints the plan and changes nothing. With --apply it commits
 the new pins on a branch in a temporary worktree, opens a pull request whose body
 lists the commits each pin carries, waits for Guild CI, and merges it. The
 Surface updater then installs the release on its own. Exit 0 with nothing to move.
+
+With --auto (for systemd timers), it implies --apply, acquires an flock, skips
+when an open pin/* PR already exists, exits 0 while member checks are still
+pending, and sends one `job-notify --send` ping per failure key.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,6 +45,7 @@ class Move:
     old: str
     new: str
     blocked: str = ""
+    pending: bool = False
     unchecked: bool = False
     subjects: list[str] = field(default_factory=list)
 
@@ -45,16 +53,62 @@ class Move:
 def sh(*cmd: str, cwd: Path = ROOT) -> str:
     out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if out.returncode != 0:
-        raise SystemExit(f"guild-pin: {' '.join(cmd)} failed: {out.stderr.strip()}")
+        raise RuntimeError(f"guild-pin: {' '.join(cmd)} failed: {out.stderr.strip()}")
     return out.stdout.strip()
 
 
-def owner() -> str:
+def repo_slug() -> str:
     url = sh("git", "config", "--get", "remote.origin.url")
-    m = re.search(r"github\.com[:/]+([^/]+)/", url)
+    m = re.search(r"github\.com[:/]+([^/]+/[^/]+?)(?:\.git)?$", url)
     if not m:
-        raise SystemExit(f"guild-pin: origin is not on GitHub: {url}")
+        raise RuntimeError(f"guild-pin: origin is not on GitHub: {url}")
     return m.group(1)
+
+
+def owner() -> str:
+    return repo_slug().split("/", 1)[0]
+
+
+def pin_state_dir() -> Path:
+    env = os.environ.get("GUILD_PIN_STATE_DIR")
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg) / "guild" / "pin-state"
+
+
+def notify_once(state_dir: Path, key: str, message: str) -> None:
+    pinged_dir = state_dir / "pinged"
+    pinged_dir.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^A-Za-z0-9._-]", "_", key)
+    marker = pinged_dir / safe_key
+    if marker.exists():
+        return
+    marker.touch()
+    jn = shutil.which("job-notify")
+    if not jn:
+        print("guild-pin: job-notify not on PATH", file=sys.stderr)
+        return
+    clean = "".join(ch for ch in message if ch.isprintable() and ch not in '\\"')
+    done = subprocess.run([jn, "--send", str(state_dir.parent), "guild-pin", "FAILED", clean],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        print("guild-pin: job-notify failed", file=sys.stderr)
+
+
+def clear_pings(state_dir: Path) -> None:
+    pinged_dir = state_dir / "pinged"
+    if not pinged_dir.is_dir():
+        return
+    for p in pinged_dir.iterdir():
+        p.unlink(missing_ok=True)
+
+
+def open_pin_prs(slug: str) -> list[dict[str, str]]:
+    raw = sh("gh", "pr", "list", "--repo", slug, "--state", "open",
+             "--json", "number,headRefName,url")
+    prs = json.loads(raw or "[]")
+    return [p for p in prs if str(p.get("headRefName", "")).startswith("pin/")]
 
 
 def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
@@ -70,6 +124,7 @@ def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
         bad = [r for r in runs if r["status"] != "completed" or r["conclusion"] not in PASSED]
         if bad:
             move.blocked = ", ".join(f"{r['name']} {r['conclusion'] or r['status']}" for r in bad)
+            move.pending = all(r["status"] != "completed" for r in bad)
         move.unchecked = not runs
         move.subjects = sh("gh", "api", f"repos/{org}/{member}/compare/{old}...{new}", "--jq",
                            '.commits[] | .sha[0:7] + " " + (.commit.message | split("\\n")[0])').splitlines()
@@ -119,7 +174,7 @@ def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
             url = sh("gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", body, cwd=wt)
             print(url)
             if not ci_passed(url, wt):
-                raise SystemExit(f"guild-pin: Guild CI did not pass on {url}; not merged")
+                raise RuntimeError(f"guild-pin: Guild CI did not pass on {url}; not merged")
             sh("gh", "pr", "merge", url, "--merge", cwd=wt)
             merged = True
             print(f"guild-pin: merged {url}")
@@ -134,26 +189,66 @@ def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
 
 
 def main(argv: list[str]) -> int:
-    do_apply = "--apply" in argv
-    names = [a for a in argv if a != "--apply"]
+    do_auto = "--auto" in argv
+    do_apply = do_auto or ("--apply" in argv)
+    names = [a for a in argv if a not in ("--apply", "--auto")]
     if any(a.startswith("-") for a in names):
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
         return 2
-    sh("git", "fetch", "-q", "origin", "main")
-    pins = json.loads(sh("git", "show", f"origin/main:{PINS_PATH}"))
-    unknown = [n for n in names if n not in pins]
-    if unknown:
-        raise SystemExit(f"guild-pin: not a pinned member: {', '.join(unknown)}")
-    org = owner()
-    moves = plan(org, pins, names or list(pins))
-    if not moves:
-        print("guild-pin: every pin is at its member's trunk head")
-        return 0
-    print(report(org, moves))
-    ready = [m for m in moves if not m.blocked]
-    if do_apply and ready:
-        apply(org, pins, ready)
-    return 1 if any(m.blocked for m in moves) else 0
+
+    lock_file = None
+    state_dir = pin_state_dir() if do_auto else None
+    if state_dir is not None:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = open(state_dir / "lock", "w", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("guild-pin: another run is in progress", file=sys.stderr)
+            return 0
+
+    try:
+        sh("git", "fetch", "-q", "origin", "main")
+        pins = json.loads(sh("git", "show", f"origin/main:{PINS_PATH}"))
+        unknown = [n for n in names if n not in pins]
+        if unknown:
+            raise RuntimeError(f"guild-pin: not a pinned member: {', '.join(unknown)}")
+        org = owner()
+        if do_auto:
+            existing = open_pin_prs(repo_slug())
+            if existing:
+                print(f"guild-pin: open pin PR already exists: {existing[0]['url']}")
+                return 0
+        moves = plan(org, pins, names or list(pins))
+        if not moves:
+            print("guild-pin: every pin is at its member's trunk head")
+            if state_dir is not None:
+                clear_pings(state_dir)
+            return 0
+        print(report(org, moves))
+        ready = [m for m in moves if not m.blocked]
+        if do_apply and ready:
+            apply(org, pins, ready)
+        failed = [m for m in moves if m.blocked and not m.pending]
+        pending = [m for m in moves if m.blocked and m.pending]
+        if state_dir is not None:
+            for m in failed:
+                notify_once(state_dir, f"member-{m.member}-{m.new[:12]}",
+                            f"{m.member} {m.new[:7]} blocked: {m.blocked}")
+            if not failed and not pending:
+                clear_pings(state_dir)
+            if not failed:
+                return 0
+        return 1 if any(m.blocked for m in moves) else 0
+    except RuntimeError as exc:
+        msg = str(exc)
+        print(msg, file=sys.stderr)
+        if state_dir is not None:
+            notify_once(state_dir, "run", msg)
+        return 1
+    finally:
+        if lock_file is not None:
+            lock_file.close()
 
 
 if __name__ == "__main__":
