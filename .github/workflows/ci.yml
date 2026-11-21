@@ -120,6 +120,9 @@ jobs:
           GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps
         run: python3 tests/test_release_lifecycle.py -v
 
+      - name: Run the release retention tests
+        run: python3 tests/test_release_retention.py -v
+
       - name: Run the updater and host guild-exec tests
         env:
           GUILD_MEMBER_SOURCES_DIR: ${{ github.workspace }}/.deps

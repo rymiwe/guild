@@ -1235,29 +1235,62 @@ def _is_tmux_server(entry: Path, exe: str | None) -> bool:
     return len(fields) > 3 and fields[3] == entry.name.encode()
 
 
+BASELINE_GLOB = "*attribution-baseline.json"
+
+
+def _baseline_releases(job_dir: Path, releases_dir: Path) -> set[str]:
+    """Release ids named by the attribution baselines in a job dir.
+
+    Bridgekeeper's attribution-guard writes <file prefix>attribution-baseline.json
+    in the job dir. Its `check` fails closed when a recorded repository is
+    missing, and a job's git commands can record a release checkout. An
+    unreadable baseline raises: prune cannot tell what it needs.
+    """
+    rids: set[str] = set()
+    for path in sorted(job_dir.glob(BASELINE_GLOB)):
+        try:
+            repos = json.loads(path.read_text(encoding="utf-8"))["repositories"]
+            names = [*repos, *(row.get("repo") for row in repos.values())]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise ReleaseError(f"cannot read attribution baseline {path} of a running job: {exc}") from exc
+        rids.update(rid for rid in (_release_of(n, releases_dir) for n in names if isinstance(n, str)) if rid)
+    return rids
+
+
 def releases_in_use(root: Path) -> dict[str, list[int]]:
     """Release ids that running processes may still use, with their pids.
 
     A process counts for a release when its executable, working directory, a
     command-line argument, a PATH entry, or one of the variables guild-exec
-    sets (RELEASE_ENV_VARS) lies in that release. A tmux server is skipped: it
-    keeps the environment of the process that started it and runs no Guild
-    code. A tmux client is not skipped, so a session still being started keeps
-    its release. Each file of a process is read on its own; one this user
-    cannot read is skipped.
+    sets (RELEASE_ENV_VARS) lies in that release. It also counts for each
+    release that an attribution baseline in its working directory, or in a
+    parent of it, names: job-launch runs a job and its end-of-job check from
+    the job dir, and that check needs every repository the baseline recorded.
+    A tmux server is skipped: it keeps the environment of the process that
+    started it and runs no Guild code. A tmux client is not skipped, so a
+    session still being started keeps its release. Each file of a process is
+    read on its own; one this user cannot read is skipped.
     """
     proc = Path("/proc")
     if not (proc / "self" / "environ").is_file():
         raise ReleaseError("cannot list running processes: /proc is not available")
     releases_dir = (root / "releases").resolve()
     used: dict[str, set[int]] = {}
+    baselines: dict[Path, set[str]] = {}
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
         exe = _read_proc(entry / "exe", link=True)
         if _is_tmux_server(entry, exe):
             continue
-        paths: list[str] = [p for p in (exe, _read_proc(entry / "cwd", link=True)) if isinstance(p, str)]
+        cwd = _read_proc(entry / "cwd", link=True)
+        if isinstance(cwd, str) and cwd.startswith("/"):
+            for d in (Path(cwd), *Path(cwd).parents):
+                if d not in baselines:
+                    baselines[d] = _baseline_releases(d, releases_dir)
+                for rid in baselines[d]:
+                    used.setdefault(rid, set()).add(int(entry.name))
+        paths: list[str] = [p for p in (exe, cwd) if isinstance(p, str)]
         environ = _read_proc(entry / "environ")
         for item in environ.split(b"\0") if isinstance(environ, bytes) else ():
             key, _, value = item.decode("utf-8", "replace").partition("=")
