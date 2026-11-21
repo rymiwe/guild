@@ -241,9 +241,12 @@ def load_events(sdir: Path) -> list[dict]:
 def compute_caps(sdir: Path) -> dict:
     daily_cap = env_int("GUILD_TRIAGE_DAILY_CAP", DEFAULT_DAILY_CAP)
     today_pt = datetime.now(PT).strftime("%Y-%m-%d")
-    daily_prs = 0
+    seen_prs: set[str] = set()
     for ev in load_events(sdir):
-        if not ev.get("pr"):
+        if ev.get("outcome") != "fixed":
+            continue
+        pr = str(ev.get("pr") or "").strip()
+        if not pr:
             continue
         at = str(ev.get("recorded_at") or "")
         try:
@@ -251,7 +254,8 @@ def compute_caps(sdir: Path) -> dict:
         except ValueError:
             continue
         if dt.strftime("%Y-%m-%d") == today_pt:
-            daily_prs += 1
+            seen_prs.add(pr)
+    daily_prs = len(seen_prs)
     return {
         "daily_prs": daily_prs,
         "daily_cap": daily_cap,
