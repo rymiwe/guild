@@ -5,9 +5,11 @@ usage:
   memory-lint [--root DIR]
 
 Each project's memory lives in DIR/<project>/memory/ (default
-~/.claude/projects). A session loads MEMORY.md as the index, so a memory file
-it does not link depends on recall alone, and a link to a missing file is a
-dead pointer.
+~/.claude/projects). A session loads MEMORY.md as the index. In practice the
+index line is the memory: across 23 qualify transcripts on 2026-11-21, index
+text appeared in 11 and no memory file's body appeared in any, indexed or not.
+So a memory file the index does not link never reaches a session, and a link
+to a missing file is a dead pointer.
 
 Findings, one per line:
   orphan    <project>/<file>   memory file MEMORY.md does not link
