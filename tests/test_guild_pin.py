@@ -147,6 +147,18 @@ class GuildPinTest(unittest.TestCase):
         self.assertEqual(out.returncode, 1, out.stderr)
         self.assertIn("Guild CI did not pass on https://github.com/acme/guild/pull/9; not merged", out.stderr)
         self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")], "merged after CI failed")
+        self.assertEqual(self.git("branch", "--list", "pin/*", cwd=self.repo), "")
+
+    def test_failed_commit_leaves_no_branch_and_the_next_run_retries(self) -> None:
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho blocked >&2\nexit 1\n")
+        hook.chmod(0o755)
+        out = self.run_pin(self.apply_fixture([['[{"name": "ci"}]', 0], ["", 0]]), "--apply", "alpha")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertEqual(self.git("branch", "--list", "pin/*", cwd=self.repo), "")
+        hook.unlink()
+        out = self.run_pin(self.apply_fixture([['[{"name": "ci"}]', 0], ["", 0]]), "--apply", "alpha")
+        self.assertEqual(out.returncode, 0, out.stderr)
 
     def test_auto_skips_when_open_pin_pr_exists(self) -> None:
         gh = {

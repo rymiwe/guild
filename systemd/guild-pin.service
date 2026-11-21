@@ -1,8 +1,10 @@
 [Unit]
 Description=Pin green Guild member trunk heads in tests/member-pins.json
 
+# BLD only: it commits and pushes to the Guild repo, and the Surface refuses guild writes.
 [Service]
 Type=oneshot
 TimeoutStartSec=15min
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=%h/.local/share/guild/src/bin/guild-pin --auto
+# linuxbrew comes before /usr/bin: the system python3 on BLD is too old.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/guild-exec guild bin/guild-pin --auto

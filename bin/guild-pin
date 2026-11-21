@@ -180,12 +180,15 @@ def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
             print(f"guild-pin: merged {url}")
         finally:
             subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, capture_output=True)
+            # The local branch always goes: a failed run that kept it made every later run fail on `worktree add -b`.
+            # Not gh's --delete-branch: it checks out main here, which fails when another worktree holds main.
+            cmds = [["git", "branch", "-q", "-D", branch]]
             if merged:
-                # Not gh's --delete-branch: it checks out main here, which fails when another worktree holds main.
-                for cmd in (["git", "push", "-q", "origin", "--delete", branch], ["git", "branch", "-q", "-D", branch]):
-                    done = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-                    if done.returncode != 0:
-                        print(f"guild-pin: left branch {branch} behind: {done.stderr.strip()}", file=sys.stderr)
+                cmds.insert(0, ["git", "push", "-q", "origin", "--delete", branch])
+            for cmd in cmds:
+                done = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+                if done.returncode != 0:
+                    print(f"guild-pin: left branch {branch} behind: {done.stderr.strip()}", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
