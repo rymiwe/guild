@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""guild-triage: deterministic alert collector and triage state for Guild jobs.
+
+usage:
+  guild-triage collect [--hosts local,surface] [--since-hours 24] [--all] [--dry-run]
+  guild-triage record INCIDENT_ID --outcome OUTCOME --summary TEXT
+                      [--fingerprint FP] [--repo OWNER/NAME] [--pr URL]
+  guild-triage status
+
+Reads job-notify logs and active seat-health markers on local and optional
+read-only SSH hosts, writes bounded evidence bundles under local state
+(~/.local/state/guild/triage/), deduplicates by incident id and normalized
+fingerprint cooldown, and enforces kill-switch and daily draft-PR caps.
+
+Exit codes:
+  0   ok
+  2   bad arguments
+  3   configuration error
+  11  held by kill switch (~/.config/guild/triage.off)
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+PT = ZoneInfo("America/Los_Angeles")
+EXIT_OK, EXIT_USAGE, EXIT_CONFIG, EXIT_HOLD = 0, 2, 3, 11
+
+ACTIONABLE_STATUSES = {"STOPPED", "FAILED", "HELD", "ENDED-NO-REPORT"}
+VALID_OUTCOMES = ("expected", "fixed", "cleared", "ignored", "blocked")
+
+NOTIFY_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"
+    r"(?P<job>\S+)\s+(?P<session>\S+)\s+(?P<status>[A-Z][A-Z0-9_-]*)\s+"
+    r"(?P<delivery>\S+)\s+reason=(?P<reason>.*)$"
+)
+
+DEFAULT_DAILY_CAP = 2
+DEFAULT_COOLDOWN_HOURS = 24
+REPORT_HEAD_LINES = 40
+REPORT_TAIL_LINES = 40
+RUN_TAIL_LINES = 100
+FAILOVER_TAIL_LINES = 60
+
+REMOTE_SNIPPET = r'''
+import json, os, shlex, subprocess, sys, time
+from pathlib import Path
+
+since_hours = float(sys.argv[1])
+statuses = {"STOPPED", "FAILED", "HELD", "ENDED-NO-REPORT"}
+
+def parse_jobs_env():
+    script = Path.home() / "code" / "quartermaster" / "bin" / "jobs_env.py"
+    if not script.is_file():
+        return {}
+    proc = subprocess.run([sys.executable, "-I", str(script)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return {}
+    out = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            parts = shlex.split(v)
+            out[k] = parts[0] if parts else ""
+    return out
+
+cfg = parse_jobs_env()
+notify_log = Path(cfg.get("JOB_CFG_NOTIFY_LOG", "")).expanduser() if cfg.get("JOB_CFG_NOTIFY_LOG") else None
+jobs_root = Path(cfg.get("JOB_CFG_ROOT", "")).expanduser() if cfg.get("JOB_CFG_ROOT") else None
+health_dir = Path(cfg.get("JOB_CFG_HEALTH_DIR", "")).expanduser() if cfg.get("JOB_CFG_HEALTH_DIR") else None
+
+now = time.time()
+active_downs = []
+if health_dir and health_dir.is_dir():
+    for entry in sorted(health_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        reason, until = "", 0
+        for line in entry.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("reason="):
+                reason = line.split("=", 1)[1].strip()
+            elif line.startswith("until="):
+                try:
+                    until = int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    until = 0
+        if until > now:
+            active_downs.append({"seat": entry.name, "reason": reason, "until": until})
+
+lines = []
+jobs_needed = set()
+if notify_log and notify_log.is_file():
+    raw_lines = notify_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in raw_lines[-2000:]:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if parts[4] in statuses:
+            lines.append(line)
+            jobs_needed.add(parts[2])
+
+def read_head_tail(path, head_n, tail_n):
+    if not path.is_file():
+        return None, None
+    data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(data[:head_n]) + ("\n" if data else ""), "\n".join(data[-tail_n:]) + ("\n" if data else "")
+
+def read_tail(path, tail_n):
+    if not path.is_file():
+        return None
+    data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(data[-tail_n:]) + ("\n" if data else "")
+
+job_files = {}
+if jobs_root and jobs_root.is_dir():
+    for job in sorted(jobs_needed):
+        if "/" in job or job in (".", ".."):
+            continue
+        jdir = jobs_root / job
+        if not jdir.is_dir():
+            continue
+        rh, rt = read_head_tail(jdir / "report.md", 40, 40)
+        job_files[job] = {
+            "report_head": rh,
+            "report_tail": rt,
+            "run_tail": read_tail(jdir / "run.log", 100),
+            "failover_log": read_tail(jdir / "run.log.failover", 60),
+        }
+
+print(json.dumps({
+    "ok": True,
+    "notify_log": str(notify_log) if notify_log else None,
+    "jobs_root": str(jobs_root) if jobs_root else None,
+    "active_seat_downs": active_downs,
+    "lines": lines,
+    "job_files": job_files,
+}))
+'''
+
+
+def state_dir() -> Path:
+    raw = os.environ.get("GUILD_TRIAGE_STATE_DIR") or "~/.local/state/guild/triage"
+    return Path(os.path.expanduser(raw))
+
+
+def kill_switch_path() -> Path:
+    raw = os.environ.get("GUILD_TRIAGE_KILL_SWITCH") or "~/.config/guild/triage.off"
+    return Path(os.path.expanduser(raw))
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        val = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if val < 0:
+        raise ValueError(f"{name} must be >= 0, got {val}")
+    return val
+
+
+def normalize_reason(reason: str) -> str:
+    s = reason.strip().lower()
+    s = re.sub(r"\b20\d{2}-\d{2}-\d{2}[ t]\d{2}:\d{2}(?::\d{2})?\b", "<ts>", s)
+    s = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", s)
+    s = re.sub(r"#\d+\b", "#<n>", s)
+    s = re.sub(r"\b\d+s\b", "<dur>", s)
+    s = re.sub(r"\b\d+\b", "<n>", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def job_kind(job: str) -> str:
+    head = job.split("-", 1)[0].lower()
+    return head if head in {"review", "feedback", "followup", "build", "audit", "thresher", "guild", "bopeep"} else "other"
+
+
+def incident_id_for(host: str, ts: str, job: str, session: str, status: str, reason: str) -> str:
+    raw = f"{host}|{ts}|{job}|{session}|{status}|{reason}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def fingerprint_for(job: str, status: str, reason: str) -> str:
+    raw = f"{job_kind(job)}|{status}|{normalize_reason(reason)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def load_seen(sdir: Path) -> dict:
+    p = sdir / "seen.json"
+    if not p.is_file():
+        return {"incidents": {}, "fingerprints": {}}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"incidents": {}, "fingerprints": {}}
+        data.setdefault("incidents", {})
+        data.setdefault("fingerprints", {})
+        return data
+    except (OSError, json.JSONDecodeError):
+        return {"incidents": {}, "fingerprints": {}}
+
+
+def save_seen(sdir: Path, data: dict) -> None:
+    sdir.mkdir(parents=True, exist_ok=True)
+    tmp = sdir / f"seen.json.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(sdir / "seen.json")
+
+
+def load_events(sdir: Path) -> list[dict]:
+    p = sdir / "events.jsonl"
+    if not p.is_file():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                out.append(obj)
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def compute_caps(sdir: Path) -> dict:
+    daily_cap = env_int("GUILD_TRIAGE_DAILY_CAP", DEFAULT_DAILY_CAP)
+    today_pt = datetime.now(PT).strftime("%Y-%m-%d")
+    daily_prs = 0
+    for ev in load_events(sdir):
+        if not ev.get("pr"):
+            continue
+        at = str(ev.get("recorded_at") or "")
+        try:
+            dt = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(PT)
+        except ValueError:
+            continue
+        if dt.strftime("%Y-%m-%d") == today_pt:
+            daily_prs += 1
+    return {
+        "daily_prs": daily_prs,
+        "daily_cap": daily_cap,
+        "can_open_pr": daily_prs < daily_cap,
+    }
+
+
+def resolve_local_paths() -> tuple[Path | None, Path | None, Path | None]:
+    notify = os.environ.get("GUILD_TRIAGE_NOTIFY_LOG")
+    jobs = os.environ.get("GUILD_TRIAGE_JOBS_ROOT")
+    health = os.environ.get("GUILD_TRIAGE_HEALTH_DIR")
+    if notify or jobs or health:
+        return (
+            Path(os.path.expanduser(notify)) if notify else None,
+            Path(os.path.expanduser(jobs)) if jobs else None,
+            Path(os.path.expanduser(health)) if health else None,
+        )
+    script = Path.home() / "code" / "quartermaster" / "bin" / "jobs_env.py"
+    if not script.is_file():
+        return None, None, None
+    proc = subprocess.run([sys.executable, "-I", str(script)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None, None, None
+    cfg: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            parts = shlex.split(v)
+            cfg[k] = parts[0] if parts else ""
+    return (
+        Path(os.path.expanduser(cfg["JOB_CFG_NOTIFY_LOG"])) if cfg.get("JOB_CFG_NOTIFY_LOG") else None,
+        Path(os.path.expanduser(cfg["JOB_CFG_ROOT"])) if cfg.get("JOB_CFG_ROOT") else None,
+        Path(os.path.expanduser(cfg["JOB_CFG_HEALTH_DIR"])) if cfg.get("JOB_CFG_HEALTH_DIR") else None,
+    )
+
+
+def _read_head_tail(path: Path, head_n: int, tail_n: int) -> tuple[str | None, str | None]:
+    if not path.is_file():
+        return None, None
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        return "", ""
+    return "\n".join(lines[:head_n]) + "\n", "\n".join(lines[-tail_n:]) + "\n"
+
+
+def _read_tail(path: Path, tail_n: int) -> str | None:
+    if not path.is_file():
+        return None
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        return ""
+    return "\n".join(lines[-tail_n:]) + "\n"
+
+
+def fetch_local_host(since_hours: float) -> dict:
+    notify_log, jobs_root, health_dir = resolve_local_paths()
+    now = time.time()
+    active_downs = []
+    if health_dir and health_dir.is_dir():
+        for entry in sorted(health_dir.iterdir()):
+            if not entry.is_file():
+                continue
+            reason, until = "", 0
+            for line in entry.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("reason="):
+                    reason = line.split("=", 1)[1].strip()
+                elif line.startswith("until="):
+                    try:
+                        until = int(line.split("=", 1)[1].strip())
+                    except ValueError:
+                        until = 0
+            if until > now:
+                active_downs.append({"seat": entry.name, "reason": reason, "until": until})
+
+    lines = []
+    jobs_needed: set[str] = set()
+    if notify_log and notify_log.is_file():
+        for line in notify_log.read_text(encoding="utf-8", errors="replace").splitlines()[-2000:]:
+            m = NOTIFY_LINE_RE.match(line)
+            if m and m.group("status") in ACTIONABLE_STATUSES:
+                lines.append(line)
+                jobs_needed.add(m.group("job"))
+
+    job_files: dict[str, dict] = {}
+    if jobs_root and jobs_root.is_dir():
+        for job in sorted(jobs_needed):
+            if "/" in job or job in (".", ".."):
+                continue
+            jdir = jobs_root / job
+            if not jdir.is_dir():
+                continue
+            rh, rt = _read_head_tail(jdir / "report.md", REPORT_HEAD_LINES, REPORT_TAIL_LINES)
+            job_files[job] = {
+                "report_head": rh,
+                "report_tail": rt,
+                "run_tail": _read_tail(jdir / "run.log", RUN_TAIL_LINES),
+                "failover_log": _read_tail(jdir / "run.log.failover", FAILOVER_TAIL_LINES),
+            }
+
+    return {
+        "ok": True,
+        "notify_log": str(notify_log) if notify_log else None,
+        "jobs_root": str(jobs_root) if jobs_root else None,
+        "active_seat_downs": active_downs,
+        "lines": lines,
+        "job_files": job_files,
+    }
+
+
+def fetch_remote_host(host: str, since_hours: float) -> dict:
+    proc = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            host,
+            "python3",
+            "-",
+            str(since_hours),
+        ],
+        input=REMOTE_SNIPPET,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "error": (proc.stderr or proc.stdout).strip() or f"ssh exit {proc.returncode}",
+            "active_seat_downs": [],
+            "lines": [],
+            "job_files": {},
+        }
+    try:
+        data = json.loads(proc.stdout)
+        if not isinstance(data, dict):
+            raise ValueError("non-object JSON")
+        return data
+    except (json.JSONDecodeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "error": f"bad remote JSON: {exc}",
+            "active_seat_downs": [],
+            "lines": [],
+            "job_files": {},
+        }
+
+
+def in_cooldown(seen: dict, fp: str, cooldown_hours: int, now_utc: datetime) -> bool:
+    entry = seen.get("fingerprints", {}).get(fp)
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("outcome") not in {"expected", "fixed", "cleared", "ignored"}:
+        return False
+    at = entry.get("recorded_at")
+    if not isinstance(at, str):
+        return False
+    try:
+        dt = datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (now_utc - dt) < timedelta(hours=cooldown_hours)
+
+
+def write_bundle(sdir: Path, inc: dict, files: dict | None, active_downs: list[dict]) -> Path:
+    bdir = sdir / "bundles" / inc["incident_id"]
+    bdir.mkdir(parents=True, exist_ok=True)
+    (bdir / "meta.json").write_text(json.dumps(inc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (bdir / "seat-health.json").write_text(json.dumps(active_downs, indent=2) + "\n", encoding="utf-8")
+    if files:
+        if files.get("report_head") is not None:
+            (bdir / "report-head.md").write_text(files["report_head"], encoding="utf-8")
+        if files.get("report_tail") is not None:
+            (bdir / "report-tail.md").write_text(files["report_tail"], encoding="utf-8")
+        if files.get("run_tail") is not None:
+            (bdir / "run-tail.log").write_text(files["run_tail"], encoding="utf-8")
+        if files.get("failover_log") is not None:
+            (bdir / "failover.log").write_text(files["failover_log"], encoding="utf-8")
+    return bdir
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    ks = kill_switch_path()
+    if ks.exists():
+        print(f"guild-triage: held by kill switch ({ks})", file=sys.stderr)
+        return EXIT_HOLD
+
+    sdir = state_dir()
+    seen = load_seen(sdir)
+    caps = compute_caps(sdir)
+    cooldown_hours = env_int("GUILD_TRIAGE_COOLDOWN_HOURS", DEFAULT_COOLDOWN_HOURS)
+    now_local = datetime.now()
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_local - timedelta(hours=args.since_hours) if args.since_hours > 0 else None
+
+    raw_hosts = args.hosts or os.environ.get("GUILD_TRIAGE_HOSTS") or "local"
+    hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+
+    host_reports: dict[str, dict] = {}
+    incidents: list[dict] = []
+
+    for host in hosts:
+        payload = fetch_local_host(args.since_hours) if host == "local" else fetch_remote_host(host, args.since_hours)
+        host_reports[host] = {
+            "ok": bool(payload.get("ok")),
+            "error": payload.get("error"),
+            "notify_log": payload.get("notify_log"),
+            "active_seat_downs": payload.get("active_seat_downs") or [],
+        }
+        if not payload.get("ok"):
+            continue
+        job_files = payload.get("job_files") or {}
+        active_downs = payload.get("active_seat_downs") or []
+        for line in payload.get("lines") or []:
+            m = NOTIFY_LINE_RE.match(line)
+            if not m:
+                continue
+            status = m.group("status")
+            if status not in ACTIONABLE_STATUSES:
+                continue
+            ts_str = m.group("ts")
+            try:
+                ts_dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if cutoff is not None and ts_dt < cutoff:
+                continue
+            job = m.group("job")
+            session = m.group("session")
+            delivery = m.group("delivery")
+            reason = m.group("reason").strip()
+            inc_id = incident_id_for(host, ts_str, job, session, status, reason)
+            if inc_id in seen.get("incidents", {}):
+                continue
+            fp = fingerprint_for(job, status, reason)
+            if not args.all and in_cooldown(seen, fp, cooldown_hours, now_utc):
+                continue
+            inc = {
+                "incident_id": inc_id,
+                "fingerprint": fp,
+                "host": host,
+                "ts": ts_str,
+                "job": job,
+                "session": session,
+                "status": status,
+                "delivery": delivery,
+                "reason": reason,
+                "bundle_dir": None,
+            }
+            if not args.dry_run:
+                bdir = write_bundle(sdir, inc, job_files.get(job), active_downs)
+                inc["bundle_dir"] = str(bdir)
+            incidents.append(inc)
+
+    out = {
+        "collected_at": now_utc.isoformat(),
+        "hosts": host_reports,
+        "caps": caps,
+        "incidents": incidents,
+    }
+    print(json.dumps(out, indent=2))
+    return EXIT_OK
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    sdir = state_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    lock_file = open(sdir / "lock", "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        now_utc = datetime.now(timezone.utc).isoformat()
+        seen = load_seen(sdir)
+        entry = {
+            "incident_id": args.incident_id,
+            "fingerprint": args.fingerprint or "",
+            "outcome": args.outcome,
+            "summary": args.summary.strip(),
+            "repo": args.repo or "",
+            "pr": args.pr or "",
+            "recorded_at": now_utc,
+        }
+        seen["incidents"][args.incident_id] = {
+            "outcome": args.outcome,
+            "recorded_at": now_utc,
+            "pr": args.pr or "",
+        }
+        if args.fingerprint:
+            seen["fingerprints"][args.fingerprint] = {
+                "outcome": args.outcome,
+                "recorded_at": now_utc,
+                "incident_id": args.incident_id,
+                "pr": args.pr or "",
+            }
+        with open(sdir / "events.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+        save_seen(sdir, seen)
+    finally:
+        lock_file.close()
+
+    print(json.dumps({"status": "recorded", "incident_id": args.incident_id, "outcome": args.outcome}))
+    return EXIT_OK
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    sdir = state_dir()
+    seen = load_seen(sdir)
+    events = load_events(sdir)
+    out = {
+        "state_dir": str(sdir),
+        "kill_switch": kill_switch_path().exists(),
+        "kill_switch_path": str(kill_switch_path()),
+        "caps": compute_caps(sdir),
+        "seen_incidents": len(seen.get("incidents", {})),
+        "seen_fingerprints": len(seen.get("fingerprints", {})),
+        "recent_events": events[-10:],
+    }
+    print(json.dumps(out, indent=2))
+    return EXIT_OK
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="guild-triage")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pc = sub.add_parser("collect", help="Collect un-triaged alert incidents and evidence bundles")
+    pc.add_argument("--hosts", help="Comma-separated host list (default: GUILD_TRIAGE_HOSTS or local)")
+    pc.add_argument("--since-hours", type=float, default=24.0, help="Lookback window in hours (0 = all)")
+    pc.add_argument("--all", action="store_true", help="Ignore fingerprint cooldown (still skips exact seen IDs)")
+    pc.add_argument("--dry-run", action="store_true", help="Do not write evidence bundles")
+    pc.set_defaults(func=cmd_collect)
+
+    pr = sub.add_parser("record", help="Record triage disposition for an incident")
+    pr.add_argument("incident_id", help="Incident id from collect output")
+    pr.add_argument("--outcome", required=True, choices=VALID_OUTCOMES)
+    pr.add_argument("--summary", required=True, help="One-line sanitized summary (no private repo names)")
+    pr.add_argument("--fingerprint", default="", help="Optional fingerprint for cooldown deduplication")
+    pr.add_argument("--repo", default="", help="Public Guild repo targeted (e.g. rymiwe/quartermaster)")
+    pr.add_argument("--pr", default="", help="Draft PR URL if opened")
+    pr.set_defaults(func=cmd_record)
+
+    ps = sub.add_parser("status", help="Show kill-switch, cap counts, and recent triage events")
+    ps.set_defaults(func=cmd_status)
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except ValueError as exc:
+        print(f"guild-triage: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

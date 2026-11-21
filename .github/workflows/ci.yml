@@ -139,3 +139,6 @@ jobs:
 
       - name: Run the poteto-watch tests
         run: python3 tests/test_poteto_watch.py -v
+
+      - name: Run the guild-triage tests
+        run: python3 tests/test_guild_triage.py -v
