@@ -199,6 +199,45 @@ class GuildTriageTests(unittest.TestCase):
         self.assertEqual(sdata["caps"]["daily_prs"], 1)
         self.assertFalse(sdata["kill_switch"])
 
+    def test_daily_pr_cap_counts_only_distinct_fixed_prs(self) -> None:
+        env = dict(self.base_env, GUILD_TRIAGE_DAILY_CAP="2")
+        # Two incidents referencing the same fixed PR count as one PR.
+        for inc_id in ("inc111111111", "inc222222222"):
+            res = run_triage(
+                [
+                    "record",
+                    inc_id,
+                    "--outcome",
+                    "fixed",
+                    "--summary",
+                    "Same PR covers both incidents",
+                    "--pr",
+                    "https://github.com/rymiwe/quartermaster/pull/131",
+                ],
+                env,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+        # A blocked incident pointing at an existing PR does not consume the cap.
+        blocked = run_triage(
+            [
+                "record",
+                "inc333333333",
+                "--outcome",
+                "blocked",
+                "--summary",
+                "Blocked on unmerged fix",
+                "--pr",
+                "https://github.com/rymiwe/quartermaster/pull/132",
+            ],
+            env,
+        )
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+
+        sdata = json.loads(run_triage(["status"], env).stdout)
+        self.assertEqual(sdata["caps"]["daily_prs"], 1)
+        self.assertTrue(sdata["caps"]["can_open_pr"])
+
     def test_kill_switch_holds_collect_with_exit_11(self) -> None:
         (self.cfg / "triage.off").write_text("paused\n", encoding="utf-8")
         res = run_triage(["collect", "--hosts", "local"], self.base_env)
