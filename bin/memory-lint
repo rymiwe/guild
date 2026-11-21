@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""memory-lint: report Claude project memories the index does not reach.
+
+usage:
+  memory-lint [--root DIR]
+
+Each project's memory lives in DIR/<project>/memory/ (default
+~/.claude/projects). A session loads MEMORY.md as the index, so a memory file
+it does not link depends on recall alone, and a link to a missing file is a
+dead pointer.
+
+Findings, one per line:
+  orphan    <project>/<file>   memory file MEMORY.md does not link
+  dangling  <project>/<file>   MEMORY.md links a file that does not exist
+
+Quiet when clean. Exit codes: 0 clean, 1 findings, 2 the check could not run.
+Read-only.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+LINK = re.compile(r"\]\(([^)\s]+\.md)\)")
+
+
+def lint(root: Path) -> list[str]:
+    findings = []
+    for mem in sorted(root.glob("*/memory")):
+        project = mem.parent.name
+        index = mem / "MEMORY.md"
+        linked = set(LINK.findall(index.read_text(encoding="utf-8"))) if index.exists() else set()
+        files = {p.name for p in mem.glob("*.md") if p.name != "MEMORY.md"}
+        findings += [f"orphan    {project}/{n}" for n in sorted(files - linked)]
+        findings += [f"dangling  {project}/{n}" for n in sorted(linked - files)]
+    return findings
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Report memories MEMORY.md does not reach.")
+    ap.add_argument("--root", type=Path, default=Path.home() / ".claude" / "projects")
+    args = ap.parse_args()
+    if not args.root.is_dir():
+        print(f"memory-lint: no such directory: {args.root}", file=sys.stderr)
+        return 2
+    findings = lint(args.root)
+    for f in findings:
+        print(f)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
