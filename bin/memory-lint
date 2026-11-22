@@ -6,8 +6,8 @@ usage:
 
 Each project's memory lives in DIR/<project>/memory/ (default
 ~/.claude/projects). A session loads MEMORY.md as the index. In practice the
-index line is the memory: across 23 qualify transcripts on 2026-11-21, index
-text appeared in 11 and no memory file's body appeared in any, indexed or not.
+index line is the memory: index text reaches a session, and a memory file's
+body does not, indexed or not.
 So a memory file the index does not link never reaches a session, and a link
 to a missing file is a dead pointer.
 

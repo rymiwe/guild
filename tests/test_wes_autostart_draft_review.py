@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-first fixtures for the auto-start draft-only review gate (Paul G1-G6).
+"""Fail-first fixtures for the auto-start draft-only review gate (G1-G6).
 
 Nothing reaches GitHub. The gate ships disabled; tests turn it on in-process.
 """
@@ -40,7 +40,7 @@ def prefs(td: Path, **overrides):
         "pace_mult": 1.5,
         "ryan_login": "rymiwe",
         "wes_logins": ["work-wes", "wes-bot"],
-        "org_members": ["cole", "dana", "paul", "casey"],
+        "org_members": ["erin", "dana", "frank", "grace"],
         "classified_repos": ["app", "work-org/app", "api", "work-org/api"],
     }
     data.update(overrides)
@@ -63,7 +63,7 @@ def pr4004(**overrides):
         "confidence": "full",
         "is_draft": False,
         "colleague_request": True,
-        "requester": {"login": "cole", "type": "User"},
+        "requester": {"login": "erin", "type": "User"},
         "seating_ok": True,
     }
     data.update(overrides)
@@ -222,7 +222,7 @@ class GateFixtures(unittest.TestCase):
         # The review-requested search upstream decides that Ryan was asked; G1 checks only the author.
         pulls = {
             "repos/work-org/app/pulls/4010": {"user": {"login": "dana", "type": "User"},
-                                              "requested_reviewers": [{"login": "paul"}], "head": {"sha": "a" * 40}},
+                                              "requested_reviewers": [{"login": "frank"}], "head": {"sha": "a" * 40}},
             "repos/work-org/app/pulls/4011": {"user": {"login": "dependabot[bot]", "type": "Bot"},
                                               "requested_reviewers": [{"login": "rymiwe"}], "head": {"sha": "b" * 40}},
         }

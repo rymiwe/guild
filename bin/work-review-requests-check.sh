@@ -12,7 +12,7 @@
 set -uo pipefail
 SEEN=/home/box/agent-data/fleet/state/work-review-requests.seen
 DRY=0
-# Auto-start draft-only reviews (Paul G1-G6). OFF by default. Ships disabled.
+# Auto-start draft-only reviews (G1-G6). OFF by default. Ships disabled.
 # Only --auto-start-draft or WES_AUTO_START_DRAFT=1 turns it on for that process.
 AUTO_START_DRAFT_DEFAULT=0
 AUTOSTART=$AUTO_START_DRAFT_DEFAULT
