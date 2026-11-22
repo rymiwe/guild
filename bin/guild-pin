@@ -3,7 +3,7 @@
 
 usage: guild-pin [--apply] [--auto] [MEMBER ...]
 
-Reads tests/member-pins.json from origin/main of this Guild checkout. For each
+Reads tests/member-pins.json from origin's main of this Guild checkout. For each
 member (default: every pinned member) it reads the head of the member's default
 branch on GitHub. A head moves the pin only when every check run on it passed;
 a head with a pending or failed run keeps the old pin and is reported. A member
@@ -35,6 +35,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PINS_PATH = "tests/member-pins.json"
+# Fetch into a ref only this script writes: guild-host-sync fetches origin/main in this checkout on its own timer,
+# and two fetches into one ref fail with "cannot lock ref".
+MAIN_REF = "refs/guild-pin/main"
 PASSED = {"success", "skipped", "neutral"}
 CHECKS_APPEAR_TRIES = 60
 CHECKS_APPEAR_SECONDS = 5
@@ -188,7 +191,7 @@ def apply(org: str, pins: dict[str, str], ready: list[Move]) -> None:
     merged = False
     with tempfile.TemporaryDirectory(prefix="guild-pin-") as tmp:
         wt = Path(tmp) / "wt"
-        sh("git", "worktree", "add", "-q", "-b", branch, str(wt), "origin/main")
+        sh("git", "worktree", "add", "-q", "-b", branch, str(wt), MAIN_REF)
         try:
             (wt / PINS_PATH).write_text(json.dumps(pins, indent=2) + "\n", encoding="utf-8")
             sh("git", "commit", "-q", "-am", title, cwd=wt)
@@ -235,14 +238,14 @@ def main(argv: list[str]) -> int:
 
     try:
         try:
-            sh("git", "fetch", "-q", "origin", "main")
+            sh("git", "fetch", "-q", "--no-write-fetch-head", "--refmap=", "origin", f"+refs/heads/main:{MAIN_REF}")
         except RuntimeError as exc:
             if state_dir is not None:
                 return transient_fetch(state_dir, str(exc))
             raise
         if state_dir is not None:
             clear_fetch_streak(state_dir)
-        pins = json.loads(sh("git", "show", f"origin/main:{PINS_PATH}"))
+        pins = json.loads(sh("git", "show", f"{MAIN_REF}:{PINS_PATH}"))
         unknown = [n for n in names if n not in pins]
         if unknown:
             raise RuntimeError(f"guild-pin: not a pinned member: {', '.join(unknown)}")
