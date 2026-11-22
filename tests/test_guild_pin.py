@@ -81,7 +81,9 @@ class GuildPinTest(unittest.TestCase):
         return p.read_text().splitlines() if p.exists() else []
 
     def state(self) -> str:
-        return self.git("for-each-ref", cwd=self.repo) + self.git("status", "--porcelain", cwd=self.repo)
+        # Branches, origin/main and the work tree; refs/guild-pin/main is the plan's own fetch of origin.
+        return (self.git("for-each-ref", "refs/heads", "refs/remotes", cwd=self.repo)
+                + self.git("status", "--porcelain", cwd=self.repo))
 
     def test_green_head_moves_and_red_head_is_blocked(self) -> None:
         new_a, new_b = "c" * 40, "d" * 40
@@ -207,6 +209,19 @@ class GuildPinTest(unittest.TestCase):
         }
         self.assertEqual(self.run_pin(ok_gh, "--auto").returncode, 0)
         self.assertEqual(list((self.tmp / "pin-state" / "pinged").iterdir()), [])
+
+    def test_auto_reads_new_pins_while_another_fetch_holds_origin_main(self) -> None:
+        # guild-host-sync fetches this checkout on its own timer and holds refs/remotes/origin/main's lock meanwhile.
+        other = self.tmp / "other"
+        self.git("clone", "-q", str(self.tmp / "origin.git"), str(other), cwd=self.tmp)
+        (other / "tests" / "member-pins.json").write_text(json.dumps({**OLD, "alpha": "c" * 40}, indent=2) + "\n")
+        self.git("commit", "-qam", "pin alpha", cwd=other)
+        self.git("push", "-q", "origin", "main", cwd=other)
+        (self.repo / ".git" / "refs" / "remotes" / "origin" / "main.lock").touch()
+        gh = {"list": "[]", "repos/acme/alpha/commits/HEAD": "c" * 40, "repos/acme/beta/commits/HEAD": OLD["beta"]}
+        out = self.run_pin(gh, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("every pin is at its member's trunk head", out.stdout)
 
     def test_auto_skips_when_locked(self) -> None:
         import fcntl
