@@ -230,6 +230,13 @@ class GuildPinTest(unittest.TestCase):
         wrapper.chmod(0o755)
         return wrapper
 
+    def failing_fetch_runs(self, count: int) -> list[int]:
+        codes = []
+        for i in range(count):
+            self.write_failing_fetch_git(f"error: cannot lock ref: is at {i:040x} but expected {i + 1:040x}")
+            codes.append(self.run_pin({}, "--auto").returncode)
+        return codes
+
     def test_auto_fetch_retry_recovery_streak_and_manual_failure(self) -> None:
         mismatch = (
             "error: cannot lock ref 'refs/remotes/origin/main': "
@@ -252,6 +259,16 @@ class GuildPinTest(unittest.TestCase):
             self.assertIn("will retry", out.stderr)
         self.assertEqual(self.notifications(), [])
 
+        # A successful fetch resets the streak even when the GitHub call after it fails, which still pages at once.
+        wrapper.unlink()
+        self.assertEqual(self.run_pin({"list": "[]"}, "--auto").returncode, 1)
+        self.assertEqual(len(self.notifications()), 1)
+
+        # A lasting streak pages once, although each ref-lock error names different commits.
+        self.assertEqual(self.failing_fetch_runs(10), [0] * 7 + [1, 1, 1])
+        self.assertEqual(len(self.notifications()), 2)
+        self.assertIn("8 or more runs in a row", self.notifications()[1])
+
         # A successful fetch resets the streak immediately, even when member checks are still pending.
         wrapper.unlink()
         new_a = "c" * 40
@@ -267,11 +284,9 @@ class GuildPinTest(unittest.TestCase):
         self.assertFalse((self.tmp / "pin-state" / "transient").exists())
 
         # Persistent streak after reset: first 7 succeed quietly, 8th+ return failure and page once per streak.
-        wrapper = self.write_failing_fetch_git(mismatch)
-        codes = [self.run_pin({}, "--auto").returncode for _ in range(10)]
-        self.assertEqual(codes, [0] * 7 + [1, 1, 1])
-        self.assertEqual(len(self.notifications()), 1)
-        self.assertIn("8 or more runs in a row", self.notifications()[0])
+        self.assertEqual(self.failing_fetch_runs(10), [0] * 7 + [1, 1, 1])
+        self.assertEqual(len(self.notifications()), 3)
+        self.assertIn("8 or more runs in a row", self.notifications()[2])
 
         # Recovery clears the streak and ping marker.
         wrapper.unlink()
