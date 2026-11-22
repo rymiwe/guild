@@ -16,7 +16,8 @@ Surface updater then installs the release on its own. Exit 0 with nothing to mov
 
 With --auto (for systemd timers), it implies --apply, acquires an flock, skips
 when an open pin/* PR already exists, exits 0 while member checks are still
-pending, and sends one `job-notify --send` ping per failure key.
+pending, retries fetch errors quietly until the eighth in a row, and sends one
+`job-notify --send` ping per failure key.
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ PINS_PATH = "tests/member-pins.json"
 PASSED = {"success", "skipped", "neutral"}
 CHECKS_APPEAR_TRIES = 60
 CHECKS_APPEAR_SECONDS = 5
+TRANSIENT_LIMIT = 8
 
 
 @dataclass
@@ -102,6 +104,27 @@ def clear_pings(state_dir: Path) -> None:
         return
     for p in pinged_dir.iterdir():
         p.unlink(missing_ok=True)
+
+
+def clear_fetch_streak(state_dir: Path) -> None:
+    (state_dir / "transient").unlink(missing_ok=True)
+    (state_dir / "pinged" / "streak").unlink(missing_ok=True)
+
+
+def transient_fetch(state_dir: Path, message: str) -> int:
+    transient_file = state_dir / "transient"
+    try:
+        n = int(transient_file.read_text(encoding="utf-8").strip()) + 1
+    except (OSError, ValueError):
+        n = 1
+    transient_file.write_text(f"{n}\n", encoding="utf-8")
+    if n >= TRANSIENT_LIMIT:
+        streak_msg = f"{message} ({TRANSIENT_LIMIT} or more runs in a row)"
+        print(streak_msg, file=sys.stderr)
+        notify_once(state_dir, "streak", streak_msg)
+        return 1
+    print(f"{message}; will retry", file=sys.stderr)
+    return 0
 
 
 def open_pin_prs(slug: str) -> list[dict[str, str]]:
@@ -211,7 +234,14 @@ def main(argv: list[str]) -> int:
             return 0
 
     try:
-        sh("git", "fetch", "-q", "origin", "main")
+        try:
+            sh("git", "fetch", "-q", "origin", "main")
+        except RuntimeError as exc:
+            if state_dir is not None:
+                return transient_fetch(state_dir, str(exc))
+            raise
+        if state_dir is not None:
+            clear_fetch_streak(state_dir)
         pins = json.loads(sh("git", "show", f"origin/main:{PINS_PATH}"))
         unknown = [n for n in names if n not in pins]
         if unknown:

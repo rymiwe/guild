@@ -223,6 +223,78 @@ class GuildPinTest(unittest.TestCase):
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("not a pinned member: gamma", out.stderr)
 
+    def write_failing_fetch_git(self, stderr_msg: str) -> Path:
+        real_git = shutil.which("git", path="/usr/bin:/bin") or "/usr/bin/git"
+        wrapper = self.tmp / "bin" / "git"
+        wrapper.write_text(f'#!/bin/sh\n[ "$1" = "fetch" ] && {{ printf "%s\\n" {json.dumps(stderr_msg)} >&2; exit 1; }}\nexec "{real_git}" "$@"\n')
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def failing_fetch_runs(self, count: int) -> list[int]:
+        codes = []
+        for i in range(count):
+            self.write_failing_fetch_git(f"error: cannot lock ref: is at {i:040x} but expected {i + 1:040x}")
+            codes.append(self.run_pin({}, "--auto").returncode)
+        return codes
+
+    def test_auto_fetch_retry_recovery_streak_and_manual_failure(self) -> None:
+        mismatch = (
+            "error: cannot lock ref 'refs/remotes/origin/main': "
+            "is at dc2256d392f31054eae43a68cd8f8e747034060b "
+            "but expected d6083990581a7ebd6c1c42c62f5586a58a090f34"
+        )
+        wrapper = self.write_failing_fetch_git(mismatch)
+
+        # Manual CLI fetch failure remains immediate on the first failure.
+        manual = self.run_pin({})
+        self.assertEqual(manual.returncode, 1)
+        self.assertIn("cannot lock ref 'refs/remotes/origin/main'", manual.stderr)
+        self.assertEqual(self.notifications(), [])
+
+        # Automatic runs retry quietly for the first 7 runs with logs and no page.
+        for _ in range(7):
+            out = self.run_pin({}, "--auto")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("cannot lock ref 'refs/remotes/origin/main'", out.stderr)
+            self.assertIn("will retry", out.stderr)
+        self.assertEqual(self.notifications(), [])
+
+        # A successful fetch resets the streak even when the GitHub call after it fails, which still pages at once.
+        wrapper.unlink()
+        self.assertEqual(self.run_pin({"list": "[]"}, "--auto").returncode, 1)
+        self.assertEqual(len(self.notifications()), 1)
+
+        # A lasting streak pages once, although each ref-lock error names different commits.
+        self.assertEqual(self.failing_fetch_runs(10), [0] * 7 + [1, 1, 1])
+        self.assertEqual(len(self.notifications()), 2)
+        self.assertIn("8 or more runs in a row", self.notifications()[1])
+
+        # A successful fetch resets the streak immediately, even when member checks are still pending.
+        wrapper.unlink()
+        new_a = "c" * 40
+        pending_gh = {
+            "list": "[]",
+            "repos/acme/alpha/commits/HEAD": new_a,
+            "repos/acme/alpha/commits/" + new_a + "/check-runs": json.dumps(
+                [{"name": "test", "status": "in_progress", "conclusion": None}]),
+            f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
+            "repos/acme/beta/commits/HEAD": OLD["beta"],
+        }
+        self.assertEqual(self.run_pin(pending_gh, "--auto").returncode, 0)
+        self.assertFalse((self.tmp / "pin-state" / "transient").exists())
+
+        # Persistent streak after reset: first 7 succeed quietly, 8th+ return failure and page once per streak.
+        self.assertEqual(self.failing_fetch_runs(10), [0] * 7 + [1, 1, 1])
+        self.assertEqual(len(self.notifications()), 3)
+        self.assertIn("8 or more runs in a row", self.notifications()[2])
+
+        # Recovery clears the streak and ping marker.
+        wrapper.unlink()
+        ok_gh = {"list": "[]", "repos/acme/alpha/commits/HEAD": OLD["alpha"], "repos/acme/beta/commits/HEAD": OLD["beta"]}
+        self.assertEqual(self.run_pin(ok_gh, "--auto").returncode, 0)
+        self.assertFalse((self.tmp / "pin-state" / "transient").exists())
+        self.assertFalse((self.tmp / "pin-state" / "pinged" / "streak").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
