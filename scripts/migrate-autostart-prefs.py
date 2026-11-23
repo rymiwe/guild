@@ -11,11 +11,12 @@ persona-named keys and files:
                -> <gates_dir>/autostart-draft-review.*
 
 The flags fill the keys that are now required, only where the prefs file lacks
-them. Pass the values the gate used before (its old built-in defaults) to keep
+them. --owner-login is required only when the prefs have neither ryan_login
+nor owner_login; without it the script exits 2 and changes nothing. Pass the values the gate used before (its old built-in defaults) to keep
 its behaviour. An old key is renamed only when the new key is absent; a state
 file is renamed only when the new file is absent. A second run changes nothing.
 
-usage: migrate-autostart-prefs.py PREFS --state-dir DIR --gates-dir DIR --audit-log FILE --timezone ZONE [--dry-run]
+usage: migrate-autostart-prefs.py PREFS --state-dir DIR --gates-dir DIR --audit-log FILE --timezone ZONE [--owner-login LOGIN] [--dry-run]
 """
 from __future__ import annotations
 
@@ -33,6 +34,8 @@ PAUSE_SUFFIXES = (".PAUSED", ".paused")
 
 def migrate(prefs_path: Path, fills: dict, dry_run: bool = False) -> list[str]:
     prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+    if not (prefs.get("ryan_login") or prefs.get("owner_login") or fills.get("owner_login")):
+        raise ValueError("prefs have neither ryan_login nor owner_login: pass --owner-login LOGIN")
     changes = []
     prefs_changed = False
     for old, new in KEY_RENAMES.items():
@@ -72,11 +75,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gates-dir", required=True)
     ap.add_argument("--audit-log", required=True)
     ap.add_argument("--timezone", required=True)
+    ap.add_argument("--owner-login", help="required when the prefs lack both ryan_login and owner_login")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     fills = {"state_dir": args.state_dir, "gates_dir": args.gates_dir,
              "audit_log": args.audit_log, "timezone": args.timezone}
-    changes = migrate(args.prefs, fills, args.dry_run)
+    if args.owner_login:
+        fills["owner_login"] = args.owner_login
+    try:
+        changes = migrate(args.prefs, fills, args.dry_run)
+    except ValueError as e:
+        print(f"migrate-autostart-prefs: {e}", file=sys.stderr)
+        return 2
     for line in changes or ["nothing to migrate"]:
         print(line)
     return 0

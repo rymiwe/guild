@@ -16,15 +16,19 @@ the work bot's GitHub account. Its seen file is `--seen FILE` or
 any GitHub call.
 
 The autostart gate turns on with `--auto-start-draft` or `AUTOSTART_DRAFT=1`
-and reads its prefs file from `$AUTOSTART_PREFS` (the check exits 3 without
-it). Required prefs: `owner_login`, `bot_logins`, `org_members`,
+and reads its prefs file from `$AUTOSTART_PREFS`. Turning autostart on without
+`AUTOSTART_PREFS` stops the whole review-request check: it exits 3 before it
+lists any review request, so set the prefs file before you turn autostart on.
+Required prefs: `owner_login`, `bot_logins`, `org_members`,
 `classified_repos`, `timezone`, `gates_dir`, `audit_log`, and `state_dir`.
 With any one missing, the gate asks and the reason names the key.
 `AUTOSTART_DRY=1` decides without starting.
 
 To move a prefs file from the old names (`ryan_login`, `wes_logins`, the
 `wes-autostart-draft-review.*` state files) run
-`scripts/migrate-autostart-prefs.py`. It is idempotent.
+`scripts/migrate-autostart-prefs.py`. It is idempotent. Pass `--owner-login`
+when the prefs have neither `ryan_login` nor `owner_login`; without it the
+script exits 2 and changes nothing.
 
 PR updates (a PR that became ready, or moved past the owner's review) were retired
 on 2026-11-19: bopeep-watch's CHANGED pings report them. The check exits 2 on

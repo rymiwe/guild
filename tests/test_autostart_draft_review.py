@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -385,6 +386,25 @@ class MigrationFixtures(unittest.TestCase):
         before = pf.read_text()
         self.assertEqual(mig.migrate(pf, {k: "other" for k in fills}), [])
         self.assertEqual(pf.read_text(), before)
+
+    def test_migration_fills_owner_login_and_requires_it_when_absent(self):
+        script = HERE.parent / "scripts" / "migrate-autostart-prefs.py"
+        td = Path(tempfile.mkdtemp(prefix="autostart-mig-owner-"))
+        pf = td / "prefs.json"
+        original = json.dumps({"wes_logins": ["example-bot"], "enabled": False})
+        pf.write_text(original)
+        base = [sys.executable, str(script), str(pf), "--state-dir", str(td / "state"),
+                "--gates-dir", str(td / "gates"), "--audit-log", str(td / "audit.md"),
+                "--timezone", "UTC"]
+        r = subprocess.run(base, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--owner-login", r.stderr)
+        self.assertEqual(pf.read_text(), original)
+        r = subprocess.run(base + ["--owner-login", "example-owner"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(pf.read_text())
+        self.assertEqual(got["owner_login"], "example-owner")
+        self.assertEqual(got["bot_logins"], ["example-bot"])
 
 
 if __name__ == "__main__":
