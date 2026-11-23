@@ -22,13 +22,15 @@ if str(BIN) not in sys.path:
 NOW = datetime(2026, 11, 12, 5, 15, tzinfo=timezone.utc)
 
 def load_mod():
-    return importlib.import_module("wes_autostart_draft_review")
+    return importlib.import_module("autostart_draft_review")
 
 
 def prefs(td: Path, **overrides):
     data = {
         "enabled": True,
         "state_dir": str(td / "state"),
+        "gates_dir": str(td / "gates"),
+        "timezone": "America/Los_Angeles",
         "audit_log": str(td / "autonomy-audit-log.md"),
         "pings_path": str(td / "state" / "pings"),
         "jobdir_root": str(td / "drafts"),
@@ -36,8 +38,8 @@ def prefs(td: Path, **overrides):
         "daily_cap": 5,
         "expected_daily_pace": 10,
         "pace_mult": 1.5,
-        "ryan_login": "rymiwe",
-        "wes_logins": ["example-bot", "example-bot-2"],
+        "owner_login": "example-owner",
+        "bot_logins": ["example-bot", "example-bot-2"],
         "org_members": ["erin", "dana", "frank", "grace"],
         "classified_repos": ["app", "work-org/app", "api", "work-org/api"],
     }
@@ -81,7 +83,7 @@ class GateFixtures(unittest.TestCase):
         self.td = Path(tempfile.mkdtemp(prefix="autostart-"))
         self.p = prefs(self.td)
         self.m = load_mod()
-        self.env = {**os.environ, "WES_AUTO_START_DRAFT": "1"}
+        self.env = {**os.environ, "AUTOSTART_DRAFT": "1"}
 
     def decide(self, rec, **kw):
         p = kw.pop("prefs", self.p)
@@ -93,7 +95,7 @@ class GateFixtures(unittest.TestCase):
 
     def test_disabled_flag_asks_and_does_not_start(self):
         p = prefs(self.td, enabled=False)
-        env = {**self.env, "WES_AUTO_START_DRAFT": "0"}
+        env = {**self.env, "AUTOSTART_DRAFT": "0"}
         rec = pr4004()
         d = self.m.decide(rec, p, now=NOW, env=env)
         self.assertEqual(d["action"], "ask")
@@ -104,15 +106,15 @@ class GateFixtures(unittest.TestCase):
 
     def test_empty_env_ignores_process_env(self):
         p = prefs(self.td, enabled=False)
-        old = os.environ.get("WES_AUTO_START_DRAFT")
-        os.environ["WES_AUTO_START_DRAFT"] = "1"
+        old = os.environ.get("AUTOSTART_DRAFT")
+        os.environ["AUTOSTART_DRAFT"] = "1"
         try:
             self.assertFalse(self.m.is_enabled(p, env={}))
         finally:
             if old is None:
-                os.environ.pop("WES_AUTO_START_DRAFT")
+                os.environ.pop("AUTOSTART_DRAFT")
             else:
-                os.environ["WES_AUTO_START_DRAFT"] = old
+                os.environ["AUTOSTART_DRAFT"] = old
 
     def test_4004_would_auto_start(self):
         d = self.decide(pr4004())
@@ -192,20 +194,20 @@ class GateFixtures(unittest.TestCase):
         self.assertIn("frontier data stale", d["reason"])
 
     # G1
-    def test_g1_ryan_is_not_a_colleague(self):
-        d = self.decide(pr4004(requester={"login": "rymiwe", "type": "User"}))
+    def test_g1_owner_is_not_a_colleague(self):
+        d = self.decide(pr4004(requester={"login": "example-owner", "type": "User"}))
         self.assertEqual(d["action"], "ask")
-        self.assertIn("Ryan", d["reason"])
+        self.assertEqual(d["reason"], "requester is the owner")
 
     def test_g1_bot_asks(self):
         d = self.decide(pr4004(requester={"login": "dependabot[bot]", "type": "Bot"}))
         self.assertEqual(d["action"], "ask")
         self.assertIn("bot", d["reason"])
 
-    def test_g1_wes_asks(self):
+    def test_g1_work_bot_asks(self):
         d = self.decide(pr4004(requester={"login": "example-bot", "type": "User"}))
         self.assertEqual(d["action"], "ask")
-        self.assertIn("Wes", d["reason"])
+        self.assertEqual(d["reason"], "requester is the work bot")
 
     def test_g1_unknown_requester_asks(self):
         d = self.decide(pr4004(requester={"login": "stranger", "type": "User"}))
@@ -217,12 +219,12 @@ class GateFixtures(unittest.TestCase):
         self.assertEqual(d["action"], "start", d)
 
     def test_g1_hook_row_does_not_check_who_was_requested(self):
-        # The review-requested search upstream decides that Ryan was asked; G1 checks only the author.
+        # The review-requested search upstream decides that the owner was asked; G1 checks only the author.
         pulls = {
             "repos/work-org/app/pulls/4010": {"user": {"login": "dana", "type": "User"},
                                               "requested_reviewers": [{"login": "frank"}], "head": {"sha": "a" * 40}},
             "repos/work-org/app/pulls/4011": {"user": {"login": "dependabot[bot]", "type": "Bot"},
-                                              "requested_reviewers": [{"login": "rymiwe"}], "head": {"sha": "b" * 40}},
+                                              "requested_reviewers": [{"login": "example-owner"}], "head": {"sha": "b" * 40}},
         }
         orig = self.m._gh_json
         self.m._gh_json = lambda path, timeout=60: pulls.get(path)
@@ -234,11 +236,24 @@ class GateFixtures(unittest.TestCase):
         self.assertTrue(self.m.colleague_status(human["requester"], self.p)["ok"])
         self.assertEqual(self.m.colleague_status(bot["requester"], self.p)["reason"], "requester is a bot")
 
-    def test_no_wes_logins_in_prefs_asks(self):
+    def test_no_bot_logins_in_prefs_asks(self):
         p = dict(self.p)
-        del p["wes_logins"]
+        del p["bot_logins"]
         self.assertEqual(self.m.colleague_status({"login": "erin", "type": "User"}, p)["reason"],
-                         "prefs have no wes_logins")
+                         "prefs have no bot_logins")
+
+    def test_missing_required_prefs_ask_and_name_the_key(self):
+        # No built-in owner, host path or time zone: each missing key asks and names it.
+        for key in ("owner_login", "gates_dir", "state_dir", "audit_log", "timezone"):
+            p = dict(self.p)
+            del p[key]
+            d = self.decide(pr4004(), prefs=p)
+            self.assertEqual((d["action"], d["reason"]), ("ask", f"prefs have no {key}"), key)
+
+    def test_unknown_timezone_asks(self):
+        d = self.decide(pr4004(), prefs=prefs(self.td, timezone="Mars/Olympus"))
+        self.assertEqual(d["action"], "ask")
+        self.assertIn("timezone", d["reason"])
 
     def test_no_classified_repos_in_prefs_asks(self):
         p = dict(self.p)
@@ -261,7 +276,7 @@ class GateFixtures(unittest.TestCase):
         d = self.decide(moved)
         self.assertEqual(d["action"], "ask")
         self.assertIn("head moved", d["reason"])
-        heads = json.loads((self.td / "state" / "wes-autostart-draft-review.heads.json").read_text())
+        heads = json.loads((self.td / "state" / "autostart-draft-review.heads.json").read_text())
         self.assertTrue(heads["work-org/app#4004"]["stale"])
 
     def test_g2_mid_run_head_change_asks(self):
@@ -335,14 +350,41 @@ class GateFixtures(unittest.TestCase):
         script = BIN / "work-review-requests-check.sh"
         text = script.read_text(encoding="utf-8")
         self.assertIn("AUTO_START_DRAFT_DEFAULT=0", text)
-        self.assertIn("wes_autostart_draft_review.py", text)
+        self.assertIn("autostart_draft_review.py", text)
         self.assertIn("--auto-start-draft", text)
         self.assertNotIn("UpdateRoutine", text)
         # No new poll / cron in the module or hook.
         self.assertNotIn("crontab", text.lower())
-        mod = Path(BIN / "wes_autostart_draft_review.py").read_text(encoding="utf-8")
+        mod = Path(BIN / "autostart_draft_review.py").read_text(encoding="utf-8")
         self.assertIn("ENABLED_DEFAULT = False", mod)
         self.assertIn("No new poll is added", mod)
+
+
+class MigrationFixtures(unittest.TestCase):
+    def test_migration_renames_keys_fills_paths_and_is_idempotent(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "migrate_autostart_prefs", HERE.parent / "scripts" / "migrate-autostart-prefs.py")
+        mig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mig)
+        td = Path(tempfile.mkdtemp(prefix="autostart-mig-"))
+        (td / "state").mkdir()
+        (td / "gates").mkdir()
+        (td / "state" / "wes-autostart-draft-review.heads.json").write_text("{}")
+        (td / "gates" / "wes-autostart-draft-review.PAUSED").write_text("")
+        pf = td / "prefs.json"
+        pf.write_text(json.dumps({"ryan_login": "example-owner", "wes_logins": ["example-bot"], "enabled": False}))
+        fills = {"state_dir": str(td / "state"), "gates_dir": str(td / "gates"),
+                 "audit_log": str(td / "audit.md"), "timezone": "UTC"}
+        self.assertTrue(mig.migrate(pf, fills))
+        got = json.loads(pf.read_text())
+        self.assertEqual(got, {"owner_login": "example-owner", "bot_logins": ["example-bot"], "enabled": False, **fills})
+        self.assertTrue((td / "state" / "autostart-draft-review.heads.json").exists())
+        self.assertTrue((td / "gates" / "autostart-draft-review.PAUSED").exists())
+        self.assertFalse((td / "state" / "wes-autostart-draft-review.heads.json").exists())
+        before = pf.read_text()
+        self.assertEqual(mig.migrate(pf, {k: "other" for k in fills}), [])
+        self.assertEqual(pf.read_text(), before)
 
 
 if __name__ == "__main__":

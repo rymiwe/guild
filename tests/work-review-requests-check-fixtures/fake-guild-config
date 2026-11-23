@@ -2,10 +2,11 @@
 """Fake guild-config for work-review-requests-check tests: `--org [-r] KEY` from $FAKE_GUILD_CONFIG (JSON).
 A missing key exits 3, like the real one."""
 import json, os, sys
+raw = "-r" in sys.argv[1:]
 args = [a for a in sys.argv[1:] if a not in ("--org", "-r")]
 v = json.loads(os.environ.get("FAKE_GUILD_CONFIG") or "{}")
 for k in args[0].split("."):
     if not isinstance(v, dict) or k not in v:
         print(f"guild-config: key {args[0]} not set for org", file=sys.stderr); sys.exit(3)
     v = v[k]
-print(json.dumps(v))
+print(v if raw and isinstance(v, str) else json.dumps(v))

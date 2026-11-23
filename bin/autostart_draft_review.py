@@ -2,10 +2,15 @@
 """Auto-start draft-only reviews on colleague requests under N lines (G1-G6).
 
 Ships disabled. Hooked from work-review-requests-check.sh when --auto-start-draft
-or WES_AUTO_START_DRAFT=1 is set. The PR events routine prompt is not used and
+or AUTOSTART_DRAFT=1 is set. The PR events routine prompt is not used and
 must not be edited for this gate. No new poll is added.
 
-Nothing posts without Ryan's OK. The start path has no post capability.
+Nothing posts without the owner's OK. The start path has no post capability.
+
+Prefs (JSON, kept out of this public repo). Required: owner_login, bot_logins,
+org_members, classified_repos, timezone (IANA name), gates_dir, audit_log, and
+state_dir (or each of starts_path, heads_path, pings_path). A missing key asks:
+the reason names it ("prefs have no <key>").
 """
 from __future__ import annotations
 
@@ -16,13 +21,15 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 N_LINES = 100
 DAILY_CAP = 5
 PACE_MULT = 1.5
-RYAN_LOGIN = "rymiwe"
-ENABLED_ENV = "WES_AUTO_START_DRAFT"
+ENABLED_ENV = "AUTOSTART_DRAFT"
+DRY_ENV = "AUTOSTART_DRY"
+GATE_NAME = "autostart-draft-review"
+# wes-post-review is the work bot's real posting command; the guard must match its name.
 POST_NAMES = ("wes-post-review", "gh-pr-review-submit", "--post")
 
 # Hard default off. Only an explicit on-flag enables starts.
@@ -33,13 +40,39 @@ class PostHoldError(RuntimeError):
     """Raised if any post path is invoked from the auto-start path."""
 
 
+class PrefsError(RuntimeError):
+    """A required prefs key is missing or bad. str() is the ask reason."""
+
+
+def _require(prefs: dict | None, key: str):
+    value = (prefs or {}).get(key)
+    if value is None or value == "" or value == []:
+        raise PrefsError(f"prefs have no {key}")
+    return value
+
+
+def _pref_path(prefs: dict | None, key: str) -> Path:
+    return Path(os.path.expanduser(str(_require(prefs, key))))
+
+
+def _zone(prefs: dict | None) -> ZoneInfo:
+    name = _require(prefs, "timezone")
+    try:
+        return ZoneInfo(str(name))
+    except (ZoneInfoNotFoundError, ValueError):
+        raise PrefsError(f"prefs timezone {name!r} is not a known zone") from None
+
+
 def _lower(value) -> str:
     return str(value or "").strip().lower()
 
 
-def local_today(now: datetime | None = None) -> str:
-    """Calendar day in the machine's local zone (honours TZ); a naive clock is local."""
-    return (now or datetime.now()).astimezone().date().isoformat()
+def today(prefs: dict | None, now: datetime | None = None) -> str:
+    tz = _zone(prefs)
+    clock = now or datetime.now(tz)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=tz)
+    return clock.astimezone(tz).date().isoformat()
 
 
 def is_enabled(prefs: dict | None = None, *, env: dict | None = None) -> bool:
@@ -54,10 +87,8 @@ def is_enabled(prefs: dict | None = None, *, env: dict | None = None) -> bool:
 
 def _gate_paused(prefs: dict | None = None) -> bool:
     """Registry pause file: if it exists, the gate asks and does not start."""
-    prefs = prefs or {}
-    raw = prefs.get("gates_dir")
-    root = Path(os.path.expanduser(str(raw))) if raw else Path("/home/box/agent-data/fleet/autonomy-gates.d")
-    return (root / "wes-autostart-draft-review.PAUSED").exists() or (root / "wes-autostart-draft-review.paused").exists()
+    root = _pref_path(prefs, "gates_dir")
+    return (root / f"{GATE_NAME}.PAUSED").exists() or (root / f"{GATE_NAME}.paused").exists()
 
 
 def _env_flag(env: dict | None, name: str) -> bool:
@@ -80,27 +111,30 @@ def is_bot_login(login: str, typ: str | None = None) -> bool:
 
 
 def colleague_status(requester: dict | None, prefs: dict | None = None) -> dict:
-    """G1: the PR author is a human work-org member (prefs org_members). Not Ryan, not a bot, not Wes.
+    """G1: the PR author is a human work-org member (prefs org_members).
+    Not the owner, not a bot, not the work bot.
 
     Unknown requester (missing login, or login not in the member list) asks.
-    That the PR requests Ryan is decided upstream: work-review-requests-check.sh
+    That the PR requests the owner is decided upstream: work-review-requests-check.sh
     emits only PRs from its review-requested search.
     """
     prefs = prefs or {}
-    ryan = _lower(prefs.get("ryan_login") or RYAN_LOGIN)
-    wes = {_lower(x) for x in (prefs.get("wes_logins") or [])}
+    owner = _lower(prefs.get("owner_login"))
+    bots = {_lower(x) for x in (prefs.get("bot_logins") or [])}
     members = prefs.get("org_members")
     req = requester or {}
     login = _lower(req.get("login") or req.get("actor") or req.get("user"))
     typ = req.get("type") or req.get("actor_type")
     if not login:
         return {"ok": False, "reason": "unknown requester"}
-    if not wes:
-        return {"ok": False, "reason": "prefs have no wes_logins"}
-    if login == ryan:
-        return {"ok": False, "reason": "requester is Ryan"}
-    if login in wes:
-        return {"ok": False, "reason": "requester is Wes"}
+    if not owner:
+        return {"ok": False, "reason": "prefs have no owner_login"}
+    if not bots:
+        return {"ok": False, "reason": "prefs have no bot_logins"}
+    if login == owner:
+        return {"ok": False, "reason": "requester is the owner"}
+    if login in bots:
+        return {"ok": False, "reason": "requester is the work bot"}
     if is_bot_login(login, typ):
         return {"ok": False, "reason": "requester is a bot"}
     if members is None:
@@ -166,13 +200,17 @@ def _write_json(path: Path, data) -> None:
 
 
 def state_paths(prefs: dict | None = None) -> dict:
+    """Raises PrefsError naming the first missing key."""
     prefs = prefs or {}
-    root = Path(os.path.expanduser(str(prefs.get("state_dir") or "/home/box/agent-data/fleet/state")))
+
+    def under_state(key: str, name: str) -> Path:
+        return _pref_path(prefs, key) if prefs.get(key) else _pref_path(prefs, "state_dir") / name
+
     return {
-        "starts": Path(prefs["starts_path"]) if prefs.get("starts_path") else root / "wes-autostart-draft-review.starts.json",
-        "heads": Path(prefs["heads_path"]) if prefs.get("heads_path") else root / "wes-autostart-draft-review.heads.json",
-        "audit": Path(prefs["audit_log"]) if prefs.get("audit_log") else Path("/home/box/agent-data/fleet/handoffs/wes/autonomy-audit-log.md"),
-        "pings": Path(prefs["pings_path"]) if prefs.get("pings_path") else root / "wes-autostart-draft-review.pings",
+        "starts": under_state("starts_path", f"{GATE_NAME}.starts.json"),
+        "heads": under_state("heads_path", f"{GATE_NAME}.heads.json"),
+        "audit": _pref_path(prefs, "audit_log"),
+        "pings": under_state("pings_path", f"{GATE_NAME}.pings"),
     }
 
 
@@ -238,7 +276,8 @@ def record_ping(message: str, prefs: dict | None = None, *, notify_cmd=None) -> 
 
 def append_audit(pr: dict, draft_path: str, prefs: dict | None = None, *, now: datetime | None = None) -> None:
     paths = state_paths(prefs)
-    ts = (now or datetime.now()).astimezone().strftime("%Y-%m-%d %-I:%M:%S %p %Z")
+    tz = _zone(prefs)
+    ts = (now or datetime.now(tz)).astimezone(tz).strftime("%Y-%m-%d %-I:%M:%S %p %Z")
     line = f"- {ts}: auto-start draft-only review {_pr_key(pr)} head={_head(pr)[:9]} draft={draft_path}\n"
     paths["audit"].parent.mkdir(parents=True, exist_ok=True)
     if not paths["audit"].exists():
@@ -249,7 +288,7 @@ def append_audit(pr: dict, draft_path: str, prefs: dict | None = None, *, now: d
 
 def record_start(pr: dict, draft_path: str, prefs: dict | None = None, *, now: datetime | None = None) -> None:
     prefs = prefs or {}
-    day = local_today(now)
+    day = today(prefs, now)
     paths = state_paths(prefs)
     starts = _load_json(paths["starts"], {"days": {}})
     days = starts.setdefault("days", {})
@@ -272,13 +311,23 @@ def mark_stale(pr: dict, prefs: dict | None = None) -> None:
 
 
 def decide(pr: dict, prefs: dict | None = None, *, now: datetime | None = None, env: dict | None = None) -> dict:
-    """Decide start or ask. Never launches. Flag off always asks (gate disabled)."""
+    """Decide start or ask. Never launches. Flag off always asks (gate disabled).
+    A missing or bad prefs key asks, with the key in the reason."""
     prefs = prefs or {}
     env = env if env is not None else os.environ
     out = {"action": "ask", "reason": None, "n_lines": changed_lines(pr), "enabled": is_enabled(prefs, env=env)}
     if not out["enabled"]:
         out["reason"] = "gate disabled"
         return out
+    try:
+        return _decide_enabled(pr, prefs, out, now=now)
+    except PrefsError as e:
+        out["action"] = "ask"
+        out["reason"] = str(e)
+        return out
+
+
+def _decide_enabled(pr: dict, prefs: dict, out: dict, *, now: datetime | None) -> dict:
     if _gate_paused(prefs):
         out["reason"] = "gate paused"
         return out
@@ -347,7 +396,7 @@ def decide(pr: dict, prefs: dict | None = None, *, now: datetime | None = None, 
     if pr.get("seating_ok") is False:
         out["reason"] = pr.get("seating_reason") or "seating rules not met"
         return out
-    blocked = pace_blocks(prefs, local_today(now))
+    blocked = pace_blocks(prefs, today(prefs, now))
     if blocked:
         out["reason"] = blocked["reason"]
         return out
@@ -388,7 +437,7 @@ def start_draft(
     root = Path(jobdir or prefs.get("jobdir_root") or (state_paths(prefs)["starts"].parent / "autostart-drafts"))
     dest = root / f"draft-{_pr_key(pr).replace('/', '-')}-{_head(pr)[:9]}"
     dest.mkdir(parents=True, exist_ok=True)
-    (dest / "HOLD-NO-POST").write_text("draft-only; nothing posts without Ryan's OK\n", encoding="utf-8")
+    (dest / "HOLD-NO-POST").write_text("draft-only; nothing posts without the owner's OK\n", encoding="utf-8")
     (dest / "pr.json").write_text(json.dumps(pr, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     record_start(pr, str(dest), prefs, now=now)
     append_audit(pr, str(dest), prefs, now=now)
@@ -407,7 +456,7 @@ def hook_lines(rows: list[dict], prefs: dict | None = None, *, env=None, now=Non
     """Called from work-review-requests-check.sh only when the flag is on."""
     env = env if env is not None else os.environ
     out = []
-    dry = _env_flag(env, "WES_AUTO_START_DRY")
+    dry = _env_flag(env, DRY_ENV)
     for pr in rows:
         if dry:
             decision = decide(pr, prefs, env=env, now=now)
@@ -500,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
     _assert_no_post(argv)
     # CLI is decide/start from a JSON fixture. Disabled unless the env flag or prefs say on.
     if not argv or argv[0] in {"-h", "--help"}:
-        print("usage: wes_autostart_draft_review.py decide|start|hook|write-hook", file=sys.stderr)
+        print("usage: autostart_draft_review.py decide|start|hook|write-hook", file=sys.stderr)
         return 2
     cmd = argv[0]
     prefs = {}
@@ -520,7 +569,7 @@ def main(argv: list[str] | None = None) -> int:
         keys_path = Path(argv[argv.index("--keys") + 1]) if "--keys" in argv else None
         json_path = Path(argv[argv.index("--json") + 1]) if "--json" in argv else None
         if not keys_path or not json_path:
-            print("usage: wes_autostart_draft_review.py write-hook --keys FILE --json FILE", file=sys.stderr)
+            print("usage: autostart_draft_review.py write-hook --keys FILE --json FILE", file=sys.stderr)
             return 2
         lines = keys_path.read_text(encoding="utf-8").splitlines() if keys_path.is_file() else []
         rows = write_hook_json(lines, json_path)
@@ -555,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         enabled = is_enabled(prefs)
-        dry = _env_flag(os.environ, "WES_AUTO_START_DRY")
+        dry = _env_flag(os.environ, DRY_ENV)
         print(
             f"AUTO_START_HOOK enabled={str(enabled).lower()} dry={str(dry).lower()} rows={len(rows)} started={started} posted={posted}",
             file=sys.stderr,

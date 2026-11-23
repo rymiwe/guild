@@ -23,13 +23,16 @@ class Env:
         self.d = pathlib.Path(tempfile.mkdtemp(prefix="wrrc-")); atexit.register(shutil.rmtree, str(self.d), True)
         (self.d / "bin").mkdir(); os.symlink(HERE / "fake-gh", self.d / "bin" / "gh")
         os.symlink(HERE / "fake-guild-config", self.d / "bin" / "guild-config")
-        self.org = {"review_requests": {"repos": [SK, QU]}}
+        self.org = {"review_requests": {"repos": [SK, QU], "owner_login": "example-owner"}}
         self.seen = self.d / "state" / "work-review-requests.seen"
-    def run(self, fixture, *extra):
+    def run(self, fixture, *extra, seen=True, env_extra=None):
         fxp = self.d / "fixture.json"; fxp.write_text(json.dumps(fixture))
         env = dict(os.environ, PATH=f"{self.d/'bin'}:{os.environ['PATH']}", FAKE_GH_FIXTURE=str(fxp),
                    FAKE_GH_LOG=str(self.d / "gh.log"), FAKE_GUILD_CONFIG=json.dumps(self.org))
-        args = [str(SCRIPT), "--seen", str(self.seen)] + list(extra)
+        for k in ("REVIEW_REQUESTS_SEEN", "AUTOSTART_DRAFT", "AUTOSTART_PREFS"):
+            env.pop(k, None)
+        env.update(env_extra or {})
+        args = [str(SCRIPT)] + (["--seen", str(self.seen)] if seen else []) + list(extra)
         p = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         return p.returncode, p.stdout, p.stderr
 
@@ -70,6 +73,29 @@ def t_repo_config_fails_closed():
     for org in ({}, {"review_requests": {"repos": "a/b"}}, {"review_requests": {"repos": []}}):
         e = Env(); e.org = org; rc, out, err = e.run(legacy_fx())
         assert rc == 3 and out == "" and not (e.d / "gh.log").exists(), f"{org}: rc={rc} out={out!r} err={err!r}"
+def t_owner_login_comes_from_config():
+    e = Env(); e.run(legacy_fx())
+    log = (e.d / "gh.log").read_text()
+    assert "review-requested:example-owner -author:example-owner" in log, log
+def t_owner_login_config_fails_closed():
+    # no built-in owner: a missing or bad login searches nothing
+    for login in (None, "", "bad login", ["example-owner"]):
+        e = Env(); e.org = {"review_requests": {"repos": [SK, QU]}}
+        if login is not None:
+            e.org["review_requests"]["owner_login"] = login
+        rc, out, err = e.run(legacy_fx())
+        assert rc == 3 and out == "" and not (e.d / "gh.log").exists(), f"{login!r}: rc={rc} out={out!r} err={err!r}"
+def t_seen_file_required():
+    # no built-in host path: without --seen or REVIEW_REQUESTS_SEEN, nothing runs
+    e = Env(); rc, out, err = e.run(legacy_fx(), seen=False)
+    assert rc == 3 and out == "" and "REVIEW_REQUESTS_SEEN" in err and not (e.d / "gh.log").exists(), f"rc={rc} err={err!r}"
+    rc, out, err = e.run(legacy_fx(), seen=False, env_extra={"REVIEW_REQUESTS_SEEN": str(e.seen)})
+    assert rc == 0 and e.seen.read_text() != "", f"rc={rc} err={err!r}"
+def t_autostart_requires_prefs():
+    e = Env(); rc, out, err = e.run(legacy_fx(), "--auto-start-draft")
+    assert rc == 3 and out == "" and "AUTOSTART_PREFS" in err and not (e.d / "gh.log").exists(), f"rc={rc} err={err!r}"
+    rc, out, err = e.run(legacy_fx(), env_extra={"AUTOSTART_DRAFT": "1", "AUTOSTART_PREFS": str(e.d / "nope.json")})
+    assert rc == 3 and "AUTOSTART_PREFS" in err, f"rc={rc} err={err!r}"
 def t_retired_pr_updates_flag_fails_loudly():
     # the PR-updates path was retired; a caller still passing it must not think updates were checked
     e = Env(); rc, out, err = e.run(legacy_fx(), "--pr-updates")
