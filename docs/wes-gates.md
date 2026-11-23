@@ -10,8 +10,8 @@ Two review-request gates for a work coding bot.
 Org facts stay out of this repo. The check reads its repos from
 `guild-config --org review_requests.repos`, a JSON list of `owner/name`. A
 missing or bad key exits 3 before any GitHub call. The autostart gate reads
-`classified_repos` and `org_members` from its prefs file; with no
-`classified_repos` it asks.
+`classified_repos`, `org_members` and `wes_logins` from its prefs file; with
+no `classified_repos` or no `wes_logins` it asks.
 
 PR updates (a PR that became ready, or moved past the owner's review) were retired
 on 2026-11-19: bopeep-watch's CHANGED pings report them. The check exits 2 on

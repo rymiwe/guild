@@ -24,7 +24,6 @@ N_LINES = 100
 DAILY_CAP = 5
 PACE_MULT = 1.5
 RYAN_LOGIN = "rymiwe"
-DEFAULT_WES_LOGINS = ("work-wes", "wes-bot", "wes")
 ENABLED_ENV = "WES_AUTO_START_DRAFT"
 POST_NAMES = ("wes-post-review", "gh-pr-review-submit", "--post")
 
@@ -93,13 +92,15 @@ def colleague_status(requester: dict | None, prefs: dict | None = None) -> dict:
     """
     prefs = prefs or {}
     ryan = _lower(prefs.get("ryan_login") or RYAN_LOGIN)
-    wes = {_lower(x) for x in (prefs.get("wes_logins") or DEFAULT_WES_LOGINS)}
+    wes = {_lower(x) for x in (prefs.get("wes_logins") or [])}
     members = prefs.get("org_members")
     req = requester or {}
     login = _lower(req.get("login") or req.get("actor") or req.get("user"))
     typ = req.get("type") or req.get("actor_type")
     if not login:
         return {"ok": False, "reason": "unknown requester"}
+    if not wes:
+        return {"ok": False, "reason": "prefs have no wes_logins"}
     if login == ryan:
         return {"ok": False, "reason": "requester is Ryan"}
     if login in wes:

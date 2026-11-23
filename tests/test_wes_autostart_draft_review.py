@@ -39,7 +39,7 @@ def prefs(td: Path, **overrides):
         "expected_daily_pace": 10,
         "pace_mult": 1.5,
         "ryan_login": "rymiwe",
-        "wes_logins": ["work-wes", "wes-bot"],
+        "wes_logins": ["example-bot", "example-bot-2"],
         "org_members": ["erin", "dana", "frank", "grace"],
         "classified_repos": ["app", "work-org/app", "api", "work-org/api"],
     }
@@ -205,7 +205,7 @@ class GateFixtures(unittest.TestCase):
         self.assertIn("bot", d["reason"])
 
     def test_g1_wes_asks(self):
-        d = self.decide(pr4004(requester={"login": "work-wes", "type": "User"}))
+        d = self.decide(pr4004(requester={"login": "example-bot", "type": "User"}))
         self.assertEqual(d["action"], "ask")
         self.assertIn("Wes", d["reason"])
 
@@ -235,6 +235,12 @@ class GateFixtures(unittest.TestCase):
             self.m._gh_json = orig
         self.assertTrue(self.m.colleague_status(human["requester"], self.p)["ok"])
         self.assertEqual(self.m.colleague_status(bot["requester"], self.p)["reason"], "requester is a bot")
+
+    def test_no_wes_logins_in_prefs_asks(self):
+        p = dict(self.p)
+        del p["wes_logins"]
+        self.assertEqual(self.m.colleague_status({"login": "erin", "type": "User"}, p)["reason"],
+                         "prefs have no wes_logins")
 
     def test_no_classified_repos_in_prefs_asks(self):
         p = dict(self.p)
