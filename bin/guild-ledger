@@ -5,6 +5,7 @@ usage: guild-ledger append                      < one event as JSON on stdin
        guild-ledger backfill [--council-dir DIR]
        guild-ledger backfill-prs --repo OWNER/NAME [--repo ...] [--days N]
        guild-ledger refresh [--council-dir DIR]
+       guild-ledger touches [--days N] [--repo OWNER/NAME ...]
 
 Ledger: $GUILD_LEDGER (default ~/.local/state/guild/ledger.jsonl), append-only
 JSONL. The schema and the backfill's proxy are in docs/outcome-ledger.md.
@@ -22,6 +23,10 @@ refresh  runs backfill, then backfill-prs over Guild, each roster tool and the
          org's guild-ledger.pr_repos (guild-config --org). A failed step sends
          one job-notify ping per kind until that step passes again; the other
          step still runs. guild-ledger-refresh.timer runs it daily.
+touches  joins human_stop decisions to pr-lifecycle outcomes by (repo, pr) in
+         the last N days (default 7) from the ledger file alone and prints
+         merged PRs, human stops on them, touches per merged PR, and counts by
+         stop name per repo.
 
 Council dir: --council-dir, else $GUILD_LEDGER_COUNCIL_DIR, else
 ~/code/conclave/tmp/council.
@@ -54,6 +59,9 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 PROXY = "cited-code-at-head"
 PR_PROXY = "pr-lifecycle"
+HUMAN_STOP_ACTION = "human_stop"
+HUMAN_STOPS = {"split_decision", "posting_go", "manual_merge", "ack_loop", "one_way_ack", "brief_approval"}
+TOUCHES_DAYS = 7
 PAGE = 100
 REVERTS_RE = re.compile(r"\bReverts\s+\[?(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(\d+)")
 EXIT_OK, EXIT_BAD_EVENT, EXIT_UNREADABLE = 0, 2, 3
@@ -122,6 +130,11 @@ def validate(event) -> dict:
     need = KINDS[kind]
     if not isinstance(data, dict) or not isinstance(data.get(need), str) or not data[need]:
         raise BadEvent(f"data must be an object with a {need} string for a {kind}")
+    if kind == "decision" and data["action"] == HUMAN_STOP_ACTION:
+        if data.get("stop") not in HUMAN_STOPS:
+            raise BadEvent(f"data.stop must be one of {sorted(HUMAN_STOPS)} for action {HUMAN_STOP_ACTION}")
+        if data.get("answered_at") is not None and not is_time(data["answered_at"]):
+            raise BadEvent("data.answered_at must be an ISO 8601 time or null")
     if "recorded_at" in event and not is_time(event["recorded_at"]):
         raise BadEvent("recorded_at must be an ISO 8601 time")
     clean = {k: v for k, v in event.items() if k not in ("id", "recorded_at")}
@@ -503,6 +516,74 @@ def refresh(council: Path) -> int:
     return EXIT_UNREADABLE if failed else EXIT_OK
 
 
+# --- touches ---------------------------------------------------------------
+
+def read_events() -> list[dict]:
+    path = ledger_path()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise Unreadable(f"{path}: {exc.strerror or exc}")
+    events = []
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            raise Unreadable(f"{path}:{n}: malformed ledger line")
+        if not isinstance(event, dict):
+            raise Unreadable(f"{path}:{n}: malformed ledger line")
+        if event.get("v") != VERSION:
+            continue
+        events.append(event)
+    return events
+
+
+def touches(repos: list[str] | None, days: int) -> int:
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    events = read_events()
+    wanted = set(repos) if repos else None
+    lifecycle_by_pr: dict[tuple[str, int], dict] = {}
+    stops_by_pr: dict[tuple[str, int], list[str]] = {}
+    seen_repos: set[str] = set()
+    for e in events:
+        subject = e["subject"]
+        repo, pr = subject["repo"], subject["pr"]
+        if wanted is not None and repo not in wanted:
+            continue
+        data = e["data"]
+        if e["kind"] == "outcome" and data.get("proxy") == PR_PROXY:
+            seen_repos.add(repo)
+            lifecycle_by_pr[(repo, pr)] = e
+        elif e["kind"] == "decision" and data.get("action") == HUMAN_STOP_ACTION:
+            seen_repos.add(repo)
+            stop = data.get("stop")
+            if not isinstance(stop, str):
+                raise Unreadable(f"human_stop decision {e.get('id')!r} missing stop name")
+            stops_by_pr.setdefault((repo, pr), []).append(stop)
+
+    merged_by_repo: dict[str, list[int]] = {}
+    for (repo, pr), e in lifecycle_by_pr.items():
+        data = e["data"]
+        ended = data.get("merged_at") or e.get("at")
+        if data.get("state") == "merged" and ended and parse_time(ended) >= since:
+            merged_by_repo.setdefault(repo, []).append(pr)
+
+    order = list(dict.fromkeys(repos)) if repos else sorted(seen_repos)
+    print(f"window {since.isoformat(timespec='seconds')} to now ({days} days)")
+    for repo in order:
+        merged_prs = merged_by_repo.get(repo, [])
+        counts: Counter[str] = Counter()
+        for pr in merged_prs:
+            counts.update(stops_by_pr.get((repo, pr), ()))
+        total_stops = sum(counts.values())
+        ratio = f"{total_stops / len(merged_prs):.2f}" if merged_prs else "-"
+        print(f"{repo}: merged {len(merged_prs)}  human stops {total_stops}"
+              f"  touches/merged PR {ratio}  by stop {dict(sorted(counts.items()))}")
+    return EXIT_OK
+
+
 # --- entry ---------------------------------------------------------------
 
 def repo_arg(value: str) -> str:
@@ -528,6 +609,9 @@ def main(argv: list[str]) -> int:
     bp.add_argument("--days", type=days_arg, default=30)
     rf = sub.add_parser("refresh", help="run both backfills and ping on a failure (the daily timer)")
     rf.add_argument("--council-dir", default=council_default())
+    tc = sub.add_parser("touches", help="human touches per merged PR from the ledger alone")
+    tc.add_argument("--repo", action="append", type=repo_arg, metavar="OWNER/NAME")
+    tc.add_argument("--days", type=days_arg, default=TOUCHES_DAYS)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -544,6 +628,8 @@ def main(argv: list[str]) -> int:
         if args.cmd == "refresh":
             return refresh(Path(args.council_dir))
         try:
+            if args.cmd == "touches":
+                return touches(args.repo, args.days)
             if args.cmd == "backfill-prs":
                 return backfill_prs(list(dict.fromkeys(args.repo)), args.days)
             return backfill(Path(args.council_dir))

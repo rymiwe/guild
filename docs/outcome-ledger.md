@@ -67,9 +67,19 @@ The cited block's longest line, with whitespace collapsed, is the needle. A thre
 **The proxy's limits.**
 
 - An escape is an explicit revert only. A fix-forward PR that repairs a bad merge is not counted, so reverts undercount escapes.
-- Human touches are not counted. Agents act under the owner's GitHub login, so GitHub cannot tell the owner's click from an agent's. The tools must record a touch when they stop for a person. That is a later unit.
+- Human touches are not counted on the lifecycle event. Agents act under the owner's GitHub login, so GitHub cannot tell the owner's click from an agent's. The tools record a touch as a `human_stop` decision event when they stop for a person, and `guild-ledger touches` joins those stops to `pr-lifecycle` outcomes.
 - `reviewers` counts only GitHub review submissions. On a repo with one author it is near zero: a council review posted under the owner's login on the owner's own PR counts as the author's.
 - `hours_open` starts at PR creation, not at the first commit or the first request for review.
+
+## Human stops and touches
+
+When a tool stops for a person on a PR, it writes a `decision` event with `data.action: human_stop`.
+
+- `data.stop` is one of a closed list: `split_decision`, `posting_go`, `manual_merge`, `ack_loop`, `one_way_ack`, or `brief_approval`. `validate()` rejects any other stop name (exit 2).
+- `data.answered_at` is an optional ISO 8601 time (or null) for when the person answered.
+- `subject` keeps the full schema (`repo`, `pr`, 40-hex `sha`, and `finding` or null). Stops without a PR, such as route asks in `asks.jsonl`, are out of this unit until a stop can name its PR.
+
+`guild-ledger touches [--days N] [--repo OWNER/NAME ...]` reads only the ledger file and makes no GitHub calls. It takes each PR whose latest `pr-lifecycle` outcome is `state: merged` in the last N days (default 7), joins all `human_stop` decisions to it by `(repo, pr)`, and prints per repo: merged PRs in the window, human stops on them, touches per merged PR, and a count per stop name. With `--repo`, it reports those repos in the order given; without `--repo`, it reports every repo present in the ledger's `pr-lifecycle` or `human_stop` events in alphabetical order.
 
 ## Scheduled refresh (BLD only)
 
@@ -96,6 +106,7 @@ echo '<event json>' | guild-ledger append   # prints "appended <id>" or "exists 
 guild-ledger backfill [--council-dir DIR]    # prints counts; default DIR ~/code/conclave/tmp/council
 guild-ledger backfill-prs --repo OWNER/NAME [--repo ...] [--days N]   # prints per-repo cycle time and reverts
 guild-ledger refresh [--council-dir DIR]     # both backfills, one ping per failed kind (the daily timer)
+guild-ledger touches [--days N] [--repo OWNER/NAME ...]   # prints per-repo human touches per merged PR from the ledger
 ```
 
 The council dir is `--council-dir`, else `$GUILD_LEDGER_COUNCIL_DIR`, else `~/code/conclave/tmp/council`.

@@ -129,6 +129,11 @@ class LedgerTest(unittest.TestCase):
             json.dumps(event(data={})),
             json.dumps(event(kind="outcome", data={"action": "x"})),
             json.dumps(event(id="0" * 64)),
+            json.dumps(event(data={"action": "human_stop"})),
+            json.dumps(event(data={"action": "human_stop", "stop": "unknown_stop"})),
+            json.dumps(event(data={"action": "human_stop", "stop": 123})),
+            json.dumps(event(data={"action": "human_stop", "stop": "posting_go", "answered_at": "yesterday"})),
+            json.dumps(event(data={"action": "human_stop", "stop": "posting_go", "answered_at": 123})),
         ]
         for text in bad:
             with self.subTest(event=text):
@@ -136,6 +141,19 @@ class LedgerTest(unittest.TestCase):
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn("malformed event", p.stderr)
         self.assertFalse(self.ledger.exists())
+
+    def test_human_stop_accepts_known_stops_and_optional_answered_at(self) -> None:
+        stops = ("split_decision", "posting_go", "manual_merge", "ack_loop", "one_way_ack", "brief_approval")
+        for i, stop in enumerate(stops, 1):
+            data = {"action": "human_stop", "stop": stop}
+            if i == 1:
+                data["answered_at"] = "2026-01-02T03:05:00+00:00"
+            elif i == 2:
+                data["answered_at"] = None
+            p = self.run_tool("append", stdin=json.dumps(
+                event(subject={"repo": REPO, "pr": i, "sha": REVIEWED, "finding": None}, data=data)))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(self.lines()), len(stops))
 
     def test_malformed_ledger_line_fails_closed(self) -> None:
         self.ledger.parent.mkdir(parents=True)
@@ -530,6 +548,104 @@ class LedgerTest(unittest.TestCase):
                            env=env, timeout=60)
         self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
         self.assertIn(str(self.tmp / "nope"), p.stderr)
+
+    # --- touches ---------------------------------------------------------
+
+    def touches_fixture(self) -> None:
+        now = datetime.now(timezone.utc)
+        iso = lambda days_ago: (now - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def pr_outcome(repo, pr, days_ago, state="merged", sha=HEAD):
+            ended = iso(days_ago)
+            data = {"proxy": "pr-lifecycle", "state": state, "author": "alex-acme",
+                    "created_at": iso(days_ago + 1),
+                    ("merged_at" if state == "merged" else "closed_at"): ended,
+                    "hours_open": 24.0, "reviewers": 0, "reviews": 0,
+                    "is_revert": False, "reverts_pr": None}
+            return {"v": 1, "kind": "outcome", "source": "github",
+                    "subject": {"repo": repo, "pr": pr, "sha": sha, "finding": None},
+                    "at": ended, "data": data}
+
+        def stop(repo, pr, name, days_ago=1, sha=REVIEWED, finding=None):
+            return {"v": 1, "kind": "decision", "source": "conclave",
+                    "subject": {"repo": repo, "pr": pr, "sha": sha, "finding": finding},
+                    "at": iso(days_ago),
+                    "data": {"action": "human_stop", "stop": name, "answered_at": iso(days_ago)}}
+
+        events = [
+            # REPO: PR 1 merged in window with 2 stops (different commits/findings), PR 2 merged with 0 stops.
+            pr_outcome(REPO, 1, 2, sha=REVIEWED),
+            pr_outcome(REPO, 1, 2, sha=HEAD),  # later outcome on same PR
+            stop(REPO, 1, "split_decision", sha=REVIEWED, finding="f1"),
+            stop(REPO, 1, "posting_go", sha=HEAD),
+            pr_outcome(REPO, 2, 3),
+            # PR 3 closed unmerged in window with a stop: excluded from merged PRs and stops on them.
+            pr_outcome(REPO, 3, 1, state="closed"),
+            stop(REPO, 3, "manual_merge"),
+            # PR 4 merged outside the 7-day window with a stop: excluded.
+            pr_outcome(REPO, 4, 10),
+            stop(REPO, 4, "ack_loop", days_ago=10),
+            # Stop on an open PR with no lifecycle outcome: excluded.
+            stop(REPO, 5, "brief_approval"),
+            # Non-stop decision on PR 1: ignored.
+            event(subject={"repo": REPO, "pr": 1, "sha": REVIEWED, "finding": "f1"}),
+            # Second repo: 1 merged PR with 3 stops (two of the same stop name).
+            pr_outcome(self.ORG_REPO, 10, 1),
+            stop(self.ORG_REPO, 10, "posting_go"),
+            stop(self.ORG_REPO, 10, "posting_go", days_ago=2),
+            stop(self.ORG_REPO, 10, "manual_merge"),
+        ]
+        for e in events:
+            p = self.run_tool("append", stdin=json.dumps(e))
+            self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_touches_joins_human_stops_to_merged_prs_per_repo(self) -> None:
+        self.touches_fixture()
+        p = self.run_tool("touches")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("(7 days)", p.stdout)
+        self.assertIn(
+            f"{REPO}: merged 2  human stops 2  touches/merged PR 1.00"
+            "  by stop {'posting_go': 1, 'split_decision': 1}",
+            p.stdout,
+        )
+        self.assertIn(
+            f"{self.ORG_REPO}: merged 1  human stops 3  touches/merged PR 3.00"
+            "  by stop {'manual_merge': 1, 'posting_go': 2}",
+            p.stdout,
+        )
+        self.assertFalse(self.log.exists())
+
+    def test_touches_filters_by_repo_and_handles_zero_stops_and_zero_merged(self) -> None:
+        self.touches_fixture()
+        # Only PR 2 has 0 stops; test a repo filter and an explicit empty repo.
+        empty_repo = "AcmeCorp/empty"
+        p = self.run_tool("touches", "--days", "7", "--repo", empty_repo, "--repo", REPO)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn(self.ORG_REPO, p.stdout)
+        self.assertIn(f"{empty_repo}: merged 0  human stops 0  touches/merged PR -  by stop {{}}", p.stdout)
+        self.assertIn(f"{REPO}: merged 2  human stops 2  touches/merged PR 1.00", p.stdout)
+
+    def test_touches_pr_with_zero_stops(self) -> None:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        pr = {"v": 1, "kind": "outcome", "source": "github",
+              "subject": {"repo": REPO, "pr": 1, "sha": HEAD, "finding": None},
+              "at": now,
+              "data": {"proxy": "pr-lifecycle", "state": "merged", "author": "alex-acme",
+                       "created_at": now, "merged_at": now, "hours_open": 0.1,
+                       "reviewers": 0, "reviews": 0, "is_revert": False, "reverts_pr": None}}
+        self.assertEqual(self.run_tool("append", stdin=json.dumps(pr)).returncode, 0)
+        p = self.run_tool("touches", "--repo", REPO)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"{REPO}: merged 1  human stops 0  touches/merged PR 0.00  by stop {{}}", p.stdout)
+
+    def test_touches_bad_arguments_and_unreadable_ledger(self) -> None:
+        for args in (["--repo", "nope"], ["--days", "0"], ["--days", "x"]):
+            with self.subTest(args=args):
+                p = self.run_tool("touches", *args)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        p = self.run_tool("touches")
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
 
 
 if __name__ == "__main__":
