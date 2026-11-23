@@ -39,7 +39,7 @@ jobs:
       - name: Check out pinned bridgekeeper
         uses: actions/checkout@v4
         with:
-          repository: rymiwe/bridgekeeper
+          repository: ${{ github.repository_owner }}/bridgekeeper
           ref: ${{ env.BRIDGEKEEPER_SHA }}
           token: ${{ secrets.GUILD_READ_TOKEN }}
           path: .deps/bridgekeeper
@@ -48,7 +48,7 @@ jobs:
       - name: Check out pinned bopeep
         uses: actions/checkout@v4
         with:
-          repository: rymiwe/bopeep
+          repository: ${{ github.repository_owner }}/bopeep
           ref: ${{ env.BOPEEP_SHA }}
           token: ${{ secrets.GUILD_READ_TOKEN }}
           path: .deps/bopeep
@@ -57,7 +57,7 @@ jobs:
       - name: Check out pinned quartermaster
         uses: actions/checkout@v4
         with:
-          repository: rymiwe/quartermaster
+          repository: ${{ github.repository_owner }}/quartermaster
           ref: ${{ env.QUARTERMASTER_SHA }}
           token: ${{ secrets.GUILD_READ_TOKEN }}
           path: .deps/quartermaster
@@ -66,7 +66,7 @@ jobs:
       - name: Check out pinned conclave
         uses: actions/checkout@v4
         with:
-          repository: rymiwe/conclave
+          repository: ${{ github.repository_owner }}/conclave
           ref: ${{ env.CONCLAVE_SHA }}
           token: ${{ secrets.GUILD_READ_TOKEN }}
           path: .deps/conclave
@@ -75,7 +75,7 @@ jobs:
       - name: Check out pinned thresher
         uses: actions/checkout@v4
         with:
-          repository: rymiwe/thresher
+          repository: ${{ github.repository_owner }}/thresher
           ref: ${{ env.THRESHER_SHA }}
           token: ${{ secrets.GUILD_READ_TOKEN }}
           path: .deps/thresher
