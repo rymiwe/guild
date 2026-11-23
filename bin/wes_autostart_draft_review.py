@@ -16,9 +16,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-PT = ZoneInfo("America/Los_Angeles")
 
 N_LINES = 100
 DAILY_CAP = 5
@@ -39,11 +37,9 @@ def _lower(value) -> str:
     return str(value or "").strip().lower()
 
 
-def today_pt(now: datetime | None = None) -> str:
-    clock = now or datetime.now(PT)
-    if clock.tzinfo is None:
-        clock = clock.replace(tzinfo=PT)
-    return clock.astimezone(PT).date().isoformat()
+def local_today(now: datetime | None = None) -> str:
+    """Calendar day in the machine's local zone (honours TZ); a naive clock is local."""
+    return (now or datetime.now()).astimezone().date().isoformat()
 
 
 def is_enabled(prefs: dict | None = None, *, env: dict | None = None) -> bool:
@@ -242,7 +238,7 @@ def record_ping(message: str, prefs: dict | None = None, *, notify_cmd=None) -> 
 
 def append_audit(pr: dict, draft_path: str, prefs: dict | None = None, *, now: datetime | None = None) -> None:
     paths = state_paths(prefs)
-    ts = (now or datetime.now(PT)).astimezone(PT).strftime("%Y-%m-%d %-I:%M:%S %p PT")
+    ts = (now or datetime.now()).astimezone().strftime("%Y-%m-%d %-I:%M:%S %p %Z")
     line = f"- {ts}: auto-start draft-only review {_pr_key(pr)} head={_head(pr)[:9]} draft={draft_path}\n"
     paths["audit"].parent.mkdir(parents=True, exist_ok=True)
     if not paths["audit"].exists():
@@ -253,7 +249,7 @@ def append_audit(pr: dict, draft_path: str, prefs: dict | None = None, *, now: d
 
 def record_start(pr: dict, draft_path: str, prefs: dict | None = None, *, now: datetime | None = None) -> None:
     prefs = prefs or {}
-    day = today_pt(now)
+    day = local_today(now)
     paths = state_paths(prefs)
     starts = _load_json(paths["starts"], {"days": {}})
     days = starts.setdefault("days", {})
@@ -351,7 +347,7 @@ def decide(pr: dict, prefs: dict | None = None, *, now: datetime | None = None, 
     if pr.get("seating_ok") is False:
         out["reason"] = pr.get("seating_reason") or "seating rules not met"
         return out
-    blocked = pace_blocks(prefs, today_pt(now))
+    blocked = pace_blocks(prefs, local_today(now))
     if blocked:
         out["reason"] = blocked["reason"]
         return out

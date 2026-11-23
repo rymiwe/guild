@@ -36,7 +36,6 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 ROSTER_PATH = ROOT / "roster"
@@ -44,7 +43,6 @@ PACE_CHECK_DEFAULT = ROOT / "bin" / "grokbot-pace-check"
 TRUE_CHECK_DEFAULT = ROOT / "bin" / "true-check"
 GUILD_LEDGER_DEFAULT = ROOT / "bin" / "guild-ledger"
 
-PT = ZoneInfo("America/Los_Angeles")
 EXIT_OK, EXIT_USAGE, EXIT_CONFIG, EXIT_HOLD = 0, 2, 3, 11
 
 POST_ID_RE = re.compile(r"^\d{10,25}$")
@@ -142,8 +140,9 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def pt_date(dt: datetime) -> str:
-    return dt.astimezone(PT).strftime("%Y-%m-%d")
+def local_date(dt: datetime) -> str:
+    """Calendar day in the machine's local zone (honours TZ)."""
+    return dt.astimezone().strftime("%Y-%m-%d")
 
 
 def is_iso8601(value: object) -> bool:
@@ -348,7 +347,6 @@ def append_event(event: dict) -> tuple[bool, dict]:
     record = dict(body)
     record["event_id"] = eid
     record["recorded_at"] = now.isoformat(timespec="seconds")
-    record.setdefault("pt_date", pt_date(now))
 
     path = events_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -428,10 +426,17 @@ def seen_post(events: list[dict], post_id: str, repo: str | None = None, decisio
     return None
 
 
+def recorded_date(ev: dict) -> str | None:
+    try:
+        return local_date(datetime.fromisoformat(str(ev.get("recorded_at") or "").replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
 def opened_today_count(events: list[dict], today: str) -> int:
     seen_prs: set[tuple[str, int]] = set()
     for ev in events:
-        if ev.get("kind") == "draft_pr_opened" and ev.get("pt_date") == today:
+        if ev.get("kind") == "draft_pr_opened" and recorded_date(ev) == today:
             repo = str(ev.get("repo") or "")
             num = ev.get("pr_number")
             if repo and isinstance(num, int):
@@ -915,7 +920,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     _, allowlist, _, _ = allowlist_context()
     repos = sorted(allowlist.values())
     events = read_events()
-    today = pt_date(now_utc())
+    today = local_date(now_utc())
     daily_cap = env_int("POTETO_WATCH_DAILY_CAP", DEFAULT_DAILY_CAP)
     open_cap = env_int("POTETO_WATCH_OPEN_CAP", DEFAULT_OPEN_CAP)
     daily_used = opened_today_count(events, today)
@@ -940,7 +945,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "sheaf_started": sum(1 for e in events if e.get("kind") == "sheaf_started"),
             "draft_pr_opened": sum(1 for e in events if e.get("kind") == "draft_pr_opened"),
         },
-        "pt_date": today,
+        "local_date": today,
         "daily_used": daily_used,
         "daily_cap": daily_cap,
         "open_prs_count": len(open_prs) if not args.offline else None,
@@ -964,12 +969,12 @@ def cmd_precheck(args: argparse.Namespace) -> int:
     pace_line = "skipped (--skip-pace)" if args.skip_pace else run_pace_check()
 
     events = read_events()
-    today = pt_date(now_utc())
+    today = local_date(now_utc())
     daily_cap = env_int("POTETO_WATCH_DAILY_CAP", DEFAULT_DAILY_CAP)
     open_cap = env_int("POTETO_WATCH_OPEN_CAP", DEFAULT_OPEN_CAP)
     daily_used = opened_today_count(events, today)
     if daily_used >= daily_cap:
-        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today} PT)")
+        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today})")
 
     open_prs = [] if args.offline else list_open_poteto_prs(repos)
     if not args.offline and len(open_prs) >= open_cap:
@@ -1044,12 +1049,12 @@ def cmd_intake(args: argparse.Namespace) -> int:
     if not args.skip_pace:
         run_pace_check()
 
-    today = pt_date(now_utc())
+    today = local_date(now_utc())
     daily_cap = env_int("POTETO_WATCH_DAILY_CAP", DEFAULT_DAILY_CAP)
     open_cap = env_int("POTETO_WATCH_OPEN_CAP", DEFAULT_OPEN_CAP)
     daily_used = opened_today_count(events, today)
     if daily_used >= daily_cap:
-        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today} PT)")
+        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today})")
 
     if not args.offline:
         gh_dup = existing_pr_for_post(proposal["repo"], proposal["post_id"])
@@ -1244,12 +1249,12 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
             )
             return EXIT_OK
 
-    today = pt_date(now_utc())
+    today = local_date(now_utc())
     daily_cap = env_int("POTETO_WATCH_DAILY_CAP", DEFAULT_DAILY_CAP)
     open_cap = env_int("POTETO_WATCH_OPEN_CAP", DEFAULT_OPEN_CAP)
     daily_used = opened_today_count(events, today)
     if daily_used >= daily_cap:
-        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today} PT)")
+        raise HoldError(f"daily draft PR cap reached ({daily_used}/{daily_cap} on {today})")
 
     if not args.offline:
         open_prs = list_open_poteto_prs(sorted(allowlist.values()))

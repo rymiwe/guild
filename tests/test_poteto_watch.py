@@ -560,6 +560,28 @@ sys.exit(0 if mode == "pass" else 11)
         self.assertEqual(cp_dup.returncode, 0, cp_dup.stderr)
         self.assertEqual(json.loads(cp_dup.stdout)["status"], "duplicate")
 
+    def test_daily_cap_counts_the_machine_local_day(self) -> None:
+        # 07:30Z is Nov 20 in UTC but Nov 19 in Los Angeles; now (19:30Z) is Nov 20 in both.
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "events.jsonl").write_text(
+            json.dumps(
+                {
+                    "kind": "draft_pr_opened",
+                    "repo": "example-owner/guild",
+                    "pr_number": 7,
+                    "event_id": "e" * 64,
+                    "recorded_at": "2026-11-20T07:30:00+00:00",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for tz, used in (("UTC", 1), ("America/Los_Angeles", 0)):
+            cp = self.run_tool("status", "--offline", env_extra={"TZ": tz})
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            out = json.loads(cp.stdout)
+            self.assertEqual((out["local_date"], out["daily_used"]), ("2026-11-20", used), tz)
+
     def test_daily_cap_and_existing_remote_branch_hold(self) -> None:
         prop_file = self.write_proposal(self.sample_sheaf(repo="example-owner/guild", test_cmd="true"))
         in_res = json.loads(self.run_tool("intake", str(prop_file)).stdout)

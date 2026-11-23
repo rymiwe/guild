@@ -52,4 +52,4 @@ Run on BLD only (never Surface, never work checkouts):
 
 - **Kill switch:** `touch ~/.config/guild/triage.off` makes `collect` exit `11` immediately. Delete to resume.
 - **State:** `~/.local/state/guild/triage/{seen.json,events.jsonl,bundles/,lock}` (override with `GUILD_TRIAGE_STATE_DIR`). Local state only; never committed.
-- **Caps & cooldown:** `GUILD_TRIAGE_DAILY_CAP` (default `2` draft PRs/day PT), `GUILD_TRIAGE_COOLDOWN_HOURS` (default `24` hours per normalized failure fingerprint).
+- **Caps & cooldown:** `GUILD_TRIAGE_DAILY_CAP` (default `2` draft PRs per local calendar day), `GUILD_TRIAGE_COOLDOWN_HOURS` (default `24` hours per normalized failure fingerprint).

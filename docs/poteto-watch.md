@@ -115,5 +115,5 @@ Run from BLD (never Surface, never work checkouts):
 
 - **Kill switch:** `touch ~/.config/guild/poteto-watch.off` stops `precheck`, `intake`, and `open-pr` immediately (exit `11`). Delete the file to resume.
 - **State:** `~/.local/state/guild/poteto-watch/{events.jsonl,cursor.json,runs/,worktrees/}` (override with `POTETO_WATCH_STATE_DIR`).
-- **Caps:** `POTETO_WATCH_DAILY_CAP` (default `2` draft PRs/day PT), `POTETO_WATCH_OPEN_CAP` (default `5` open `poteto/` PRs across all Guild repos), `POTETO_WATCH_MAX_NONTEST_FILES` (`10`), `POTETO_WATCH_MAX_NONTEST_LINES` (`400`).
+- **Caps:** `POTETO_WATCH_DAILY_CAP` (default `2` draft PRs per local calendar day), `POTETO_WATCH_OPEN_CAP` (default `5` open `poteto/` PRs across all Guild repos), `POTETO_WATCH_MAX_NONTEST_FILES` (`10`), `POTETO_WATCH_MAX_NONTEST_LINES` (`400`).
 - **Graduating to stricter autonomy:** After 10+ draft PRs with high merge precision and zero noisy/reverted PRs, add `--require-true` to `open-pr` so only diffs passing all five `TRUE(+P)` letters open automatically. Only consider ready PRs after that gate is proven.

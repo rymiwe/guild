@@ -32,9 +32,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-PT = ZoneInfo("America/Los_Angeles")
 EXIT_OK, EXIT_USAGE, EXIT_CONFIG, EXIT_HOLD = 0, 2, 3, 11
 
 ACTIONABLE_STATUSES = {"STOPPED", "FAILED", "HELD", "ENDED-NO-REPORT"}
@@ -240,7 +238,7 @@ def load_events(sdir: Path) -> list[dict]:
 
 def compute_caps(sdir: Path) -> dict:
     daily_cap = env_int("GUILD_TRIAGE_DAILY_CAP", DEFAULT_DAILY_CAP)
-    today_pt = datetime.now(PT).strftime("%Y-%m-%d")
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
     seen_prs: set[str] = set()
     for ev in load_events(sdir):
         if ev.get("outcome") != "fixed":
@@ -250,10 +248,10 @@ def compute_caps(sdir: Path) -> dict:
             continue
         at = str(ev.get("recorded_at") or "")
         try:
-            dt = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(PT)
+            dt = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone()
         except ValueError:
             continue
-        if dt.strftime("%Y-%m-%d") == today_pt:
+        if dt.strftime("%Y-%m-%d") == today:
             seen_prs.add(pr)
     daily_prs = len(seen_prs)
     return {

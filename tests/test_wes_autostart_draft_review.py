@@ -11,17 +11,15 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 BIN = HERE.parent / "bin"
 if str(BIN) not in sys.path:
     sys.path.insert(0, str(BIN))
 
-PT = ZoneInfo("America/Los_Angeles")
-NOW = datetime(2026, 11, 11, 21, 15, tzinfo=PT)
+NOW = datetime(2026, 11, 12, 5, 15, tzinfo=timezone.utc)
 
 def load_mod():
     return importlib.import_module("wes_autostart_draft_review")
