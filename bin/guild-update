@@ -150,6 +150,15 @@ say "activated $id"
 for unit in $restart_units; do
   systemctl --user try-restart "$unit" || say "try-restart $unit failed"
 done
-"${release[@]}" prune --root "$root" >/dev/null || say "prune failed"
+jobs_root=${GUILD_JOBS_ROOT:-$HOME/work-notes}
+guard=$root/current/bin/attribution-guard
+if [ -x "$guard" ]; then
+  export GUILD_ATTRIBUTION_GUARD=$guard
+fi
+if [ -d "$jobs_root" ]; then
+  "${release[@]}" prune --root "$root" --jobs-root "$jobs_root" >/dev/null || say "prune failed"
+else
+  "${release[@]}" prune --root "$root" >/dev/null || say "prune failed"
+fi
 git -C "$src" -c advice.detachedHead=false checkout -q --detach "$sha" ||
   fail "$id-src" "activated $id but cannot move $src to it"

@@ -24,13 +24,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import pwd
 import re
+import subprocess
 import shutil
 import signal
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -1236,6 +1237,112 @@ def _is_tmux_server(entry: Path, exe: str | None) -> bool:
 
 
 BASELINE_GLOB = "*attribution-baseline.json"
+PASS_GLOB = "*attribution-pass.json"
+
+
+def _pass_key() -> bytes | None:
+    env = os.environ.get("GUILD_ATTRIBUTION_PASS_KEY")
+    path = Path(env) if env else Path.home() / ".local/share/guild/attribution-pass.key"
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _attribution_disposition(job_dir: Path, baseline: Path) -> str | None:
+    """`pass` or `fail` when a guard pass verifies for this baseline, else None.
+
+    The pass is the file Bridgekeeper's attribution-guard writes. Its HMAC
+    covers the job path, the baseline bytes, and the evidence hash. A missing
+    key, a bad MAC, or a pass for a different baseline leaves the release held.
+    """
+    key = _pass_key()
+    if key is None:
+        return None
+    try:
+        baseline_hash = hashlib.sha256(baseline.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    job = str(job_dir.resolve())
+    for path in sorted(job_dir.glob(PASS_GLOB)):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mac = data.pop("mac")
+            message = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+            good = hmac.compare_digest(mac, hmac.new(key, message, hashlib.sha256).hexdigest())
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if not good or data.get("v") != 1 or data.get("result") not in ("pass", "fail"):
+            continue
+        if data.get("job") != job or data.get("baseline_sha256") != baseline_hash:
+            continue
+        if not isinstance(data.get("evidence_sha256"), str):
+            continue
+        return data["result"]
+    return None
+
+
+def _job_is_busy(job_dir: Path) -> bool:
+    proc = Path("/proc")
+    prefix = str(job_dir.resolve())
+    if not (proc / "self").is_dir():
+        return False
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        cwd = _read_proc(entry / "cwd", link=True)
+        if isinstance(cwd, str) and (cwd == prefix or cwd.startswith(prefix + os.sep)):
+            return True
+    return False
+
+
+def _prove_settled_jobs(jobs_root: Path, releases_dir: Path) -> None:
+    """Run the attribution guard for a settled job that still has no pass.
+
+    The guard rechecks while the repositories exist and writes the pass prune
+    reads. A running job is left alone: its process already keeps the release,
+    and an early pass would not cover commits it has not made yet.
+    """
+    guard = os.environ.get("GUILD_ATTRIBUTION_GUARD")
+    if not guard:
+        return
+    for job_dir in sorted(p for p in jobs_root.iterdir() if p.is_dir()):
+        baselines = list(job_dir.glob(BASELINE_GLOB))
+        if not baselines or _job_is_busy(job_dir):
+            continue
+        if all(_attribution_disposition(job_dir, path) in ("pass", "fail") for path in baselines):
+            continue
+        names: list[str] = []
+        for path in baselines:
+            try:
+                repos = json.loads(path.read_text(encoding="utf-8"))["repositories"]
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+            names.extend(n for n in [*repos, *(row.get("repo") for row in repos.values())] if isinstance(n, str))
+        if not any(_release_of(n, releases_dir) for n in names):
+            continue
+        subprocess.run([guard, "check", str(job_dir)], check=False, capture_output=True, text=True, timeout=300)
+
+
+def _held_for_attribution(jobs_root: Path | None, releases_dir: Path) -> list[str]:
+    """Releases a settled job's baseline names until a verified pass or failure exists."""
+    if jobs_root is None or not jobs_root.is_dir():
+        return []
+    _prove_settled_jobs(jobs_root, releases_dir)
+    held: set[str] = set()
+    for job_dir in sorted(jobs_root.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        for path in sorted(job_dir.glob(BASELINE_GLOB)):
+            if _attribution_disposition(job_dir, path) in ("pass", "fail"):
+                continue
+            try:
+                repos = json.loads(path.read_text(encoding="utf-8"))["repositories"]
+                names = [*repos, *(row.get("repo") for row in repos.values())]
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                raise ReleaseError(f"cannot read attribution baseline {path}: {exc}") from exc
+            held.update(rid for rid in (_release_of(n, releases_dir) for n in names if isinstance(n, str)) if rid)
+    return sorted(held)
 
 
 def _baseline_releases(job_dir: Path, releases_dir: Path) -> set[str]:
@@ -1308,16 +1415,18 @@ def releases_in_use(root: Path) -> dict[str, list[int]]:
     return {rid: sorted(pids) for rid, pids in sorted(used.items())}
 
 
-def prune_releases(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+def prune_releases(root: Path, *, dry_run: bool = False, jobs_root: Path | None = None) -> dict[str, Any]:
     """Remove each release that is not current, not previous, and not in use.
 
     No new job can bind to such a release: a new job resolves `current`, and
     only a process already bound to a release can start another job on it,
-    which keeps that release in use.
+    which keeps that release in use. A release named by a job baseline under
+    jobs_root stays until that baseline has a verified attribution pass or a
+    verified failure.
     """
     root = root.resolve()
-    st = status_report(root)
-    keep = {st["current"], st["previous"], *st["in_use"]}
+    st = status_report(root, jobs_root=jobs_root)
+    keep = {st["current"], st["previous"], *st["in_use"], *st["held_for_attribution"]}
     removed: list[str] = []
     for rid in st["releases"]:
         if rid in keep:
@@ -1328,7 +1437,7 @@ def prune_releases(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
     return {**st, "removed": removed, "dry_run": dry_run}
 
 
-def status_report(root: Path) -> dict[str, Any]:
+def status_report(root: Path, *, jobs_root: Path | None = None) -> dict[str, Any]:
     root = root.resolve()
     releases_dir = root / "releases"
     releases: list[str] = []
@@ -1340,6 +1449,7 @@ def status_report(root: Path) -> dict[str, Any]:
         "previous": read_pointer_id(root, "previous", tolerate_dangling=True),
         "releases": releases,
         "in_use": releases_in_use(root) if releases else {},
+        "held_for_attribution": _held_for_attribution(jobs_root, releases_dir) if releases else [],
     }
 
 
@@ -1377,10 +1487,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_st = sub.add_parser("status")
     p_st.add_argument("--root", type=Path, required=True)
+    p_st.add_argument("--jobs-root", type=Path, default=None, help="job directory parent; baselines here hold a release until a verified attribution pass")
     p_st.add_argument("--json", action="store_true")
 
     p_pr = sub.add_parser("prune")
     p_pr.add_argument("--root", type=Path, required=True)
+    p_pr.add_argument("--jobs-root", type=Path, default=None, help="job directory parent; baselines here hold a release until a verified attribution pass")
     p_pr.add_argument("--dry-run", action="store_true")
     p_pr.add_argument("--json", action="store_true")
 
@@ -1435,9 +1547,9 @@ def main(argv: list[str] | None = None) -> int:
                 skip_check=args.skip_check,
             )
         elif args.cmd == "status":
-            res = status_report(args.root)
+            res = status_report(args.root, jobs_root=args.jobs_root)
         elif args.cmd == "prune":
-            res = prune_releases(args.root, dry_run=args.dry_run)
+            res = prune_releases(args.root, dry_run=args.dry_run, jobs_root=args.jobs_root)
         else:
             raise ReleaseError(f"unknown command: {args.cmd}")
     except (ReleaseError, OSError, ValueError, KeyError) as exc:
