@@ -230,11 +230,38 @@ class Seat(unittest.TestCase):
     def test_one_retry_inside_the_budget_then_unavailable(self):
         d = tempfile.mkdtemp()
         calls = os.path.join(d, "calls")
-        cmd, _ = stub(d, "boom", rc=1, count=calls)
+        cmd, _ = stub(d, "SERVICE_UNAVAILABLE (code 503)", rc=1, count=calls)
         p, _, _, _ = run("unused", extra_env={"POTETO_JUDGE_CMD": cmd})
         self.assertEqual(json.loads(p.stdout)["row"]["poteto_lean"], "unavailable")
         with open(calls) as f:
             self.assertEqual(len(f.read().split()), 2)
+
+    def test_quota_429_is_not_retried(self):
+        """Paul guild#96 R1: a quota error cannot succeed on retry, so exactly 1 agy call."""
+        d = tempfile.mkdtemp()
+        calls = os.path.join(d, "calls")
+        err = ('error: Individual quota reached. Resets in 2h40m49s.\\nAGY_ERROR: {"short_error":'
+               '"RESOURCE_EXHAUSTED (code 429): Individual quota reached.","status":"RESOURCE_EXHAUSTED",'
+               '"error_code":429,"code_kind":"http","retryable":true}')
+        cmd, _ = stub(d, err, rc=3, count=calls)
+        p, _, _, _ = run("unused", extra_env={"POTETO_JUDGE_CMD": cmd})
+        row = json.loads(p.stdout)["row"]
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(row["poteto_lean"], "unavailable")
+        self.assertIn("RESOURCE_EXHAUSTED", row["poteto_reason"])
+        with open(calls) as f:
+            self.assertEqual(len(f.read().split()), 1)
+
+    def test_permanent_errors_and_bad_json_are_not_retried(self):
+        for out, rc in (("UNAUTHENTICATED (code 401)", 1), ("bad JSON", 0)):
+            with self.subTest(out=out):
+                d = tempfile.mkdtemp()
+                calls = os.path.join(d, "calls")
+                cmd, _ = stub(d, out, rc=rc, count=calls)
+                p, _, _, _ = run("unused", extra_env={"POTETO_JUDGE_CMD": cmd})
+                self.assertEqual(json.loads(p.stdout)["row"]["poteto_lean"], "unavailable")
+                with open(calls) as f:
+                    self.assertEqual(len(f.read().split()), 1)
 
     def test_row_carries_bot_and_model_for_the_scorecard(self):
         p, _, _, _ = run(GOOD)

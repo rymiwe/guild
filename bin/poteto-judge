@@ -39,7 +39,10 @@ share, ...) is "unavailable (never-gated action)". It never creates a gate.
 Seat: Gemini gemini-4-neon-low through agy (another family from the bots and
 from Jev, not Opus). No fallback seat: if agy fails, the lean is unavailable.
 Never metered Cursor. Budget $POTETO_JUDGE_TIMEOUT seconds (default 20) for the
-call and at most one retry inside it.
+call and at most one retry inside it, for transient errors only (5xx,
+UNAVAILABLE, DEADLINE_EXCEEDED, connection). A quota error (429 /
+RESOURCE_EXHAUSTED), a timeout, bad JSON, auth or an unknown failure is never
+retried.
 
 Env: HITL_SCORECARD_LOG | SCORECARD_FILE (log), POTETO_RUBRIC, POTETO_JUDGE_TIMEOUT,
 POTETO_JUDGE_CMD (tests: a command reading the prompt on stdin).
@@ -159,6 +162,21 @@ def answer_of(raw: dict) -> dict:
     return raw
 
 
+class TransientError(RuntimeError):
+    """A failure a second call can fix (5xx, UNAVAILABLE, DEADLINE_EXCEEDED, connection)."""
+
+
+TRANSIENT = re.compile(r"\b(UNAVAILABLE|DEADLINE_EXCEEDED|INTERNAL|code 5\d\d|\"error_code\":\s*5\d\d|"
+                       r"connection (reset|refused|closed)|ECONNRESET|temporarily unavailable)\b", re.I)
+
+
+class QuotaError(RuntimeError):
+    """The seat's quota is out (429 / RESOURCE_EXHAUSTED): a retry cannot succeed."""
+
+
+QUOTA = re.compile(r"RESOURCE_EXHAUSTED|\bcode 429\b|\"error_code\":\s*429\b|quota reached", re.I)
+
+
 def default_cmd() -> str:
     return f'agy --model {DEFAULT_MODEL} --disable-slash-commands -p "$(cat)"'
 
@@ -171,8 +189,14 @@ def ask_once(prompt: str, timeout: float) -> dict:
         cmd = default_cmd()
     p = subprocess.run(cmd, shell=True, input=prompt, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
-        err = re.search(r'"status":"([A-Z_]+)"', p.stdout + p.stderr)
-        raise RuntimeError(f"judge exit {p.returncode}" + (f" {err.group(1)}" if err else ""))
+        out = p.stdout + p.stderr
+        err = re.search(r'"status":"([A-Z_]+)"', out)
+        why = f"judge exit {p.returncode}" + (f" {err.group(1)}" if err else "")
+        if QUOTA.search(out):
+            raise QuotaError(why)
+        if TRANSIENT.search(out):
+            raise TransientError(why)
+        raise RuntimeError(why)
     m = re.search(r"\{.*\}", p.stdout, re.S)
     if not m:
         raise RuntimeError("no JSON in judge answer")
@@ -183,13 +207,12 @@ def ask_once(prompt: str, timeout: float) -> dict:
 
 
 def ask(prompt: str, budget: float) -> dict:
-    """One call, plus one retry only if the budget has room. A timeout is not retried."""
+    """One call, plus one retry for a transient error only, if the budget has room.
+    Quota (429), timeouts, bad JSON, auth and unknown failures are not retried."""
     t0 = time.monotonic()
     try:
         return ask_once(prompt, budget)
-    except subprocess.TimeoutExpired:
-        raise
-    except Exception:
+    except TransientError:
         left = budget - (time.monotonic() - t0)
         if left < MIN_RETRY_S:
             raise
