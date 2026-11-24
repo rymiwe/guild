@@ -1090,6 +1090,42 @@ class Conditions(Base):
         self.assertEqual(rc, 11)
         self.assertIn("consumed.log is not a plain file or is writable by others", out["allow_reason"])
 
+    def bounded(self, cmd, subj):
+        """Run eval or verify with a 20 s cap, so a hang fails the test instead of stalling the suite."""
+        sp, rp = self.tmp / "d11-subject.json", self.tmp / "d11-result.json"
+        sp.write_text(json.dumps(subj))
+        args = ["eval", str(sp), "--out", str(rp)] if cmd == "eval" else ["verify", str(rp), str(sp)]
+        try:
+            cp = subprocess.run(["python3", str(BIN), *args], text=True, capture_output=True, env=self.env, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail(f"true-check {cmd} hung on a FIFO in the gate-passes dir (D11)")
+        return cp.returncode, (json.loads(rp.read_text()) if cmd == "eval" and rp.exists() else None)
+
+    # Paul's cc6d61c probes, D11: a FIFO named *.json must not hang eval or verify
+    def test_d11_fifo_record_is_skipped_without_hanging(self):
+        subj = self.approve_row_and_subject()
+        d = self.tmp / "passes" / "approve-gate"
+        d.mkdir(parents=True)
+        d.chmod(0o755)
+        d.parent.chmod(0o755)
+        os.mkfifo(d / "0.json", 0o600)
+        rc, out = self.bounded("eval", subj)
+        self.assertEqual(rc, 11)
+        self.assertEqual(out["allow_reason"], "gate row g: enforced_by approve-gate: 0.json is not a plain file; skipped")
+        self.record(subj, "approve-gate")  # pass-*.json sorts after the FIFO
+        rc, out = self.bounded("eval", subj)
+        self.assertEqual((rc, out["allowed"]), (0, True), out["allow_reason"])
+        self.assertEqual(self.bounded("verify", subj)[0], 0)
+        self.assertEqual(self.used_lines(), 1)
+
+    def test_d11_fifo_consumed_log_is_refused_without_hanging(self):
+        subj = self.approve_row_and_subject()
+        self.record(subj, "approve-gate")
+        os.mkfifo(self.tmp / "passes" / "consumed.log", 0o600)
+        rc, out = self.bounded("eval", subj)
+        self.assertEqual(rc, 11)
+        self.assertIn("consumed.log is not a plain file", out["allow_reason"])
+
     def test_record_ts_in_the_future_says_so(self):
         subj = self.approve_row_and_subject()
         self.record(subj, "approve-gate", age=-300)
