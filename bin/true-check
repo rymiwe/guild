@@ -875,7 +875,9 @@ def safe(st) -> bool:
 def open_consumed(create: bool) -> int | None:
     """consumed.log as an fd: never through a symlink, never when group/other-writable. None if absent."""
     import stat
-    # O_NONBLOCK: a FIFO here must not block the open; fstat below refuses anything not a plain file.
+    # O_NONBLOCK is a defensive portability guard, not a Linux fix: POSIX leaves
+    # O_RDWR on a FIFO undefined. On Linux the open already returns without
+    # blocking, and fstat below already refuses anything that is not a plain file.
     flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if create else 0)
     try:
         fd = os.open(consumed_log(), flags, 0o600)
