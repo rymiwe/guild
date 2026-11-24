@@ -29,10 +29,14 @@ cat "$FAKE_JEV_DIR/shadow.json"
 """
 
 
-def jev(e="pass", p="pass", conf=0.9, family="gpt", principle=None):
+def jev(e="pass", p="pass", conf=0.9, family="gpt", principle=None, cites="tests/test_parse.py"):
     """One E/P judge answer (the name is kept from when Jev judged)."""
     ans = {"id": "call-1", "family": family, "answers": {"E": {"choice": e, "confidence": conf},
                                                           "P": {"choice": p, "confidence": conf}}}
+    if cites is not None:
+        ans["answers"]["E"]["cites"] = cites
+    if family is None:
+        del ans["family"]
     if principle:
         ans["answers"]["P"]["principle"] = principle
     return ans
@@ -76,9 +80,12 @@ class Base(unittest.TestCase):
         routes = self.tmp / "routes.jsonl"
         routes.write_text(json.dumps({"run_id": "r1", "family": "claude", "model": "m", "cli": "t3"}) + "\n"
                           + json.dumps({"run_id": "r2", "family": "grok", "model": "m", "cli": "t3"}) + "\n")
+        seats = self.tmp / "seats-base.json"
+        seats.write_text(json.dumps([{"family": "gpt", "model": "g"}, {"family": "gemini", "model": "x"}]))
         self.env = {**os.environ, "TRUE_CHECK_JUDGE": str(fake), "TRUE_CHECK_JEV_ASK": str(shadow),
-                    "TRUE_CHECK_ROUTE_LOG": str(routes), "FAKE_JEV_DIR": str(self.tmp)}
-        for k in ("TRUE_CHECK_SEATS", "TRUE_CHECK_DEFAULT_FAMILY", "GUILD_GATE_LEDGER"):
+                    "TRUE_CHECK_ROUTE_LOG": str(routes), "TRUE_CHECK_SEATS": str(seats),
+                    "FAKE_JEV_DIR": str(self.tmp)}
+        for k in ("TRUE_CHECK_DEFAULT_FAMILY", "GUILD_GATE_LEDGER"):
             self.env.pop(k, None)
         self.answers([jev()])
 
@@ -678,10 +685,39 @@ class Gaps(Base):
         self.assertEqual(req["exclude_family"], "claude")
 
     def test_judge_of_builder_family_holds(self):
-        self.answers([jev(family="grok")])
+        f = self.tmp / "seats-grok.json"
+        f.write_text(json.dumps([{"family": "grok", "model": "grok-4.7"}]))
+        self.env["TRUE_CHECK_SEATS"] = str(f)
         rc, out, _ = self.run_eval(subject(builder={"run_id": "r2"}))
+        self.assertEqual((rc, self.calls()), (11, 0))
+        self.assertIn("outside the builder family grok", out["letters"]["E"]["evidence"])
+
+    # audit rev 5 (S16-S19)
+    def test_s16_e_pass_without_a_cite_is_unknown(self):
+        self.answers([jev(cites=None)])
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual((rc, out["letters"]["E"]["verdict"]), (11, "unknown"))
+        self.assertIn("E:unknown", out["verdicts"])
+
+    def test_s17_no_seat_record_holds_before_any_call(self):
+        for seats in ("", str(self.tmp / "no-such-seats.json")):
+            self.env["TRUE_CHECK_SEATS"] = seats
+            rc, out, _ = self.run_eval(subject())
+            self.assertEqual((rc, self.calls()), (11, 0))
+            self.assertIn("judge family unverified: no seat record", out["letters"]["E"]["evidence"])
+
+    def test_s18_reported_family_must_match_the_seat(self):
+        self.answers([jev(family="claude")])
+        rc, out, _ = self.run_eval(subject())
         self.assertEqual(rc, 11)
-        self.assertIn("same family", out["letters"]["E"]["evidence"])
+        self.assertIn("judge family mismatch: seat gpt, judge reported claude", out["letters"]["E"]["evidence"])
+        self.answers([jev(family=None)])
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual(rc, 0, "no self-report: the seat record decides")
+
+    def test_s19_phishing_is_never_gated_by_name(self):
+        rc, out, _ = self.run_eval(subject(action="phishing", repo="rymiwe/guild"))
+        self.assertEqual((rc, out["allow_reason"], self.calls()), (11, "never gated: phishing always goes to Ryan", 0))
 
     def test_jev_is_log_only(self):
         (self.tmp / "shadow.json").write_text(json.dumps({"id": "j", "answers": {"E": {"choice": "fail", "confidence": 1}}}))
@@ -713,13 +749,14 @@ class Gaps(Base):
 
     def test_unknown_builder_uses_two_families(self):
         self.seats(("gpt", "g"), ("claude", "c"), ("gemini", "x"))
+        self.answers([jev(), jev(family="gemini")])
         rc, out, _ = self.run_eval(self.unknown_builder())
         self.assertEqual((rc, self.calls()), (0, 2))
         self.assertIn("two-family fallback: gpt, gemini", out["reviewers"])
 
     def test_one_failing_fallback_reviewer_holds(self):
         self.seats(("gpt", "g"), ("gemini", "x"))
-        self.answers([jev(), jev(e="fail")])
+        self.answers([jev(), jev(e="fail", family="gemini")])
         rc, out, _ = self.run_eval(self.unknown_builder())
         self.assertEqual((rc, out["failed"]), (11, ["E"]))
 

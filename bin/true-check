@@ -22,7 +22,8 @@ outward, and whether it needs a gate-ledger row:
           diff.patch, reply and post keep the diff path), route-internal,
           reminder (local, no row), calendar-hold, routine-edit, memory-write,
           skill-edit (need a row)
-Never gated (NEVER_GATED): send, purchase, delete, account-change, booking.
+Never gated (NEVER_GATED): send, purchase, delete, account-change, booking,
+phishing.
 They hold with "never gated: <action> always goes to Ryan" before any letter
 or model call, even when a ledger row lists them. A ledger row that lists one
 is refused for every action. Any other action holds as unknown.
@@ -74,8 +75,12 @@ Unknown family: two reviewers from two different families, neither the
 router's default family ($TRUE_CHECK_DEFAULT_FAMILY) and neither Opus, from
 the seat list ($TRUE_CHECK_SEATS, a JSON list of {"family", "model"}); both
 must pass. Fewer than two eligible families holds: "builder family
-unverified". The judge's family is the seat's; with no seat list, the family
-judge-ask reports for the seat it ran. A judge of the builder's family holds.
+unverified". The judge's family is the seat record's. With no seat record
+(TRUE_CHECK_SEATS unset or unreadable) E and P hold before any call: "judge
+family unverified: no seat record". judge-ask's self-reported family is only
+logged; one that differs from the seat holds ("judge family mismatch"). A judge
+of the builder's family holds. An E pass must cite (answers.E.cites) one of
+subject.evidence, or E is unknown.
 
 Every letter needs a verdict and evidence. A missing field, a missing
 evidence string or a fail is a hold. A rule letter that holds skips the judge.
@@ -329,7 +334,7 @@ ACTION_TYPES = {
     "memory-write":   {"kind": "nodiff", "outward": False, "needs_row": True,  "count": 1},
     "skill-edit":     {"kind": "nodiff", "outward": False, "needs_row": True,  "count": 1, "lines": 20},
 }
-NEVER_GATED = ("send", "purchase", "delete", "account-change", "booking")
+NEVER_GATED = ("send", "purchase", "delete", "account-change", "booking", "phishing")
 # pstack principle names; a P fail must name one.
 PRINCIPLE_NAMES = (
     "principle-attack-the-premise", "principle-boundary-discipline", "principle-build-the-lever",
@@ -474,12 +479,12 @@ def load_seats() -> list[dict] | None:
     return [s for s in seats if isinstance(s, dict) and family_of(s.get("family"))]
 
 
-def pick_reviewers(builder: str | None) -> tuple[list[dict | None] | None, str]:
+def pick_reviewers(builder: str | None) -> tuple[list[dict] | None, str]:
     """Judge seats, or None with the reason to hold."""
     seats = load_seats()
     if builder is not None:
         if seats is None:
-            return [None], f"one judge outside {builder} (judge-ask picks the seat)"
+            return None, "judge family unverified: no seat record"
         for s in seats:
             if family_of(s["family"]) != builder and not is_opus(s):
                 return [s], f"one judge outside {builder}: {family_of(s['family'])}"
@@ -565,10 +570,11 @@ def judge_letters(raw: dict | None, err: str, subject: dict) -> dict:
                 out[k] = letter("fail", f"judge call {call}: fail at {conf:.2f}, breaks {p}")
             else:
                 out[k] = letter("unknown", f"judge call {call}: P fail names no principle from the list")
-        elif k == "E" and choice == "pass" and "cites" in a:
+        elif k == "E" and choice == "pass":
             ev = subject.get("evidence") or []
-            if a["cites"] in ev:
-                out[k] = letter("pass", f"judge call {call}: pass at {conf:.2f}, cites {a['cites']}")
+            cites = a.get("cites")
+            if isinstance(cites, str) and cites in ev:
+                out[k] = letter("pass", f"judge call {call}: pass at {conf:.2f}, cites {cites}")
             else:
                 out[k] = letter("unknown", f"judge call {call}: E pass cites no evidence item")
         else:
@@ -576,18 +582,21 @@ def judge_letters(raw: dict | None, err: str, subject: dict) -> dict:
     return out
 
 
-def one_reviewer(subject: dict, nodiff: bool, builder: str | None, seat: dict | None) -> tuple[dict, int]:
+def one_reviewer(subject: dict, nodiff: bool, builder: str | None, seat: dict) -> tuple[dict, int]:
+    """One judge on one seat. The seat record names the family; the reply's family is only logged."""
     req = judge_request(subject, nodiff, builder, seat)
+    fam = family_of(seat.get("family"))
 
     def call() -> dict:
         raw, err = ask_judge(req)
         got = judge_letters(raw, err, subject)
-        fam = family_of(seat.get("family")) if seat else (family_of(raw.get("family")) if raw else None)
+        reported = family_of(raw.get("family")) if raw else None
+        if raw is not None and reported and reported != fam:
+            why = f"judge family mismatch: seat {fam}, judge reported {reported}"
+            return {k: letter("unknown", why) for k in ("E", "P")}
         if raw is not None and builder is not None and fam == builder:
             return {k: letter("fail", f"judge same family as builder ({builder})") for k in ("E", "P")}
-        if raw is not None and seat is None and fam is None:
-            return {k: letter("unknown", "judge family unknown: the judge named no seat family") for k in ("E", "P")}
-        tag = f" [{fam}]" if fam else ""
+        tag = f" [seat {fam}" + (f", reported {reported}]" if reported else ", no self-report]")
         return {k: letter(v["verdict"], v["evidence"] + tag) for k, v in got.items()}
 
     got = call()
