@@ -2,6 +2,7 @@
 """true-check: deterministic T, R, U; one other-family judge for E and P; Jev log-only; fail closed."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -65,6 +66,13 @@ def subject(**over):
          "force_push": False, "evidence": ["tests/test_parse.py"], "builder": {"run_id": "r1"}}
     s.update(over)
     return s
+
+
+def with_conditions(row):
+    """A ledger row with an empty conditions object unless it names its own (or opts out with None)."""
+    if not isinstance(row, dict) or "conditions" in row:
+        return {k: v for k, v in row.items() if v is not None} if isinstance(row, dict) else row
+    return {**row, "conditions": {}}
 
 
 class Base(unittest.TestCase):
@@ -310,7 +318,7 @@ class Actions(Base):
         self.rows([])
 
     def rows(self, rows):
-        self.ledger.write_text(json.dumps({"gates": rows}))
+        self.ledger.write_text(json.dumps({"gates": [with_conditions(r) for r in rows]}))
 
     def act(self, **over):
         rc, out, _ = self.run_eval(subject(**over))
@@ -580,7 +588,7 @@ class Gaps(Base):
         self.rows([])
 
     def rows(self, rows, **extra):
-        self.ledger.write_text(json.dumps({"gates": rows, **extra}))
+        self.ledger.write_text(json.dumps({"gates": [with_conditions(r) for r in rows], **extra}))
 
     def tc(self, *args):
         return subprocess.run(["python3", str(BIN), *args], text=True, capture_output=True, env=self.env)
@@ -776,18 +784,22 @@ class Gaps(Base):
 
     # G5
     ROW = {"id": "g-a", "actions": ["reply"], "repos": ["rymiwe/*"], "status": "approved", "owner": "Code Cole",
-           "scope": "reply | on rymiwe", "ryan_pick": "t1u", "verdict": "paul/v.md", "date": "2026-11-24"}
+           "scope": "reply | on rymiwe", "ryan_pick": "t1u", "verdict": "paul/v.md", "date": "2026-11-24",
+           "conditions": {}, "notes": "active (verified) [cutover note]"}
 
     def test_ledger_render_matches_golden(self):
-        rows = [self.ROW, {**self.ROW, "id": "g-b", "status": "pending proof", "actions": ["approve", "reply"]}]
+        rows = [self.ROW, {**self.ROW, "id": "g-b", "status": "pending proof", "actions": ["approve", "reply"],
+                           "conditions": {"reviewers": 0, "draft": True}}]
         self.rows(rows, preamble=["# Autonomy gates", ""])
         cp = self.tc("ledger-render")
         golden = ("<!-- generated from gate-ledger.json by true-check ledger-render; do not edit -->\n"
                   "# Autonomy gates\n\n"
-                  "| id | date | Ryan pick | scope | owner | verdict | status | actions | repos |\n"
-                  "|---|---|---|---|---|---|---|---|---|\n"
-                  "| g-a | 2026-11-24 | t1u | reply \\| on rymiwe | Code Cole | paul/v.md | approved | reply | rymiwe/* |\n"
-                  "| g-b | 2026-11-24 | t1u | reply \\| on rymiwe | Code Cole | paul/v.md | pending proof | approve, reply | rymiwe/* |\n")
+                  "| id | date | Ryan pick | scope | owner | verdict | status | actions | repos | conditions | notes |\n"
+                  "|---|---|---|---|---|---|---|---|---|---|---|\n"
+                  "| g-a | 2026-11-24 | t1u | reply \\| on rymiwe | Code Cole | paul/v.md | approved | reply | rymiwe/* "
+                  "|  | active (verified) [cutover note] |\n"
+                  "| g-b | 2026-11-24 | t1u | reply \\| on rymiwe | Code Cole | paul/v.md | pending proof | approve, reply "
+                  "| rymiwe/* | {\"draft\": true, \"reviewers\": 0} | active (verified) [cutover note] |\n")
         self.assertEqual((cp.returncode, cp.stdout), (0, golden))
 
     def test_ledger_check_catches_a_hand_edit(self):
@@ -801,10 +813,9 @@ class Gaps(Base):
         self.assertIn("LEDGER DRIFT", cp.stdout)
 
     def test_ledger_render_needs_every_field_and_renders_a_send_row(self):
-        bad = dict(self.ROW)
-        del bad["owner"]
-        self.rows([bad])
-        self.assertEqual(self.tc("ledger-render").returncode, 3)
+        for field in ("owner", "notes", "conditions"):
+            self.rows([{**self.ROW, field: None}])
+            self.assertEqual(self.tc("ledger-render").returncode, 3, field)
         self.rows([{**self.ROW, "actions": ["send"]}])
         self.assertEqual(self.tc("ledger-render").returncode, 0)
         rc, out, _ = self.run_eval(subject(action="reply", gate="g-a", repo="rymiwe/guild", pr=pr()))
@@ -817,6 +828,147 @@ class Gaps(Base):
                          "subject_sha256"} <= set(out))
         self.assertEqual(self.tc("eval").returncode, 3)
         self.assertEqual(self.tc("ledger-check").returncode, 3)
+
+
+class Conditions(Base):
+    """Paul's 2026-11-24 ledger-fill audit: an approved row is not a blanket grant (P1, P4, P5, P6)."""
+
+    REPO = "example/app"
+
+    def setUp(self):
+        super().setUp()
+        self.ledger = self.tmp / "ledger.json"
+        self.env["GUILD_GATE_LEDGER"] = str(self.ledger)
+        remotes = self.tmp / "remotes"
+        bare = remotes / "example" / "app.git"
+        bare.parent.mkdir(parents=True)
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"]
+        subprocess.run([*git, "init", "-q", "--bare", str(bare)], check=True)
+        work = self.tmp / "seed"
+        subprocess.run([*git, "init", "-q", str(work)], check=True)
+        subprocess.run([*git, "-C", str(work), "commit", "-q", "--allow-empty", "-m", "seed"], check=True)
+        for ref in ("main", "rymiwe/old"):
+            subprocess.run([*git, "-C", str(work), "push", "-q", str(bare), f"HEAD:refs/heads/{ref}"], check=True)
+        self.env["TRUE_CHECK_REMOTE_BASE"] = "file://" + str(remotes) + "/"
+
+    def row(self, actions, conditions, gate="g"):
+        self.ledger.write_text(json.dumps({"gates": [{"id": gate, "actions": actions, "repos": ["example/*"],
+                                                      "status": "approved", "conditions": conditions}]}))
+
+    def act(self, **over):
+        rc, out, _ = self.run_eval(subject(gate="g", repo=self.REPO, **over))
+        return rc, out["allowed"], out["allow_reason"]
+
+    DRAFT = {"draft": True, "reviewers": 0, "assignees": 0, "force_push": False}
+    PUSH = {"branch_new": True, "branch_prefix": "rymiwe/", "force_push": False}
+
+    def record(self, subj, gate, verdict="PASS", sha=None):
+        bare = {k: v for k, v in subj.items() if k != "gate_passes"}
+        f = Path(tempfile.mkstemp(dir=self.tmp, prefix=f"pass-{gate}-", suffix=".json")[1])
+        f.write_text(json.dumps({"gate": gate, "verdict": verdict, "subject_sha256":
+                                 sha or hashlib.sha256(json.dumps(bare, sort_keys=True).encode()).hexdigest()}))
+        return [{"gate": gate, "record": str(f)}]
+
+    # 1. conditions are read; an unknown key holds
+    def test_unknown_condition_key_holds(self):
+        self.row(["open-pr"], {**self.DRAFT, "max_per_day": 6})
+        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
+        self.assertEqual((rc, ok), (11, False))
+        self.assertIn("unknown condition max_per_day", why)
+
+    def test_approved_row_needs_a_conditions_object(self):
+        self.ledger.write_text(json.dumps({"gates": [{"id": "g", "actions": ["open-pr"], "repos": ["example/*"],
+                                                      "status": "approved"}]}))
+        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
+        self.assertEqual((rc, ok), (11, False))
+        self.assertIn("no conditions object", why)
+
+    # 3. open-pr: draft only, no reviewers (P5, P6); mark-ready stays unknown
+    def test_p5_open_pr_without_draft_field_holds(self):
+        self.row(["open-pr"], self.DRAFT)
+        rc, ok, why = self.act(action="open-pr")
+        self.assertEqual((rc, ok, why), (11, False, "gate row g needs draft: true"))
+
+    def test_p6_open_pr_not_draft_or_with_reviewers_holds(self):
+        self.row(["open-pr"], self.DRAFT)
+        rc, ok, why = self.act(action="open-pr", draft=False, reviewers=["someone"], assignees=[])
+        self.assertEqual((rc, ok, why), (11, False, "gate row g needs draft: true"))
+        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=["someone"], assignees=[])
+        self.assertEqual((rc, ok, why), (11, False, "gate row g allows at most 0 reviewers, subject has 1"))
+        rc, ok, why = self.act(action="open-pr", draft=True, assignees=[])
+        self.assertIn("needs reviewers as a list", why)
+
+    def test_draft_open_pr_meeting_every_condition_is_allowed(self):
+        self.row(["open-pr"], self.DRAFT)
+        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
+        self.assertEqual((rc, ok), (0, True), why)
+
+    def test_mark_ready_stays_unknown(self):
+        self.row(["open-pr", "ready", "mark-ready"], self.DRAFT)
+        for action in ("ready", "mark-ready"):
+            rc, ok, why = self.act(action=action, draft=False)
+            self.assertEqual((rc, ok, why), (11, False, f"unknown action {action!r}"))
+        self.assertEqual(self.calls(), 0)
+
+    # 4. push: new branch by remote read-back, rymiwe/ prefix, no force (P4)
+    def test_p4_push_without_branch_holds(self):
+        self.row(["push"], self.PUSH)
+        rc, ok, why = self.act(action="push")
+        self.assertEqual((rc, ok, why), (11, False, "gate row g needs branch"))
+
+    def test_push_branch_rules(self):
+        self.row(["push"], self.PUSH)
+        cases = {"main": "needs a branch starting rymiwe/",
+                 "rymiwe/old": "needs a new branch; remote already has rymiwe/old",
+                 "-rymiwe/x": "needs branch"}
+        for branch, want in cases.items():
+            rc, ok, why = self.act(action="push", branch=branch)
+            self.assertEqual((rc, ok), (11, False), branch)
+            self.assertIn(want, why, branch)
+        rc, ok, why = self.act(action="push", branch="rymiwe/new-fix", force_push=True)
+        self.assertEqual((rc, ok), (11, False))
+        rc, ok, why = self.act(action="push", branch="rymiwe/new-fix")
+        self.assertEqual((rc, ok), (0, True), why)
+
+    def test_push_read_back_failure_holds(self):
+        self.row(["push"], self.PUSH)
+        self.env["TRUE_CHECK_REMOTE_BASE"] = "file://" + str(self.tmp / "no-such-remotes") + "/"
+        rc, ok, why = self.act(action="push", branch="rymiwe/new-fix")
+        self.assertEqual((rc, ok, why), (11, False, "gate row g: remote read-back of rymiwe/new-fix failed"))
+
+    def test_push_conditions_do_not_bind_open_pr_and_back(self):
+        self.row(["push", "open-pr"], {**self.PUSH, **self.DRAFT})
+        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
+        self.assertEqual((rc, ok), (0, True), why)
+        rc, ok, why = self.act(action="push", branch="rymiwe/new-fix")
+        self.assertEqual((rc, ok), (0, True), why)
+
+    # 5. enforced_by: the caller's own gate PASS for this subject (P1)
+    def test_p1_approve_without_caller_gate_pass_holds(self):
+        self.row(["approve"], {"enforced_by": ["approve-gate"]})
+        rc, ok, why = self.act(action="approve", pr=pr())
+        self.assertEqual((rc, ok, why), (11, False, "gate row g: enforced_by approve-gate: no gate_passes record"))
+
+    def test_enforced_by_record_must_be_a_pass_for_this_subject(self):
+        self.row(["approve"], {"enforced_by": ["approve-gate"]})
+        subj = subject(action="approve", gate="g", repo=self.REPO, pr=pr())
+        for passes, want in ((self.record(subj, "approve-gate", verdict="FAIL"), "not a PASS"),
+                             (self.record(subj, "other-gate"), "no gate_passes record"),
+                             (self.record(subj, "approve-gate", sha="0" * 64), "another subject"),
+                             ([{"gate": "approve-gate", "record": str(self.tmp / "nope.json")}], "unreadable")):
+            rc, out, _ = self.run_eval({**subj, "gate_passes": passes})
+            self.assertEqual((rc, out["allowed"]), (11, False), want)
+            self.assertIn(want, out["allow_reason"])
+        rc, out, _ = self.run_eval({**subj, "gate_passes": self.record(subj, "approve-gate")})
+        self.assertEqual((rc, out["allowed"]), (0, True), out["allow_reason"])
+
+    # 7. a judge family mismatch is a hard fail with no retry
+    def test_judge_family_mismatch_is_a_hard_fail_without_retry(self):
+        self.answers([jev(family="claude"), jev()])
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual((rc, out["letters"]["E"]["verdict"], out["letters"]["P"]["verdict"]), (11, "fail", "fail"))
+        self.assertEqual((out["judge_calls"], self.calls()), (1, 1))
+        self.assertIn("judge family mismatch: seat gpt, judge reported claude", out["letters"]["E"]["evidence"])
 
 
 if __name__ == "__main__":

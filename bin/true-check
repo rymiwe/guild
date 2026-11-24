@@ -35,9 +35,24 @@ an unlisted owner or an unreadable config proves nothing, so it holds). Every
 other type also needs subject.gate to name an approved row in the gate ledger
 that covers the action and repo ("*" for a type with no repo):
   {"gates": [{"id": "...", "actions": ["reply"], "repos": ["owner/name" | "owner/*" | "*"],
-              "status": "approved", "owner": "...", "scope": "...",
-              "ryan_pick": "...", "verdict": "...", "date": "YYYY-MM-DD"}]}
-allow reads id, actions, repos and status; ledger-render needs all nine.
+              "status": "approved", "conditions": {...}, "notes": "...", "owner": "...",
+              "scope": "...", "ryan_pick": "...", "verdict": "...", "date": "YYYY-MM-DD"}]}
+allow reads id, actions, repos, status and conditions; ledger-render needs all
+eleven. An approved row must carry a conditions object ({} for none). Each
+condition binds only the actions named here; an unknown key holds the row:
+  draft: true          open-pr needs subject.draft true
+  reviewers: N         open-pr needs subject.reviewers as a list of at most N
+  assignees: N         open-pr needs subject.assignees as a list of at most N
+  force_push: false    push and open-pr need subject.force_push false
+  branch_prefix: "p/"  push needs subject.branch to start with p/
+  branch_new: true     push needs a remote read-back (git ls-remote of the
+                       repo; $TRUE_CHECK_REMOTE_BASE, default https://github.com/)
+                       that shows subject.branch does not exist yet
+  enforced_by: [gate]  every action needs subject.gate_passes [{gate, record}],
+                       record a file {"gate", "verdict": "PASS", "subject_sha256"}
+                       whose sha is of the subject without gate_passes
+notes is prose (the status trail); it is rendered, never read. Marking a PR
+ready has no action type, so it holds as unknown.
 The ledger is $GUILD_GATE_LEDGER or ~/.config/guild/gate-ledger.json.
 
 Letters, diff types:
@@ -583,7 +598,7 @@ def judge_letters(raw: dict | None, err: str, subject: dict) -> dict:
 
 
 def one_reviewer(subject: dict, nodiff: bool, builder: str | None, seat: dict) -> tuple[dict, int]:
-    """One judge on one seat. The seat record names the family; the reply's family is only logged."""
+    """One judge on one seat. The seat record names the family; a reply naming another family fails."""
     req = judge_request(subject, nodiff, builder, seat)
     fam = family_of(seat.get("family"))
 
@@ -592,8 +607,9 @@ def one_reviewer(subject: dict, nodiff: bool, builder: str | None, seat: dict) -
         got = judge_letters(raw, err, subject)
         reported = family_of(raw.get("family")) if raw else None
         if raw is not None and reported and reported != fam:
+            # A judge that is not the seat it was sent to is a hard fail: no retry.
             why = f"judge family mismatch: seat {fam}, judge reported {reported}"
-            return {k: letter("unknown", why) for k in ("E", "P")}
+            return {k: letter("fail", why) for k in ("E", "P")}
         if raw is not None and builder is not None and fam == builder:
             return {k: letter("fail", f"judge same family as builder ({builder})") for k in ("E", "P")}
         tag = f" [seat {fam}" + (f", reported {reported}]" if reported else ", no self-report]")
@@ -773,6 +789,121 @@ def ledger_path() -> str:
     return os.environ.get("GUILD_GATE_LEDGER") or os.path.expanduser("~/.config/guild/gate-ledger.json")
 
 
+# Row conditions true-check reads. Each applies to the listed actions only; an
+# unknown key holds every action of the row.
+CONDITION_ACTIONS = {
+    "draft": ("open-pr",),
+    "reviewers": ("open-pr",),
+    "assignees": ("open-pr",),
+    "branch_new": ("push",),
+    "branch_prefix": ("push",),
+    "force_push": ("push", "open-pr"),
+    "enforced_by": None,  # every action of the row
+}
+BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+
+
+def remote_url(repo: str) -> str:
+    base = os.environ.get("TRUE_CHECK_REMOTE_BASE") or "https://github.com/"
+    return base + repo + ".git"
+
+
+def remote_has_branch(repo: str, branch: str) -> bool | None:
+    """Read back the remote: True if the branch exists there, False if not, None if unknown."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        cp = subprocess.run(["git", "ls-remote", "--exit-code", "--heads", remote_url(repo), "refs/heads/" + branch],
+                            text=True, capture_output=True, timeout=20, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if cp.returncode == 2:
+        return False
+    if cp.returncode == 0 and cp.stdout.strip():
+        return True
+    return None
+
+
+def gate_pass_ok(subject: dict, gate: str) -> str | None:
+    """None when subject.gate_passes holds a readable PASS record from GATE for this subject."""
+    want = subject_sha({k: v for k, v in subject.items() if k != "gate_passes"})
+    passes = subject.get("gate_passes")
+    if not isinstance(passes, list):
+        return f"enforced_by {gate}: no gate_passes record"
+    for item in passes:
+        if not (isinstance(item, dict) and item.get("gate") == gate and isinstance(item.get("record"), str)):
+            continue
+        try:
+            with open(item["record"]) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            return f"enforced_by {gate}: record unreadable"
+        if not isinstance(rec, dict) or rec.get("gate") != gate or rec.get("verdict") != "PASS":
+            return f"enforced_by {gate}: record is not a PASS from {gate}"
+        if rec.get("subject_sha256") != want:
+            return f"enforced_by {gate}: record is for another subject"
+        return None
+    return f"enforced_by {gate}: no gate_passes record"
+
+
+def conditions_hold(subject: dict, gate: str, conds) -> str | None:
+    """None when every condition of the row that applies to this action is met; else why it holds."""
+    if not isinstance(conds, dict):
+        return f"gate row {gate} is malformed: conditions must be an object"
+    unknown = sorted(k for k in conds if k not in CONDITION_ACTIONS)
+    if unknown:
+        return f"gate row {gate} has unknown condition {unknown[0]}"
+    action = subject["action"]
+    applies = lambda k: k in conds and (CONDITION_ACTIONS[k] is None or action in CONDITION_ACTIONS[k])
+    if applies("draft"):
+        if conds["draft"] is not True:
+            return f"gate row {gate}: condition draft must be true"
+        if subject.get("draft") is not True:
+            return f"gate row {gate} needs draft: true"
+    for k in ("reviewers", "assignees"):
+        if applies(k):
+            cap = conds[k]
+            if not (isinstance(cap, int) and not isinstance(cap, bool) and cap >= 0):
+                return f"gate row {gate}: condition {k} must be a count"
+            got = subject.get(k)
+            if not isinstance(got, list):
+                return f"gate row {gate} needs {k} as a list (at most {cap})"
+            if len(got) > cap:
+                return f"gate row {gate} allows at most {cap} {k}, subject has {len(got)}"
+    if applies("force_push"):
+        if conds["force_push"] is not False:
+            return f"gate row {gate}: condition force_push must be false"
+        if subject.get("force_push") is not False:
+            return f"gate row {gate} needs force_push: false"
+    if applies("branch_prefix") or applies("branch_new"):
+        branch = subject.get("branch")
+        if not (isinstance(branch, str) and BRANCH_RE.fullmatch(branch) and ".." not in branch):
+            return f"gate row {gate} needs branch"
+        if applies("branch_prefix"):
+            pre = conds["branch_prefix"]
+            if not (isinstance(pre, str) and pre):
+                return f"gate row {gate}: condition branch_prefix must be a string"
+            if not branch.startswith(pre):
+                return f"gate row {gate} needs a branch starting {pre}, got {branch}"
+        if applies("branch_new"):
+            if conds["branch_new"] is not True:
+                return f"gate row {gate}: condition branch_new must be true"
+            there = remote_has_branch(subject["repo"], branch)
+            if there is None:
+                return f"gate row {gate}: remote read-back of {branch} failed"
+            if there:
+                return f"gate row {gate} needs a new branch; remote already has {branch}"
+    if applies("enforced_by"):
+        gates = conds["enforced_by"]
+        if not (isinstance(gates, list) and gates and all(isinstance(g, str) and g for g in gates)):
+            return f"gate row {gate}: condition enforced_by must name caller gates"
+        for g in gates:
+            why = gate_pass_ok(subject, g)
+            if why:
+                return f"gate row {gate}: {why}"
+    return None
+
+
 def ledger_row(subject: dict, repo: str) -> tuple[bool, str]:
     gate = subject.get("gate")
     if not isinstance(gate, str) or not gate:
@@ -802,6 +933,11 @@ def ledger_row(subject: dict, repo: str) -> tuple[bool, str]:
         repos = [r.casefold() for r in repos]
         if not any(r == repo or r == "*" or (r.endswith("/*") and repo.startswith(r[:-1])) for r in repos):
             return False, f"gate row {gate} does not cover {repo}"
+        if "conditions" not in row:
+            return False, f"gate row {gate} is malformed: no conditions object"
+        why = conditions_hold(subject, gate, row["conditions"])
+        if why:
+            return False, why
         return True, f"gate row {gate} approves {subject['action']} on {repo}"
     return False, f"no gate row {gate} in the ledger"
 
@@ -874,12 +1010,16 @@ def evaluate(subject: dict, jev: bool = True) -> dict:
 
 
 # ---------------- gate ledger rendering ----------------
-LEDGER_FIELDS = ("id", "actions", "repos", "status", "owner", "scope", "ryan_pick", "verdict", "date")
+LEDGER_FIELDS = ("id", "actions", "repos", "status", "owner", "scope", "ryan_pick", "verdict", "date",
+                 "conditions", "notes")
 LEDGER_HEADER = "<!-- generated from gate-ledger.json by true-check ledger-render; do not edit -->"
 
 
 def cell(v) -> str:
-    s = ", ".join(v) if isinstance(v, list) else str(v)
+    if isinstance(v, dict):
+        s = json.dumps(v, sort_keys=True, ensure_ascii=False) if v else ""
+    else:
+        s = ", ".join(v) if isinstance(v, list) else str(v)
     return s.replace("\n", " ").replace("|", "\\|")
 
 
@@ -894,14 +1034,15 @@ def ledger_render() -> str:
     if not (isinstance(pre, list) and all(isinstance(x, str) for x in pre)):
         raise Usage(f"{path}: preamble must be a list of lines")
     out += pre
-    out += ["| id | date | Ryan pick | scope | owner | verdict | status | actions | repos |",
-            "|---|---|---|---|---|---|---|---|---|"]
+    out += ["| id | date | Ryan pick | scope | owner | verdict | status | actions | repos | conditions | notes |",
+            "|---|---|---|---|---|---|---|---|---|---|---|"]
     for i, row in enumerate(rows):
         miss = [f for f in LEDGER_FIELDS if not isinstance(row, dict) or f not in row]
         if miss:
             raise Usage(f"{path}: gate row {i} lacks {', '.join(miss)}")
         out.append("| " + " | ".join(cell(row[f]) for f in
-                   ("id", "date", "ryan_pick", "scope", "owner", "verdict", "status", "actions", "repos")) + " |")
+                   ("id", "date", "ryan_pick", "scope", "owner", "verdict", "status", "actions", "repos",
+                    "conditions", "notes")) + " |")
     return "\n".join(out) + "\n"
 
 
