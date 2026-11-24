@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -92,7 +93,7 @@ class Base(unittest.TestCase):
         seats.write_text(json.dumps([{"family": "gpt", "model": "g"}, {"family": "gemini", "model": "x"}]))
         self.env = {**os.environ, "TRUE_CHECK_JUDGE": str(fake), "TRUE_CHECK_JEV_ASK": str(shadow),
                     "TRUE_CHECK_ROUTE_LOG": str(routes), "TRUE_CHECK_SEATS": str(seats),
-                    "FAKE_JEV_DIR": str(self.tmp)}
+                    "FAKE_JEV_DIR": str(self.tmp), "GUILD_GATE_PASSES": str(self.tmp / "passes")}
         for k in ("TRUE_CHECK_DEFAULT_FAMILY", "GUILD_GATE_LEDGER"):
             self.env.pop(k, None)
         self.answers([jev()])
@@ -862,12 +863,18 @@ class Conditions(Base):
     DRAFT = {"draft": True, "reviewers": 0, "assignees": 0, "force_push": False}
     PUSH = {"branch_new": True, "branch_prefix": "rymiwe/", "force_push": False}
 
-    def record(self, subj, gate, verdict="PASS", sha=None):
+    def record(self, subj, gate, verdict="PASS", sha=None, age=0, ttl=600, where=None, **extra):
+        """A PASS record as the gate would write it: in $GUILD_GATE_PASSES/<gate>/ unless WHERE says otherwise."""
         bare = {k: v for k, v in subj.items() if k != "gate_passes"}
-        f = Path(tempfile.mkstemp(dir=self.tmp, prefix=f"pass-{gate}-", suffix=".json")[1])
-        f.write_text(json.dumps({"gate": gate, "verdict": verdict, "subject_sha256":
-                                 sha or hashlib.sha256(json.dumps(bare, sort_keys=True).encode()).hexdigest()}))
-        return [{"gate": gate, "record": str(f)}]
+        d = Path(where) if where else self.tmp / "passes" / gate
+        d.mkdir(parents=True, exist_ok=True)
+        d.chmod(0o755)
+        f = Path(tempfile.mkstemp(dir=d, prefix="pass-", suffix=".json")[1])
+        ts = time.time() - age
+        rec = {"gate": gate, "verdict": verdict, "ts": ts, "expires_at": ts + ttl, "subject_sha256":
+               sha or hashlib.sha256(json.dumps(bare, sort_keys=True).encode()).hexdigest(), **extra}
+        f.write_text(json.dumps({k: v for k, v in rec.items() if v is not None}))
+        return f
 
     # 1. conditions are read; an unknown key holds
     def test_unknown_condition_key_holds(self):
@@ -876,14 +883,18 @@ class Conditions(Base):
         self.assertEqual((rc, ok), (11, False))
         self.assertIn("unknown condition max_per_day", why)
 
-    def test_conditions_must_be_an_object_and_absent_means_none(self):
+    def test_conditions_are_mandatory_and_must_be_an_object(self):
         self.row(["open-pr"], ["draft"])
         rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
         self.assertEqual((rc, ok, why), (11, False, "gate row g is malformed: conditions must be an object"))
         self.ledger.write_text(json.dumps({"gates": [{"id": "g", "actions": ["open-pr"], "repos": ["example/*"],
                                                       "status": "approved"}]}))
         rc, ok, why = self.act(action="open-pr")
-        self.assertEqual((rc, ok), (0, True), "no conditions key: the row alone grants, as before")
+        self.assertEqual((rc, ok), (11, False), "no conditions key holds")
+        self.assertIn("no conditions object", why)
+        self.row(["open-pr"], {})
+        rc, ok, why = self.act(action="open-pr")
+        self.assertEqual((rc, ok), (0, True), "{} means no conditions")
 
     # 3. open-pr: draft only, no reviewers (P5, P6); mark-ready stays unknown
     def test_p5_open_pr_without_draft_field_holds(self):
@@ -940,29 +951,82 @@ class Conditions(Base):
 
     def test_push_conditions_do_not_bind_open_pr_and_back(self):
         self.row(["push", "open-pr"], {**self.PUSH, **self.DRAFT})
-        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
-        self.assertEqual((rc, ok), (0, True), why)
+        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[], branch="rymiwe/old")
+        self.assertEqual((rc, ok), (0, True), "branch_new binds push only: " + why)
         rc, ok, why = self.act(action="push", branch="rymiwe/new-fix")
+        self.assertEqual((rc, ok), (0, True), why)
+
+    def test_branch_prefix_binds_open_pr_head_branch(self):
+        self.row(["open-pr"], {**self.DRAFT, "branch_prefix": "rymiwe/"})
+        ok_pr = dict(draft=True, reviewers=[], assignees=[])
+        rc, ok, why = self.act(action="open-pr", **ok_pr)
+        self.assertEqual((rc, ok, why), (11, False, "gate row g needs branch"))
+        rc, ok, why = self.act(action="open-pr", branch="main", **ok_pr)
+        self.assertEqual((rc, ok, why), (11, False, "gate row g needs a branch starting rymiwe/, got main"))
+        rc, ok, why = self.act(action="open-pr", branch="rymiwe/fix", **ok_pr)
         self.assertEqual((rc, ok), (0, True), why)
 
     # 5. enforced_by: the caller's own gate PASS for this subject (P1)
     def test_p1_approve_without_caller_gate_pass_holds(self):
         self.row(["approve"], {"enforced_by": ["approve-gate"]})
         rc, ok, why = self.act(action="approve", pr=pr())
-        self.assertEqual((rc, ok, why), (11, False, "gate row g: enforced_by approve-gate: no gate_passes record"))
+        self.assertEqual((rc, ok, why), (11, False, "gate row g: enforced_by approve-gate: no PASS record"))
 
     def test_enforced_by_record_must_be_a_pass_for_this_subject(self):
         self.row(["approve"], {"enforced_by": ["approve-gate"]})
         subj = subject(action="approve", gate="g", repo=self.REPO, pr=pr())
-        for passes, want in ((self.record(subj, "approve-gate", verdict="FAIL"), "not a PASS"),
-                             (self.record(subj, "other-gate"), "no gate_passes record"),
-                             (self.record(subj, "approve-gate", sha="0" * 64), "another subject"),
-                             ([{"gate": "approve-gate", "record": str(self.tmp / "nope.json")}], "unreadable")):
-            rc, out, _ = self.run_eval({**subj, "gate_passes": passes})
-            self.assertEqual((rc, out["allowed"]), (11, False), want)
-            self.assertIn(want, out["allow_reason"])
-        rc, out, _ = self.run_eval({**subj, "gate_passes": self.record(subj, "approve-gate")})
+        for kw in (dict(verdict="FAIL"), dict(sha="0" * 64)):
+            f = self.record(subj, "approve-gate", **kw)
+            rc, out, _ = self.run_eval(subj)
+            self.assertEqual((rc, out["allow_reason"]), (11, "gate row g: enforced_by approve-gate: no PASS record"), kw)
+            f.unlink()
+        self.record(subj, "other-gate")
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual(rc, 11)
+        self.record(subj, "approve-gate")
+        rc, out, _ = self.run_eval(subj)
         self.assertEqual((rc, out["allowed"]), (0, True), out["allow_reason"])
+
+    # Paul's guild#86 audit, F1-F3
+    def test_f1_record_path_from_the_subject_is_never_read(self):
+        self.row(["approve"], {"enforced_by": ["approve-gate"]})
+        subj = subject(action="approve", gate="g", repo=self.REPO, pr=pr())
+        forged = self.record(subj, "approve-gate", where=self.tmp / "caller")
+        rc, out, _ = self.run_eval({**subj, "gate_passes": [{"gate": "approve-gate", "record": str(forged)}]})
+        self.assertEqual((rc, out["allow_reason"]), (11, "gate row g: enforced_by approve-gate: no PASS record"))
+        d = self.tmp / "passes" / "approve-gate"
+        self.record(subj, "approve-gate")
+        d.chmod(0o777)
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual(rc, 11)
+        self.assertIn("writable by others", out["allow_reason"])
+
+    def test_f2_a_record_allows_once(self):
+        self.row(["approve"], {"enforced_by": ["approve-gate"]})
+        subj = subject(action="approve", gate="g", repo=self.REPO, pr=pr())
+        self.record(subj, "approve-gate")
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual((rc, out["allowed"]), (0, True), out["allow_reason"])
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual((rc, out["allow_reason"]), (11, "gate row g: enforced_by approve-gate: record already used"))
+        self.record(subj, "approve-gate", note="a fresh PASS from the gate")
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual(rc, 0, "a new record from the gate allows once more")
+
+    def test_f3_record_needs_ts_and_a_short_unexpired_life(self):
+        self.row(["approve"], {"enforced_by": ["approve-gate"]})
+        subj = subject(action="approve", gate="g", repo=self.REPO, pr=pr())
+        cases = ((dict(age=3600, ttl=600), "record expired"),
+                 (dict(ttl=16 * 60), "expiry of 15 minutes or less"),
+                 (dict(ts=None), "needs ts"),
+                 (dict(ts="2026-11-01T00:00:00", expires_at="2026-11-01T00:10:00"), "needs ts"),
+                 (dict(ts="2026-11-01T00:00:00-08:00", expires_at="2026-11-01T00:10:00-08:00"), "record expired"))
+        for kw, want in cases:
+            f = self.record(subj, "approve-gate", **kw)
+            rc, out, _ = self.run_eval(subj)
+            self.assertEqual((rc, out["allowed"]), (11, False), kw)
+            self.assertIn(want, out["allow_reason"], kw)
+            f.unlink()
 
     # 7. a judge family mismatch is a hard fail with no retry
     def test_judge_family_mismatch_is_a_hard_fail_without_retry(self):

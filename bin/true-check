@@ -38,20 +38,27 @@ that covers the action and repo ("*" for a type with no repo):
               "status": "approved", "conditions": {...}, "notes": "...", "owner": "...",
               "scope": "...", "ryan_pick": "...", "verdict": "...", "date": "YYYY-MM-DD"}]}
 allow reads id, actions, repos, status and conditions; ledger-render needs all
-eleven. A row with no conditions key has none (the row is the whole grant), so
-flip a row to approved only with its conditions in place. Each condition binds
-only the actions named here; an unknown key or a non-object holds the row:
+eleven. conditions is mandatory: a row without the key holds, and {} means
+none. Each condition binds only the actions named here; an unknown key or a
+non-object holds the row:
   draft: true          open-pr needs subject.draft true
   reviewers: N         open-pr needs subject.reviewers as a list of at most N
   assignees: N         open-pr needs subject.assignees as a list of at most N
   force_push: false    push and open-pr need subject.force_push false
-  branch_prefix: "p/"  push needs subject.branch to start with p/
+  branch_prefix: "p/"  push and open-pr need subject.branch (the pushed or head
+                       branch) to start with p/
   branch_new: true     push needs a remote read-back (git ls-remote of the
                        repo; $TRUE_CHECK_REMOTE_BASE, default https://github.com/)
                        that shows subject.branch does not exist yet
-  enforced_by: [gate]  every action needs subject.gate_passes [{gate, record}],
-                       record a file {"gate", "verdict": "PASS", "subject_sha256"}
-                       whose sha is of the subject without gate_passes
+  enforced_by: [gate]  every action needs a PASS record that the gate itself
+                       wrote under $GUILD_GATE_PASSES/<gate>/ (default
+                       ~/.local/state/guild/gate-passes; never a path from the
+                       subject; the dir must not be a link or group/other
+                       writable): {"gate", "verdict": "PASS", "subject_sha256",
+                       "ts", "expires_at"}, the sha of the subject without
+                       gate_passes, expiring at most 15 minutes after ts. A
+                       record allows once: its sha goes to consumed.log there,
+                       and reuse holds (verify consumes too).
 notes is prose (the status trail); it is rendered, never read. Marking a PR
 ready has no action type, so it holds as unknown.
 The ledger is $GUILD_GATE_LEDGER or ~/.config/guild/gate-ledger.json.
@@ -143,6 +150,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 MAX_FILES = 3   # changed files outside tests
 MAX_LINES = 80  # added + deleted lines outside tests
@@ -797,7 +805,7 @@ CONDITION_ACTIONS = {
     "reviewers": ("open-pr",),
     "assignees": ("open-pr",),
     "branch_new": ("push",),
-    "branch_prefix": ("push",),
+    "branch_prefix": ("push", "open-pr"),
     "force_push": ("push", "open-pr"),
     "enforced_by": None,  # every action of the row
 }
@@ -825,84 +833,174 @@ def remote_has_branch(repo: str, branch: str) -> bool | None:
     return None
 
 
-def gate_pass_ok(subject: dict, gate: str) -> str | None:
-    """None when subject.gate_passes holds a readable PASS record from GATE for this subject."""
+GATE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+PASS_TTL_MAX = 15 * 60  # a gate PASS record may live at most 15 minutes
+CLOCK_SKEW = 60
+
+
+def passes_dir() -> str:
+    """Where caller gates write PASS records; set by the gate's environment, never by the subject."""
+    return os.environ.get("GUILD_GATE_PASSES") or os.path.expanduser("~/.local/state/guild/gate-passes")
+
+
+def when(v) -> float | None:
+    """Epoch seconds from a number or an ISO 8601 time with a zone; None otherwise."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            import datetime
+            t = datetime.datetime.fromisoformat(v)
+        except ValueError:
+            return None
+        return t.timestamp() if t.tzinfo else None
+    return None
+
+
+def consumed_log() -> str:
+    return os.path.join(passes_dir(), "consumed.log")
+
+
+def consumed() -> set[str]:
+    try:
+        with open(consumed_log()) as fh:
+            return {line.split()[0] for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+
+def gate_pass(subject: dict, gate: str) -> tuple[str | None, str | None]:
+    """(None, record sha) for an unused, unexpired PASS from GATE for this subject; else (why, None).
+
+    Records are read only from passes_dir()/GATE/*.json. subject.gate_passes is never read.
+    A record is {"gate", "verdict": "PASS", "subject_sha256", "ts", "expires_at"}, where the
+    sha is of the subject without gate_passes and expires_at is at most 15 minutes after ts.
+    """
+    if not GATE_NAME.fullmatch(gate):
+        return f"enforced_by {gate}: not a gate name", None
+    d = os.path.join(passes_dir(), gate)
+    try:
+        st = os.lstat(d)
+        names = sorted(os.listdir(d))
+    except OSError:
+        return f"enforced_by {gate}: no PASS record", None
+    import stat
+    if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o022:
+        return f"enforced_by {gate}: record dir is a link or writable by others", None
     want = subject_sha({k: v for k, v in subject.items() if k != "gate_passes"})
-    passes = subject.get("gate_passes")
-    if not isinstance(passes, list):
-        return f"enforced_by {gate}: no gate_passes record"
-    for item in passes:
-        if not (isinstance(item, dict) and item.get("gate") == gate and isinstance(item.get("record"), str)):
+    used, now, why = consumed(), time.time(), f"enforced_by {gate}: no PASS record"
+    for name in names:
+        f = os.path.join(d, name)
+        if not name.endswith(".json") or os.path.islink(f):
             continue
         try:
-            with open(item["record"]) as fh:
-                rec = json.load(fh)
+            with open(f, "rb") as fh:
+                raw = fh.read()
+            rec = json.loads(raw)
         except (OSError, ValueError):
-            return f"enforced_by {gate}: record unreadable"
-        if not isinstance(rec, dict) or rec.get("gate") != gate or rec.get("verdict") != "PASS":
-            return f"enforced_by {gate}: record is not a PASS from {gate}"
-        if rec.get("subject_sha256") != want:
-            return f"enforced_by {gate}: record is for another subject"
+            continue
+        if not (isinstance(rec, dict) and rec.get("gate") == gate and rec.get("verdict") == "PASS"
+                and rec.get("subject_sha256") == want):
+            continue
+        ts, exp = when(rec.get("ts")), when(rec.get("expires_at"))
+        if ts is None or exp is None or not 0 < exp - ts <= PASS_TTL_MAX:
+            why = f"enforced_by {gate}: record needs ts and an expiry of 15 minutes or less"
+            continue
+        if ts > now + CLOCK_SKEW or now >= exp:
+            why = f"enforced_by {gate}: record expired"
+            continue
+        sha = hashlib.sha256(raw).hexdigest()
+        if sha in used:
+            why = f"enforced_by {gate}: record already used"
+            continue
+        return None, sha
+    return why, None
+
+
+def consume(shas: list[str]) -> str | None:
+    """Mark PASS records used, once each. None on success; why it holds if one was used meanwhile."""
+    if not shas:
         return None
-    return f"enforced_by {gate}: no gate_passes record"
+    import fcntl
+    try:
+        os.makedirs(passes_dir(), exist_ok=True)
+        with open(consumed_log(), "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            used = {line.split()[0] for line in fh if line.strip()}
+            if any(x in used for x in shas):
+                return "enforced_by: record already used"
+            fh.write("".join(f"{x} {int(time.time())}\n" for x in shas))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        return "enforced_by: cannot record the PASS as used"
+    return None
 
 
-def conditions_hold(subject: dict, gate: str, conds) -> str | None:
-    """None when every condition of the row that applies to this action is met; else why it holds."""
+def conditions_hold(subject: dict, gate: str, conds) -> tuple[str | None, list[str]]:
+    """(None, PASS record shas to consume) when every condition that applies is met; else (why, [])."""
+    why, shas = conditions_check(subject, gate, conds, [])
+    return why, (shas if why is None else [])
+
+
+def conditions_check(subject: dict, gate: str, conds, shas: list[str]) -> tuple[str | None, list[str]]:
+    hold = lambda why: (why, shas)
     if not isinstance(conds, dict):
-        return f"gate row {gate} is malformed: conditions must be an object"
+        return hold(f"gate row {gate} is malformed: conditions must be an object")
     unknown = sorted(k for k in conds if k not in CONDITION_ACTIONS)
     if unknown:
-        return f"gate row {gate} has unknown condition {unknown[0]}"
+        return hold(f"gate row {gate} has unknown condition {unknown[0]}")
     action = subject["action"]
     applies = lambda k: k in conds and (CONDITION_ACTIONS[k] is None or action in CONDITION_ACTIONS[k])
     if applies("draft"):
         if conds["draft"] is not True:
-            return f"gate row {gate}: condition draft must be true"
+            return hold(f"gate row {gate}: condition draft must be true")
         if subject.get("draft") is not True:
-            return f"gate row {gate} needs draft: true"
+            return hold(f"gate row {gate} needs draft: true")
     for k in ("reviewers", "assignees"):
         if applies(k):
             cap = conds[k]
             if not (isinstance(cap, int) and not isinstance(cap, bool) and cap >= 0):
-                return f"gate row {gate}: condition {k} must be a count"
+                return hold(f"gate row {gate}: condition {k} must be a count")
             got = subject.get(k)
             if not isinstance(got, list):
-                return f"gate row {gate} needs {k} as a list (at most {cap})"
+                return hold(f"gate row {gate} needs {k} as a list (at most {cap})")
             if len(got) > cap:
-                return f"gate row {gate} allows at most {cap} {k}, subject has {len(got)}"
+                return hold(f"gate row {gate} allows at most {cap} {k}, subject has {len(got)}")
     if applies("force_push"):
         if conds["force_push"] is not False:
-            return f"gate row {gate}: condition force_push must be false"
+            return hold(f"gate row {gate}: condition force_push must be false")
         if subject.get("force_push") is not False:
-            return f"gate row {gate} needs force_push: false"
+            return hold(f"gate row {gate} needs force_push: false")
     if applies("branch_prefix") or applies("branch_new"):
         branch = subject.get("branch")
         if not (isinstance(branch, str) and BRANCH_RE.fullmatch(branch) and ".." not in branch):
-            return f"gate row {gate} needs branch"
+            return hold(f"gate row {gate} needs branch")
         if applies("branch_prefix"):
             pre = conds["branch_prefix"]
             if not (isinstance(pre, str) and pre):
-                return f"gate row {gate}: condition branch_prefix must be a string"
+                return hold(f"gate row {gate}: condition branch_prefix must be a string")
             if not branch.startswith(pre):
-                return f"gate row {gate} needs a branch starting {pre}, got {branch}"
+                return hold(f"gate row {gate} needs a branch starting {pre}, got {branch}")
         if applies("branch_new"):
             if conds["branch_new"] is not True:
-                return f"gate row {gate}: condition branch_new must be true"
+                return hold(f"gate row {gate}: condition branch_new must be true")
             there = remote_has_branch(subject["repo"], branch)
             if there is None:
-                return f"gate row {gate}: remote read-back of {branch} failed"
+                return hold(f"gate row {gate}: remote read-back of {branch} failed")
             if there:
-                return f"gate row {gate} needs a new branch; remote already has {branch}"
+                return hold(f"gate row {gate} needs a new branch; remote already has {branch}")
     if applies("enforced_by"):
         gates = conds["enforced_by"]
         if not (isinstance(gates, list) and gates and all(isinstance(g, str) and g for g in gates)):
-            return f"gate row {gate}: condition enforced_by must name caller gates"
+            return hold(f"gate row {gate}: condition enforced_by must name caller gates")
         for g in gates:
-            why = gate_pass_ok(subject, g)
+            why, sha = gate_pass(subject, g)
             if why:
-                return f"gate row {gate}: {why}"
-    return None
+                return hold(f"gate row {gate}: {why}")
+            shas.append(sha)
+    return None, shas
 
 
 def ledger_row(subject: dict, repo: str) -> tuple[bool, str]:
@@ -934,9 +1032,13 @@ def ledger_row(subject: dict, repo: str) -> tuple[bool, str]:
         repos = [r.casefold() for r in repos]
         if not any(r == repo or r == "*" or (r.endswith("/*") and repo.startswith(r[:-1])) for r in repos):
             return False, f"gate row {gate} does not cover {repo}"
-        why = conditions_hold(subject, gate, row.get("conditions", {}))
+        if "conditions" not in row:
+            return False, f"gate row {gate} is malformed: no conditions object (conditions are mandatory; {{}} means none)"
+        why, shas = conditions_hold(subject, gate, row["conditions"])
+        if why is None:
+            why = consume(shas)
         if why:
-            return False, why
+            return False, why if why.startswith("gate row") else f"gate row {gate}: {why}"
         return True, f"gate row {gate} approves {subject['action']} on {repo}"
     return False, f"no gate row {gate} in the ledger"
 
