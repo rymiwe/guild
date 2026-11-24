@@ -1296,16 +1296,19 @@ def _job_is_busy(job_dir: Path) -> bool:
     return False
 
 
-def _prove_settled_jobs(jobs_root: Path, releases_dir: Path) -> None:
+def _prove_settled_jobs(jobs_root: Path, releases_dir: Path) -> set[Path]:
     """Run the attribution guard for a settled job that still has no pass.
 
     The guard rechecks while the repositories exist and writes the pass prune
     reads. A running job is left alone: its process already keeps the release,
-    and an early pass would not cover commits it has not made yet.
+    and an early pass would not cover commits it has not made yet. A guard
+    that exits 0 without writing a pass checked the repositories and does not
+    know this receipt yet, so prune does not hold those releases.
     """
+    cleared: set[Path] = set()
     guard = os.environ.get("GUILD_ATTRIBUTION_GUARD")
     if not guard:
-        return
+        return cleared
     for job_dir in sorted(p for p in jobs_root.iterdir() if p.is_dir()):
         baselines = list(job_dir.glob(BASELINE_GLOB))
         if not baselines or _job_is_busy(job_dir):
@@ -1321,17 +1324,20 @@ def _prove_settled_jobs(jobs_root: Path, releases_dir: Path) -> None:
             names.extend(n for n in [*repos, *(row.get("repo") for row in repos.values())] if isinstance(n, str))
         if not any(_release_of(n, releases_dir) for n in names):
             continue
-        subprocess.run([guard, "check", str(job_dir)], check=False, capture_output=True, text=True, timeout=300)
+        ran = subprocess.run([guard, "check", str(job_dir)], check=False, capture_output=True, text=True, timeout=300)
+        if ran.returncode == 0 and all(_attribution_disposition(job_dir, path) is None for path in baselines):
+            cleared.add(job_dir.resolve())
+    return cleared
 
 
 def _held_for_attribution(jobs_root: Path | None, releases_dir: Path) -> list[str]:
     """Releases a settled job's baseline names until a verified pass or failure exists."""
     if jobs_root is None or not jobs_root.is_dir():
         return []
-    _prove_settled_jobs(jobs_root, releases_dir)
+    cleared = _prove_settled_jobs(jobs_root, releases_dir)
     held: set[str] = set()
     for job_dir in sorted(jobs_root.iterdir()):
-        if not job_dir.is_dir():
+        if not job_dir.is_dir() or job_dir.resolve() in cleared:
             continue
         for path in sorted(job_dir.glob(BASELINE_GLOB)):
             if _attribution_disposition(job_dir, path) in ("pass", "fail"):

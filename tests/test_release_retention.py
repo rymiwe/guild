@@ -37,6 +37,7 @@ class ReleaseRetentionTest(unittest.TestCase):
         self.key = self.tmp / "pass.key"
         self.key.write_bytes(b"k" * 32)
         os.environ["GUILD_ATTRIBUTION_PASS_KEY"] = str(self.key)
+        os.environ.pop("GUILD_ATTRIBUTION_GUARD", None)
 
     def sign(self, job_dir: Path, result: str, reason: str | None = None) -> None:
         baseline = next(job_dir.glob("*attribution-baseline.json"))
@@ -167,6 +168,19 @@ class ReleaseRetentionTest(unittest.TestCase):
         pr = self.prune()
         self.assertEqual(pr.returncode, 0, pr.stderr)
         self.assertEqual(json.loads(pr.stdout)["held_for_attribution"], ["r1"])
+
+    def test_guard_that_passes_without_a_receipt_does_not_hold(self) -> None:
+        self.job("review-legacy", "r1")
+        guard = self.tmp / "guard"
+        guard.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        guard.chmod(0o755)
+        os.environ["GUILD_ATTRIBUTION_GUARD"] = str(guard)
+        self.addCleanup(os.environ.pop, "GUILD_ATTRIBUTION_GUARD", None)
+        pr = self.prune()
+        self.assertEqual(pr.returncode, 0, pr.stderr)
+        report = json.loads(pr.stdout)
+        self.assertEqual(report["held_for_attribution"], [])
+        self.assertIn("r1", report["removed"])
 
     def test_unreadable_baseline_of_a_running_job_removes_nothing(self) -> None:
         self.run_job(self.job("review-broken", text="{not json"))
