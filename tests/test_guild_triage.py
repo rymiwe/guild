@@ -295,6 +295,56 @@ class GuildTriageTests(unittest.TestCase):
         bundle = Path(inc["bundle_dir"])
         self.assertIn("STOPPED base moved", (bundle / "report-tail.md").read_text(encoding="utf-8"))
 
+    def test_collect_parses_notify_lines_with_op_lookup_fields(self) -> None:
+        self.notify_log.write_text(
+            f"{self._ts(12)} bopeep-watch bopeep-watch FAILED http=200 mode=item cmds=1 outcome=ok reason=harvest failed: HTTP Error 401\n"
+            f"{self._ts(8)} guild guild-host-sync FAILED op-read-failed mode=legacy-refs cmds=1 outcome=op-error exit=1 reason=fetch failed\n",
+            encoding="utf-8",
+        )
+        res = run_triage(["collect", "--hosts", "local", "--dry-run"], self.base_env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads(res.stdout)
+        self.assertEqual(len(data["incidents"]), 2)
+        self.assertEqual(data["incidents"][0]["job"], "bopeep-watch")
+        self.assertEqual(data["incidents"][0]["delivery"], "http=200")
+        self.assertEqual(data["incidents"][0]["reason"], "harvest failed: HTTP Error 401")
+        self.assertEqual(data["incidents"][1]["job"], "guild")
+        self.assertEqual(data["incidents"][1]["delivery"], "op-read-failed")
+        self.assertEqual(data["incidents"][1]["reason"], "fetch failed")
+
+    def test_resolve_local_paths_prefers_active_guild_release(self) -> None:
+        home = self.tmp / "home"
+        rel_qm = home / ".local" / "share" / "guild" / "releases" / "g-123" / "code" / "quartermaster" / "bin"
+        rel_qm.mkdir(parents=True, exist_ok=True)
+        current = home / ".local" / "share" / "guild" / "current"
+        current.symlink_to(home / ".local" / "share" / "guild" / "releases" / "g-123")
+        (rel_qm / "jobs_env.py").write_text(
+            f"print('JOB_CFG_NOTIFY_LOG={self.notify_log}')\n"
+            f"print('JOB_CFG_ROOT={self.jobs}')\n"
+            f"print('JOB_CFG_HEALTH_DIR={self.health}')\n",
+            encoding="utf-8",
+        )
+        stale_qm = home / "code" / "quartermaster" / "bin"
+        stale_qm.mkdir(parents=True, exist_ok=True)
+        (stale_qm / "jobs_env.py").write_text("import sys; sys.exit(3)\n", encoding="utf-8")
+
+        self.notify_log.write_text(
+            f"{self._ts(5)} review-widgets-1 review-widgets-1 STOPPED http=200 mode=item cmds=1 outcome=ok reason=preflight timed out\n",
+            encoding="utf-8",
+        )
+        env = {
+            "PATH": self.base_env["PATH"],
+            "HOME": str(home),
+            "GUILD_TRIAGE_STATE_DIR": str(self.state),
+            "GUILD_TRIAGE_KILL_SWITCH": str(self.cfg / "triage.off"),
+        }
+        res = run_triage(["collect", "--hosts", "local", "--dry-run"], env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads(res.stdout)
+        self.assertEqual(data["hosts"]["local"]["notify_log"], str(self.notify_log))
+        self.assertEqual(len(data["incidents"]), 1)
+        self.assertEqual(data["incidents"][0]["reason"], "preflight timed out")
+
 
 if __name__ == "__main__":
     unittest.main()

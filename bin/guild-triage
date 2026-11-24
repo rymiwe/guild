@@ -41,7 +41,7 @@ VALID_OUTCOMES = ("expected", "fixed", "cleared", "ignored", "blocked")
 NOTIFY_LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"
     r"(?P<job>\S+)\s+(?P<session>\S+)\s+(?P<status>[A-Z][A-Z0-9_-]*)\s+"
-    r"(?P<delivery>\S+)\s+reason=(?P<reason>.*)$"
+    r"(?P<delivery>\S+)(?:\s+\S+=\S+)*\s+reason=(?P<reason>.*)$"
 )
 
 DEFAULT_DAILY_CAP = 2
@@ -59,19 +59,25 @@ since_hours = float(sys.argv[1])
 statuses = {"STOPPED", "FAILED", "HELD", "ENDED-NO-REPORT"}
 
 def parse_jobs_env():
-    script = Path.home() / "code" / "quartermaster" / "bin" / "jobs_env.py"
-    if not script.is_file():
-        return {}
-    proc = subprocess.run([sys.executable, "-I", str(script)], capture_output=True, text=True)
-    if proc.returncode != 0:
-        return {}
-    out = {}
-    for line in proc.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            parts = shlex.split(v)
-            out[k] = parts[0] if parts else ""
-    return out
+    root = Path(os.path.expanduser(os.environ.get("GUILD_RELEASE_ROOT") or "~/.local/share/guild"))
+    candidates = [
+        root / "current" / "code" / "quartermaster" / "bin" / "jobs_env.py",
+        Path.home() / "code" / "quartermaster" / "bin" / "jobs_env.py",
+    ]
+    for script in candidates:
+        if not script.is_file():
+            continue
+        proc = subprocess.run([sys.executable, "-I", str(script)], capture_output=True, text=True)
+        if proc.returncode != 0:
+            continue
+        out = {}
+        for line in proc.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                parts = shlex.split(v)
+                out[k] = parts[0] if parts else ""
+        return out
+    return {}
 
 cfg = parse_jobs_env()
 notify_log = Path(cfg.get("JOB_CFG_NOTIFY_LOG", "")).expanduser() if cfg.get("JOB_CFG_NOTIFY_LOG") else None
@@ -271,23 +277,29 @@ def resolve_local_paths() -> tuple[Path | None, Path | None, Path | None]:
             Path(os.path.expanduser(jobs)) if jobs else None,
             Path(os.path.expanduser(health)) if health else None,
         )
-    script = Path.home() / "code" / "quartermaster" / "bin" / "jobs_env.py"
-    if not script.is_file():
-        return None, None, None
-    proc = subprocess.run([sys.executable, "-I", str(script)], capture_output=True, text=True)
-    if proc.returncode != 0:
-        return None, None, None
-    cfg: dict[str, str] = {}
-    for line in proc.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            parts = shlex.split(v)
-            cfg[k] = parts[0] if parts else ""
-    return (
-        Path(os.path.expanduser(cfg["JOB_CFG_NOTIFY_LOG"])) if cfg.get("JOB_CFG_NOTIFY_LOG") else None,
-        Path(os.path.expanduser(cfg["JOB_CFG_ROOT"])) if cfg.get("JOB_CFG_ROOT") else None,
-        Path(os.path.expanduser(cfg["JOB_CFG_HEALTH_DIR"])) if cfg.get("JOB_CFG_HEALTH_DIR") else None,
-    )
+    root = Path(os.path.expanduser(os.environ.get("GUILD_RELEASE_ROOT") or "~/.local/share/guild"))
+    candidates = [
+        root / "current" / "code" / "quartermaster" / "bin" / "jobs_env.py",
+        Path.home() / "code" / "quartermaster" / "bin" / "jobs_env.py",
+    ]
+    for script in candidates:
+        if not script.is_file():
+            continue
+        proc = subprocess.run([sys.executable, "-I", str(script)], capture_output=True, text=True)
+        if proc.returncode != 0:
+            continue
+        cfg: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                parts = shlex.split(v)
+                cfg[k] = parts[0] if parts else ""
+        return (
+            Path(os.path.expanduser(cfg["JOB_CFG_NOTIFY_LOG"])) if cfg.get("JOB_CFG_NOTIFY_LOG") else None,
+            Path(os.path.expanduser(cfg["JOB_CFG_ROOT"])) if cfg.get("JOB_CFG_ROOT") else None,
+            Path(os.path.expanduser(cfg["JOB_CFG_HEALTH_DIR"])) if cfg.get("JOB_CFG_HEALTH_DIR") else None,
+        )
+    return None, None, None
 
 
 def _read_head_tail(path: Path, head_n: int, tail_n: int) -> tuple[str | None, str | None]:
