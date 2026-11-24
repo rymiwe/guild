@@ -80,6 +80,20 @@ A starting org file, with made-up values:
 grokbot-pace-check || exit "$?"   # preserve the checker’s exit code
 ```
 
+## HITL scorecard lint
+
+[`bin/scorecard-append`](bin/scorecard-append) is the one writer for the fleet HITL scorecard (`log.jsonl`, rules from the `jev-hitl-triage` skill). It checks one JSON row from stdin and appends it under `flock` on `LOG.lock`. A bad row exits 1 with the reason and leaves the log byte-identical. [`bin/lint-scorecard`](bin/lint-scorecard) reads the log and never edits it.
+
+- **Row checks:** `ts` with a UTC offset, a canonical bot short name from `agents/*/profile.json`, `decision_id`, `automatable_*` in full/partial/no, and `jev_reason` when `jev_lean` is `unavailable`.
+- **Decision checks** (older than `--grace`, default 15 min): a bot lean (null counts) with `bot_lean_ts`, a Jev lean (`unavailable` counts; `jev_raw` does not) with `jev_ts`, and the bot lean before Jev's.
+- **Modes:** default reports and exits 0. `--fail-new` exits 1 on findings after the baseline (the first N non-empty rows, written once with `--write-baseline`) and exits 2 with no baseline. `--fail-any` exits 1 on any finding. `--by-bot` and `--json` are also available.
+- **Log path:** `--file`, else `$SCORECARD_FILE` or its alias `$HITL_SCORECARD_LOG` (the decision writers' name), else the fleet default. If both env vars name different files, both tools exit 2 instead of guessing.
+
+```sh
+echo "$row_json" | scorecard-append || exit "$?"
+lint-scorecard --fail-new --by-bot
+```
+
 ## Outcome ledger
 
 [`bin/guild-ledger`](bin/guild-ledger) keeps one append-only record of what each tool decided and what happened next, in `${GUILD_LEDGER:-~/.local/state/guild/ledger.jsonl}`. `guild-ledger append` writes one validated event from stdin and skips an id already present. `guild-ledger backfill` joins Conclave's posted review findings to GitHub over REST. `guild-ledger-refresh.timer` runs both backfills daily on BLD and pings on a failure. No wrapper is installed: run it from the Guild checkout. Schema, proxy and limits: [`docs/outcome-ledger.md`](docs/outcome-ledger.md).

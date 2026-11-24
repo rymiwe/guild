@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Lint the fleet HITL scorecard. Never edits the log.
+
+usage: lint-scorecard [--fail-new | --fail-any] [--file FILE] [--by-bot] [--json]
+                      [--grace MIN] [--now ISO]
+       lint-scorecard --write-baseline [--file FILE]
+       lint-scorecard --check            (one JSON row on stdin; used by scorecard-append)
+
+  (default)        report findings, exit 0
+  --fail-new       exit 1 only for findings after the baseline line count in
+                   FILE.lint-baseline; exit 2 if there is no baseline
+  --fail-any       exit 1 for any finding (legacy included)
+  --by-bot         also print finding counts per raw `bot` value
+  --json           machine output (one JSON object) instead of text
+  --grace MIN      skip decision checks whose newest row is younger than MIN
+                   minutes (default 15; Jev may still be answering)
+  --now ISO        clock for --grace (tests)
+  --write-baseline record the current line count in FILE.lint-baseline;
+                   refuses if one exists
+
+FILE: --file, else $SCORECARD_FILE or its alias $HITL_SCORECARD_LOG (the name
+the decision writers use), else
+  ~/agent-data/fleet/experiments/hitl-scorecard/log.jsonl (the Grok Bot box).
+If both env vars are set to different files, exit 2 instead of guessing.
+The baseline counts non-empty rows, the same rows the lint counts.
+Rules come from skill jev-hitl-triage (Steps 2-4 and the Scorecard section).
+Exit 2 on usage error or missing file.
+
+Row codes:      JSON, TS, BOT, DECISION_ID, AUTOMATABLE, JEV_REASON
+Decision codes (a decision is any decision_id with an `options` or
+`bot_lean` row): NO_BOT_LEAN, NO_BOT_LEAN_TS, NO_JEV_LEAN, NO_JEV_TS,
+LEAN_ORDER (bot_lean_ts later than jev_ts).
+"""
+from __future__ import annotations
+
+import datetime as dt
+import glob
+import json
+import os
+import re
+import sys
+from collections import Counter
+
+DEFAULT_FILE = os.path.expanduser("~/agent-data/fleet/experiments/hitl-scorecard/log.jsonl")
+GROUP_PLACEHOLDERS = frozenset({"Family", "Household", "Money", "Media", "Staff"})
+AUTOMATABLE = frozenset({"full", "partial", "no"})
+TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:[+-]\d{2}:?\d{2}|Z)$"
+)
+SAMPLES = 8
+FIX = "write rows with scorecard-append"
+ENV_VARS = ("SCORECARD_FILE", "HITL_SCORECARD_LOG")
+
+
+def resolve_log(cli_file: str | None) -> tuple[str | None, str | None]:
+    """Return (path, error). --file wins; then the env vars; then the default."""
+    if cli_file:
+        return cli_file, None
+    set_ = {k: os.environ[k] for k in ENV_VARS if os.environ.get(k)}
+    if len(set_) == 2:
+        a, b = (os.path.realpath(v) for v in set_.values())
+        if a != b:
+            return None, ("SCORECARD_FILE={SCORECARD_FILE!r} and HITL_SCORECARD_LOG="
+                          "{HITL_SCORECARD_LOG!r} name different files; unset one or "
+                          "pass --file").format(**set_)
+    for k in ENV_VARS:
+        if k in set_:
+            return set_[k], None
+    return DEFAULT_FILE, None
+
+
+def agents_dir() -> str:
+    return os.environ.get("AGENTS_DIR", os.path.expanduser("~/agent-data/agents"))
+
+
+def canonical_bots() -> set[str]:
+    """Short bot names from agents/*/profile.json (text before ' · ')."""
+    names = set()
+    for path in glob.glob(os.path.join(agents_dir(), "*", "profile.json")):
+        try:
+            with open(path) as f:
+                name = json.load(f).get("name") or ""
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+        short = name.split(" · ", 1)[0].strip()
+        if not short or short.startswith("when you're") or short in GROUP_PLACEHOLDERS:
+            continue
+        names.add(short)
+    return names
+
+
+def suggest(bot: str, names: set[str]) -> str | None:
+    if not isinstance(bot, str):
+        return None
+    b = bot.strip()
+    low = b.lower()
+    for n in sorted(names):
+        nl = n.lower()
+        if low in (nl, nl.replace(" ", "-"), nl.split()[-1]):
+            return n
+        if low.startswith(nl + " ") or low.startswith(nl + " ·"):
+            return n
+    return None
+
+
+def parse_ts(value) -> dt.datetime | None:
+    if not isinstance(value, str) or not TS_RE.match(value):
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def row_problems(row, names: set[str]) -> list[tuple[str, str]]:
+    """Return [(code, why)] for one parsed row; [] if good."""
+    if not isinstance(row, dict):
+        return [("JSON", "row is not a JSON object")]
+    out = []
+    if "ts" not in row:
+        out.append(("TS", "ts is missing"))
+    elif parse_ts(row["ts"]) is None:
+        out.append(("TS", f"ts={row['ts']!r} is not ISO-8601 with a UTC offset"))
+    for k in ("bot_lean_ts", "jev_ts"):
+        if k in row and row[k] is not None and parse_ts(row[k]) is None:
+            out.append(("TS", f"{k}={row[k]!r} is not ISO-8601 with a UTC offset"))
+    bot = row.get("bot")
+    if bot not in names:
+        s = suggest(bot, names)
+        hint = f"; use {s!r}" if s else ""
+        if bot is None:
+            out.append(("BOT", f"bot is missing{hint}"))
+        else:
+            out.append(("BOT", f"bot={bot!r} is not a canonical bot name{hint}"))
+    did = row.get("decision_id")
+    if not isinstance(did, str) or not did.strip():
+        out.append(("DECISION_ID", "decision_id is missing or empty"))
+    for k in ("automatable_bot", "automatable_jev"):
+        if k in row and row[k] not in AUTOMATABLE:
+            out.append(("AUTOMATABLE", f"{k}={row[k]!r} must be full, partial or no"))
+    if row.get("jev_lean") == "unavailable" and not row.get("jev_reason"):
+        out.append(("JEV_REASON", "jev_lean=unavailable needs jev_reason in the same row"))
+    return out
+
+
+def decision_problems(rows: list[dict]) -> list[tuple[str, str]]:
+    has = lambda k: any(k in r for r in rows)
+    out = []
+    if not has("bot_lean"):
+        out.append(("NO_BOT_LEAN", "no row has bot_lean (use null for no lean)"))
+    elif not any(r.get("bot_lean_ts") for r in rows):
+        out.append(("NO_BOT_LEAN_TS", "bot_lean has no bot_lean_ts (proof of lean order)"))
+    jev = [r.get("jev_lean") for r in rows if r.get("jev_lean") is not None]
+    if not jev:
+        out.append(("NO_JEV_LEAN", "no jev_lean in any row (write 'unavailable' + jev_reason)"))
+    elif any(j != "unavailable" for j in jev) and not any(r.get("jev_ts") for r in rows):
+        out.append(("NO_JEV_TS", "jev_lean has no jev_ts"))
+    b = [t for t in (parse_ts(r.get("bot_lean_ts")) for r in rows) if t]
+    j = [t for t in (parse_ts(r.get("jev_ts")) for r in rows) if t]
+    if b and j and min(b) > min(j):
+        out.append(("LEAN_ORDER", f"bot_lean_ts {min(b).isoformat()} is after jev_ts {min(j).isoformat()}"))
+    return out
+
+
+def load_baseline(path: str) -> int | None:
+    try:
+        with open(path + ".lint-baseline") as f:
+            for line in f:
+                m = re.match(r"^lines:\s*(\d+)\s*$", line)
+                if m:
+                    return int(m.group(1))
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def lint(path: str, now: dt.datetime, grace_min: float):
+    names = canonical_bots()
+    baseline = load_baseline(path)
+    findings = []
+    decisions: dict[str, list[tuple[int, dict]]] = {}
+    nrows = 0
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            nrows += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                findings.append(dict(line=lineno, row=nrows, code="JSON",
+                                     why=f"not JSON ({e.msg})", bot=None, decision_id=None))
+                continue
+            for code, why in row_problems(row, names):
+                findings.append(dict(line=lineno, row=nrows, code=code, why=why,
+                                     bot=row.get("bot") if isinstance(row, dict) else None,
+                                     decision_id=row.get("decision_id") if isinstance(row, dict) else None))
+            if isinstance(row, dict) and isinstance(row.get("decision_id"), str) and row["decision_id"].strip():
+                decisions.setdefault(row["decision_id"], []).append((lineno, nrows, row))
+    checked = 0
+    for did, items in decisions.items():
+        rows = [r for _, _, r in items]
+        if not any("options" in r or "bot_lean" in r for r in rows):
+            continue
+        stamps = [t for t in (parse_ts(r.get("ts")) for r in rows) if t]
+        if stamps and now - max(stamps) < dt.timedelta(minutes=grace_min):
+            continue
+        checked += 1
+        first, first_row = items[0][0], items[0][1]
+        for code, why in decision_problems(rows):
+            findings.append(dict(line=first, row=first_row, code=code, why=why,
+                                 bot=rows[0].get("bot"), decision_id=did))
+    for fd in findings:
+        fd["new"] = baseline is not None and fd["row"] > baseline
+    return dict(file=path, rows=nrows, decisions=checked, baseline_lines=baseline,
+                bad=len(findings), new=sum(f["new"] for f in findings),
+                old=sum(not f["new"] for f in findings), findings=findings)
+
+
+def check_stdin() -> int:
+    names = canonical_bots()
+    text = sys.stdin.read()
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) != 1:
+        print(f"bad scorecard row: expected exactly 1 JSON line, got {len(lines)}", file=sys.stderr)
+        return 1
+    try:
+        row = json.loads(lines[0])
+    except json.JSONDecodeError as e:
+        print(f"bad scorecard row: not JSON ({e.msg})", file=sys.stderr)
+        return 1
+    probs = row_problems(row, names)
+    for code, why in probs:
+        print(f"bad scorecard row: {code}: {why}", file=sys.stderr)
+    return 1 if probs else 0
+
+
+def main(argv: list[str]) -> int:
+    args = list(argv)
+    if args == ["--check"]:
+        return check_stdin()
+    mode, path, by_bot, as_json, grace, now, write_base = "report", None, False, False, 15.0, None, False
+    try:
+        while args:
+            a = args.pop(0)
+            if a in ("--fail-new", "--fail-any"):
+                mode = a[2:]
+            elif a == "--file":
+                path = args.pop(0)
+            elif a.startswith("--file="):
+                path = a.split("=", 1)[1]
+            elif a == "--by-bot":
+                by_bot = True
+            elif a == "--json":
+                as_json = True
+            elif a == "--grace":
+                grace = float(args.pop(0))
+            elif a == "--now":
+                now = parse_ts(args.pop(0))
+                if now is None:
+                    raise ValueError("--now needs ISO-8601 with offset")
+            elif a == "--write-baseline":
+                write_base = True
+            else:
+                raise ValueError(a)
+    except (IndexError, ValueError):
+        print(__doc__, file=sys.stderr)
+        return 2
+    path, err = resolve_log(path)
+    if err:
+        print(f"lint-scorecard: {err}", file=sys.stderr)
+        return 2
+    if not os.path.isfile(path):
+        print(f"lint-scorecard: no such file {path}", file=sys.stderr)
+        return 2
+    if write_base:
+        bp = path + ".lint-baseline"
+        if os.path.exists(bp):
+            print(f"lint-scorecard: {bp} exists; not overwriting", file=sys.stderr)
+            return 1
+        with open(path, encoding="utf-8", errors="replace") as f:
+            n = sum(1 for line in f if line.strip())
+        with open(bp, "x") as f:
+            f.write(f"# lint-scorecard baseline: the first N non-empty rows are legacy\n"
+                    f"lines: {n}\nwritten: {dt.datetime.now().astimezone().isoformat(timespec='seconds')}\n")
+        print(f"{bp}: lines: {n}")
+        return 0
+    now = now or dt.datetime.now().astimezone()
+    res = lint(path, now, grace)
+    if mode == "fail-new" and res["baseline_lines"] is None:
+        print(f"lint-scorecard: --fail-new needs {path}.lint-baseline "
+              f"(create it once with --write-baseline)", file=sys.stderr)
+        return 2
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False))
+    else:
+        base = (f"baseline line {res['baseline_lines']}" if res["baseline_lines"] is not None
+                else "no .lint-baseline yet")
+        print(f"{path}: {res['rows']} rows, {res['decisions']} decisions checked, "
+              f"{res['bad']} bad ({res['new']} new after {base}, {res['old']} baseline/legacy)")
+        codes = Counter(f["code"] for f in res["findings"])
+        if codes:
+            print("  codes: " + ", ".join(f"{c}={n}" for c, n in sorted(codes.items())))
+        for label, want in (("NEW", True), ("old", False)):
+            group = [f for f in res["findings"] if f["new"] == want]
+            for fd in group[:SAMPLES]:
+                print(f"  {label} line {fd['line']} {fd['code']} decision_id={fd['decision_id']}: "
+                      f"{fd['why']}; {FIX}")
+            if len(group) > SAMPLES:
+                print(f"  {label}: {len(group) - SAMPLES} more")
+        if by_bot:
+            counts = Counter(str(f["bot"]) for f in res["findings"])
+            print(f"findings by bot ({sum(counts.values())}):")
+            for b, n in counts.most_common():
+                print(f"  {b}: {n}")
+    if mode == "fail-any" and res["bad"]:
+        return 1
+    if mode == "fail-new" and res["new"]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
