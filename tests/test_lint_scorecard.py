@@ -385,5 +385,108 @@ class LockAndBaselineTests(Base):
         self.assertIn("NO_JEV_LEAN", r.stdout)
 
 
+
+def poteto_row(did="cole-x-2026-11-24", **kv):
+    row = {"ts": TS2, "bot": "Code Cole", "decision_id": did, "stage": "poteto-shadow",
+           "poteto_rubric": "v1-b3b273cf", "poteto_model": "gemini-4-neon-low",
+           "poteto_lean": "A", "poteto_principle": "Build the Lever", "poteto_why": "w",
+           "poteto_conf": 0.8, "poteto_latency_s": 12.0,
+           "auto_state": "rule", "auto_kind": "check", "auto_rule": "lint it", "auto_why": "same each time"}
+    row.update(kv)
+    return {k: v for k, v in row.items() if v is not DROP}
+
+
+DROP = object()
+
+
+class PotetoShadowTests(Base):
+    """Stage poteto-shadow rows and match_poteto (poteto lean design 8; audit change 7)."""
+
+    def lint_rows(self, *extra):
+        self.write(good_decision() + list(extra))
+        return self.lint("--fail-any")
+
+    def test_valid_poteto_rows_pass(self):
+        unavailable = poteto_row(poteto_lean="unavailable", poteto_reason="timeout",
+                                 poteto_principle=DROP, poteto_why=DROP, poteto_conf=DROP,
+                                 auto_state="unavailable", auto_reason="timeout",
+                                 auto_kind=DROP, auto_rule=DROP, auto_why=DROP)
+        no_lean = poteto_row(poteto_lean=None, poteto_principle=DROP, auto_state="human",
+                             auto_kind=DROP, auto_rule=DROP)
+        r = self.lint_rows(poteto_row(), unavailable, no_lean)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_old_automatable_vocabulary_is_not_an_auto_state(self):
+        r = self.lint_rows(poteto_row(auto_state="partial"))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("POTETO", r.stdout)
+
+    def test_unavailable_lean_needs_a_reason(self):
+        r = self.lint_rows(poteto_row(poteto_lean="unavailable", poteto_principle=DROP))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("POTETO", r.stdout)
+
+    def test_letter_lean_needs_a_principle_and_rubric(self):
+        r = self.lint_rows(poteto_row(poteto_principle=DROP))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        r = self.lint_rows(poteto_row(poteto_rubric=DROP))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("POTETO", r.stdout)
+
+    def test_rule_state_needs_kind_and_rule(self):
+        r = self.lint_rows(poteto_row(auto_kind="vibes"))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        r = self.lint_rows(poteto_row(auto_rule=DROP))
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_match_poteto_must_be_bool(self):
+        did = good_decision()[0]["decision_id"]
+        res = {"ts": TS2, "bot": "Code Cole", "decision_id": did, "stage": "resolution",
+               "ryan_pick": "A", "match_bot": True, "match_jev": True, "match_poteto": "yes"}
+        r = self.lint_rows(res)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("POTETO", r.stdout)
+
+    def test_append_refuses_a_bad_poteto_row(self):
+        self.write(good_decision())
+        before = self.read_bytes()
+        r = self.append(json.dumps(poteto_row(auto_state="full")))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(self.read_bytes(), before)
+
+    def resolution(self, pick, **kv):
+        did = good_decision()[0]["decision_id"]
+        row = {"ts": TS2, "bot": "Code Cole", "decision_id": did, "stage": "resolution",
+               "ryan_pick": pick, "match_bot": pick == "A", "match_jev": pick == "A"}
+        row.update(kv)
+        return json.dumps(row)
+
+    def last_row(self):
+        return json.loads(self.read_text().splitlines()[-1])
+
+    def test_append_fills_match_poteto_on_a_resolution(self):
+        self.write(good_decision() + [poteto_row()])
+        r = self.append(self.resolution("A"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIs(self.last_row()["match_poteto"], True)
+        r = self.append(self.resolution("B: hold"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIs(self.last_row()["match_poteto"], False)
+
+    def test_append_leaves_match_poteto_off_without_a_poteto_lean(self):
+        unavailable = poteto_row(poteto_lean="unavailable", poteto_reason="timeout", poteto_principle=DROP,
+                                 auto_state="unavailable", auto_reason="timeout", auto_kind=DROP, auto_rule=DROP)
+        for rows in (good_decision(), good_decision() + [unavailable]):
+            self.write(rows)
+            r = self.append(self.resolution("A"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("match_poteto", self.last_row())
+
+    def test_append_keeps_a_written_match_poteto(self):
+        self.write(good_decision() + [poteto_row()])
+        r = self.append(self.resolution("A", match_poteto=False))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIs(self.last_row()["match_poteto"], False)
+
 if __name__ == "__main__":
     unittest.main()
