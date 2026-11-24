@@ -56,9 +56,15 @@ non-object holds the row:
                        subject; the dir must not be a link or group/other
                        writable): {"gate", "verdict": "PASS", "subject_sha256",
                        "ts", "expires_at"}, the sha of the subject without
-                       gate_passes, expiring at most 15 minutes after ts. A
-                       record allows once: its sha goes to consumed.log there,
-                       and reuse holds (verify consumes too).
+                       gate_passes, expiring at most 15 minutes after ts (a ts
+                       in the future holds). The records root and the gate dir
+                       must be real dirs, not links, not group/other-writable;
+                       a record file that is a link or group/other-writable is
+                       skipped. eval never consumes a record (its result says
+                       so in pass_record); verify consumes it once: its sha
+                       goes to consumed.log (opened O_NOFOLLOW, refused when
+                       group/other-writable) under a lock, and any later
+                       verify or eval holds with "already used".
 notes is prose (the status trail); it is rendered, never read. Marking a PR
 ready has no action type, so it holds as unknown.
 The ledger is $GUILD_GATE_LEDGER or ~/.config/guild/gate-ledger.json.
@@ -861,12 +867,63 @@ def consumed_log() -> str:
     return os.path.join(passes_dir(), "consumed.log")
 
 
-def consumed() -> set[str]:
+def safe(st) -> bool:
+    """Not group/other-writable."""
+    return not st.st_mode & 0o022
+
+
+def open_consumed(create: bool) -> int | None:
+    """consumed.log as an fd: never through a symlink, never when group/other-writable. None if absent."""
+    import stat
+    flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | (os.O_CREAT if create else 0)
     try:
-        with open(consumed_log()) as fh:
-            return {line.split()[0] for line in fh if line.strip()}
-    except OSError:
+        fd = os.open(consumed_log(), flags, 0o600)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise UnsafePasses("consumed.log is a link or unreadable") from e
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or not safe(st):
+        os.close(fd)
+        raise UnsafePasses("consumed.log is not a plain file or is writable by others")
+    return fd
+
+
+class UnsafePasses(Exception):
+    pass
+
+
+def read_used(fd: int) -> set[str]:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        b = os.read(fd, 65536)
+        if not b:
+            break
+        chunks.append(b)
+    return {line.split()[0] for line in b"".join(chunks).decode(errors="replace").splitlines() if line.strip()}
+
+
+def consumed() -> set[str]:
+    fd = open_consumed(create=False)
+    if fd is None:
         return set()
+    try:
+        return read_used(fd)
+    finally:
+        os.close(fd)
+
+
+def safe_dir(path: str) -> str | None:
+    """None when PATH is a real directory, not a link, not group/other-writable; else why not."""
+    import stat
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "missing"
+    if not stat.S_ISDIR(st.st_mode) or not safe(st):
+        return "a link or writable by others"
+    return None
 
 
 def gate_pass(subject: dict, gate: str) -> tuple[str | None, str | None]:
@@ -876,28 +933,45 @@ def gate_pass(subject: dict, gate: str) -> tuple[str | None, str | None]:
     A record is {"gate", "verdict": "PASS", "subject_sha256", "ts", "expires_at"}, where the
     sha is of the subject without gate_passes and expires_at is at most 15 minutes after ts.
     """
+    import stat
     if not GATE_NAME.fullmatch(gate):
         return f"enforced_by {gate}: not a gate name", None
-    d = os.path.join(passes_dir(), gate)
+    root = passes_dir()
+    d = os.path.join(root, gate)
+    for where, path in (("records root", root), ("record dir", d)):
+        bad = safe_dir(path)
+        if bad == "missing":
+            return f"enforced_by {gate}: no PASS record", None
+        if bad:
+            return f"enforced_by {gate}: {where} is {bad}", None
     try:
-        st = os.lstat(d)
         names = sorted(os.listdir(d))
+        used = consumed()
     except OSError:
         return f"enforced_by {gate}: no PASS record", None
-    import stat
-    if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o022:
-        return f"enforced_by {gate}: record dir is a link or writable by others", None
+    except UnsafePasses as e:
+        return f"enforced_by {gate}: {e}", None
     want = subject_sha({k: v for k, v in subject.items() if k != "gate_passes"})
-    used, now, why = consumed(), time.time(), f"enforced_by {gate}: no PASS record"
+    now, why = time.time(), f"enforced_by {gate}: no PASS record"
     for name in names:
         f = os.path.join(d, name)
-        if not name.endswith(".json") or os.path.islink(f):
+        if not name.endswith(".json"):
             continue
         try:
-            with open(f, "rb") as fh:
+            fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue  # a link, or gone
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or not safe(st):
+                continue  # a record anyone else could write proves nothing
+            with os.fdopen(os.dup(fd), "rb") as fh:
                 raw = fh.read()
+        finally:
+            os.close(fd)
+        try:
             rec = json.loads(raw)
-        except (OSError, ValueError):
+        except ValueError:
             continue
         if not (isinstance(rec, dict) and rec.get("gate") == gate and rec.get("verdict") == "PASS"
                 and rec.get("subject_sha256") == want):
@@ -906,7 +980,10 @@ def gate_pass(subject: dict, gate: str) -> tuple[str | None, str | None]:
         if ts is None or exp is None or not 0 < exp - ts <= PASS_TTL_MAX:
             why = f"enforced_by {gate}: record needs ts and an expiry of 15 minutes or less"
             continue
-        if ts > now + CLOCK_SKEW or now >= exp:
+        if ts > now + CLOCK_SKEW:
+            why = f"enforced_by {gate}: record ts in the future"
+            continue
+        if now >= exp:
             why = f"enforced_by {gate}: record expired"
             continue
         sha = hashlib.sha256(raw).hexdigest()
@@ -923,18 +1000,21 @@ def consume(shas: list[str]) -> str | None:
         return None
     import fcntl
     try:
-        os.makedirs(passes_dir(), exist_ok=True)
-        with open(consumed_log(), "a+") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            fh.seek(0)
-            used = {line.split()[0] for line in fh if line.strip()}
-            if any(x in used for x in shas):
-                return "enforced_by: record already used"
-            fh.write("".join(f"{x} {int(time.time())}\n" for x in shas))
-            fh.flush()
-            os.fsync(fh.fileno())
+        fd = open_consumed(create=True)
+    except UnsafePasses as e:
+        return f"enforced_by: {e}"
     except OSError:
         return "enforced_by: cannot record the PASS as used"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if any(x in read_used(fd) for x in shas):
+            return "enforced_by: record already used"
+        os.write(fd, "".join(f"{x} {int(time.time())}\n" for x in shas).encode())
+        os.fsync(fd)
+    except OSError:
+        return "enforced_by: cannot record the PASS as used"
+    finally:
+        os.close(fd)
     return None
 
 
@@ -1003,7 +1083,8 @@ def conditions_check(subject: dict, gate: str, conds, shas: list[str]) -> tuple[
     return None, shas
 
 
-def ledger_row(subject: dict, repo: str) -> tuple[bool, str]:
+def ledger_row(subject: dict, repo: str, spend: bool, note: dict) -> tuple[bool, str]:
+    """SPEND (verify only) marks the row's PASS records used; eval only reports them in NOTE."""
     gate = subject.get("gate")
     if not isinstance(gate, str) or not gate:
         return False, "no gate row named (subject.gate)"
@@ -1035,15 +1116,20 @@ def ledger_row(subject: dict, repo: str) -> tuple[bool, str]:
         if "conditions" not in row:
             return False, f"gate row {gate} is malformed: no conditions object (conditions are mandatory; {{}} means none)"
         why, shas = conditions_hold(subject, gate, row["conditions"])
-        if why is None:
-            why = consume(shas)
+        if why is None and shas:
+            if spend:
+                why = consume(shas)
+                note["pass_record"] = "consumed by this verify"
+            else:
+                note["pass_record"] = "not consumed: eval never consumes; true-check verify consumes it, once"
         if why:
             return False, why if why.startswith("gate row") else f"gate row {gate}: {why}"
         return True, f"gate row {gate} approves {subject['action']} on {repo}"
     return False, f"no gate row {gate} in the ledger"
 
 
-def allow(subject: dict, status: str) -> tuple[bool, str]:
+def allow(subject: dict, status: str, spend: bool = False, note: dict | None = None) -> tuple[bool, str]:
+    note = {} if note is None else note
     action = subject.get("action")
     t = ACTION_TYPES.get(action)
     if t is None:
@@ -1060,9 +1146,9 @@ def allow(subject: dict, status: str) -> tuple[bool, str]:
         personal, why = personal_repo(subject)
         if personal:
             return True, f"merge on {why} on a TRUE(+P) pass"
-        ok, row = ledger_row(subject, repo)
+        ok, row = ledger_row(subject, repo, spend, note)
         return ok, f"{why}: {row}"
-    return ledger_row(subject, repo if isinstance(repo, str) and repo else "*")
+    return ledger_row(subject, repo if isinstance(repo, str) and repo else "*", spend, note)
 
 
 def verdict_line(letters: dict) -> str:
@@ -1077,7 +1163,7 @@ def held(subject: dict, reason: str, why: str) -> dict:
             "jev": "jev: not called", "jev_shadow": {"status": "skipped"}, "subject_sha256": subject_sha(subject)}
 
 
-def evaluate(subject: dict, jev: bool = True) -> dict:
+def evaluate(subject: dict, jev: bool = True, spend: bool = False) -> dict:
     if not isinstance(subject, dict):
         raise Usage("SUBJECT must be a JSON object")
     action = subject.get("action")
@@ -1103,7 +1189,10 @@ def evaluate(subject: dict, jev: bool = True) -> dict:
             shadow, jev_line = jev_shadow(subject, nodiff)
     letters.update(ep)
     res = decide(letters)
-    res["allowed"], res["allow_reason"] = allow(subject, res["status"])
+    note = {}
+    res["allowed"], res["allow_reason"] = allow(subject, res["status"], spend, note)
+    if note:
+        res["pass_record"] = note["pass_record"] if res["allowed"] else "held: not consumed"
     res.update(letters=letters, verdicts=verdict_line(letters), jev_calls=calls, judge_calls=calls,
                reviewers=notes, builder={"family": builder, "source": bnote}, jev=jev_line,
                jev_shadow=shadow, subject_sha256=subject_sha(subject))
@@ -1180,7 +1269,7 @@ def main(argv: list[str]) -> int:
             # Only the hash is read from RESULT. Its letters may come from anyone, so judge again.
             ok = (isinstance(res, dict) and isinstance(subject, dict)
                   and res.get("subject_sha256") == subject_sha(subject)
-                  and evaluate(subject)["allowed"])
+                  and evaluate(subject, spend=True)["allowed"])
             print("VERIFY PASS" if ok else "VERIFY HOLD")
             return 0 if ok else EXIT["hold"]
         if argv[:1] == ["ledger-render"] and len(argv) in (1, 3):

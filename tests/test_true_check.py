@@ -869,6 +869,8 @@ class Conditions(Base):
         d = Path(where) if where else self.tmp / "passes" / gate
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o755)
+        if not where:
+            d.parent.chmod(0o755)
         f = Path(tempfile.mkstemp(dir=d, prefix="pass-", suffix=".json")[1])
         ts = time.time() - age
         rec = {"gate": gate, "verdict": verdict, "ts": ts, "expires_at": ts + ttl, "subject_sha256":
@@ -1001,17 +1003,98 @@ class Conditions(Base):
         self.assertEqual(rc, 11)
         self.assertIn("writable by others", out["allow_reason"])
 
-    def test_f2_a_record_allows_once(self):
+    def verify(self, subj):
+        """eval --out RESULT, then verify RESULT SUBJECT; returns verify's exit code."""
+        sp, rp = self.tmp / "v-subject.json", self.tmp / "v-result.json"
+        sp.write_text(json.dumps(subj))
+        subprocess.run(["python3", str(BIN), "eval", str(sp), "--out", str(rp)], capture_output=True, env=self.env)
+        return subprocess.run(["python3", str(BIN), "verify", str(rp), str(sp)], capture_output=True,
+                              env=self.env).returncode
+
+    def used_lines(self):
+        f = self.tmp / "passes" / "consumed.log"
+        return len(f.read_text().splitlines()) if f.exists() else 0
+
+    def approve_row_and_subject(self):
         self.row(["approve"], {"enforced_by": ["approve-gate"]})
-        subj = subject(action="approve", gate="g", repo=self.REPO, pr=pr())
+        return subject(action="approve", gate="g", repo=self.REPO, pr=pr())
+
+    # Paul's 5071246 re-audit, V1-V6: only verify consumes
+    def test_v1_v5_eval_never_consumes_and_verify_consumes_once(self):
+        subj = self.approve_row_and_subject()
         self.record(subj, "approve-gate")
-        rc, out, _ = self.run_eval(subj)
-        self.assertEqual((rc, out["allowed"]), (0, True), out["allow_reason"])
+        for _ in range(2):
+            rc, out, _ = self.run_eval(subj)
+            self.assertEqual((rc, out["allowed"]), (0, True), out["allow_reason"])
+            self.assertIn("not consumed", out["pass_record"])
+        self.assertEqual(self.used_lines(), 0, "eval consumed the record")
+        self.assertEqual(self.verify(subj), 0)
+        self.assertEqual(self.used_lines(), 1)
+        self.assertEqual(self.verify(subj), 11, "a second verify must hold")
         rc, out, _ = self.run_eval(subj)
         self.assertEqual((rc, out["allow_reason"]), (11, "gate row g: enforced_by approve-gate: record already used"))
         self.record(subj, "approve-gate", note="a fresh PASS from the gate")
+        self.assertEqual(self.verify(subj), 0, "a new record from the gate allows one more verify")
+
+    def test_v6_concurrent_verifies_pass_once(self):
+        subj = self.approve_row_and_subject()
+        self.record(subj, "approve-gate")
+        sp, rp = self.tmp / "v-subject.json", self.tmp / "v-result.json"
+        sp.write_text(json.dumps(subj))
+        subprocess.run(["python3", str(BIN), "eval", str(sp), "--out", str(rp)], capture_output=True, env=self.env)
+        procs = [subprocess.Popen(["python3", str(BIN), "verify", str(rp), str(sp)], stdout=subprocess.DEVNULL,
+                                  env=self.env) for _ in range(8)]
+        codes = sorted(p.wait() for p in procs)
+        self.assertEqual(codes, [0] + [11] * 7)
+        self.assertEqual(self.used_lines(), 1)
+
+    # hardening: D2, D6, D8, D9 and a future ts
+    def test_d2_d6_records_root_must_be_a_real_private_dir(self):
+        subj = self.approve_row_and_subject()
+        self.record(subj, "approve-gate")
+        real = self.tmp / "passes"
+        real.chmod(0o777)
         rc, out, _ = self.run_eval(subj)
-        self.assertEqual(rc, 0, "a new record from the gate allows once more")
+        self.assertEqual((rc, out["allow_reason"]),
+                         (11, "gate row g: enforced_by approve-gate: records root is a link or writable by others"))
+        real.chmod(0o755)
+        link = self.tmp / "passes-link"
+        link.symlink_to(real)
+        self.env["GUILD_GATE_PASSES"] = str(link)
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual((rc, out["allow_reason"]),
+                         (11, "gate row g: enforced_by approve-gate: records root is a link or writable by others"))
+
+    def test_d8_record_writable_by_others_is_skipped(self):
+        subj = self.approve_row_and_subject()
+        self.record(subj, "approve-gate").chmod(0o666)
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual((rc, out["allow_reason"]), (11, "gate row g: enforced_by approve-gate: no PASS record"))
+
+    def test_d9_consumed_log_link_or_open_is_refused_and_not_followed(self):
+        subj = self.approve_row_and_subject()
+        self.record(subj, "approve-gate")
+        other = self.tmp / "other.txt"
+        other.write_text("keep\n")
+        log = self.tmp / "passes" / "consumed.log"
+        log.symlink_to(other)
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual(rc, 11)
+        self.assertIn("consumed.log is a link", out["allow_reason"])
+        self.assertEqual(self.verify(subj), 11)
+        self.assertEqual(other.read_text(), "keep\n")
+        log.unlink()
+        log.write_text("")
+        log.chmod(0o666)
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual(rc, 11)
+        self.assertIn("consumed.log is not a plain file or is writable by others", out["allow_reason"])
+
+    def test_record_ts_in_the_future_says_so(self):
+        subj = self.approve_row_and_subject()
+        self.record(subj, "approve-gate", age=-300)
+        rc, out, _ = self.run_eval(subj)
+        self.assertEqual((rc, out["allow_reason"]), (11, "gate row g: enforced_by approve-gate: record ts in the future"))
 
     def test_f3_record_needs_ts_and_a_short_unexpired_life(self):
         self.row(["approve"], {"enforced_by": ["approve-gate"]})
