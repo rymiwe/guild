@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""true-check: deterministic T, R, U; one Jev call for E and P; fail closed."""
+"""true-check: deterministic T, R, U; one other-family judge for E and P; Jev log-only; fail closed."""
 from __future__ import annotations
 
 import json
@@ -21,9 +21,21 @@ python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); r=a[min(int(sys.arg
 """
 
 
-def jev(e="pass", p="pass", conf=0.9):
-    return {"id": "call-1", "answers": {"E": {"choice": e, "confidence": conf},
-                                         "P": {"choice": p, "confidence": conf}}}
+FAKE_SHADOW = """#!/bin/sh
+# Log-only Jev: counts calls in shadow-calls and answers from shadow.json.
+n=$(cat "$FAKE_JEV_DIR/shadow-calls" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$FAKE_JEV_DIR/shadow-calls"
+cat "$FAKE_JEV_DIR/shadow.json"
+"""
+
+
+def jev(e="pass", p="pass", conf=0.9, family="gpt", principle=None):
+    """One E/P judge answer (the name is kept from when Jev judged)."""
+    ans = {"id": "call-1", "family": family, "answers": {"E": {"choice": e, "confidence": conf},
+                                                          "P": {"choice": p, "confidence": conf}}}
+    if principle:
+        ans["answers"]["P"]["principle"] = principle
+    return ans
 
 
 def patch_of(files):
@@ -46,7 +58,7 @@ def D(*files):
 def subject(**over):
     s = {"action": "local-build", "goal": "Drop a dead branch in the parser.",
          "diff": D(("bin/parse", 2, 5), ("tests/test_parse.py", 40, 0)),
-         "force_push": False}
+         "force_push": False, "evidence": ["tests/test_parse.py"], "builder": {"run_id": "r1"}}
     s.update(over)
     return s
 
@@ -54,10 +66,20 @@ def subject(**over):
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        fake = self.tmp / "jev-ask"
+        fake = self.tmp / "judge-ask"
         fake.write_text(FAKE_JEV)
         fake.chmod(0o755)
-        self.env = {**os.environ, "TRUE_CHECK_JEV_ASK": str(fake), "FAKE_JEV_DIR": str(self.tmp)}
+        shadow = self.tmp / "jev-ask"
+        shadow.write_text(FAKE_SHADOW)
+        shadow.chmod(0o755)
+        (self.tmp / "shadow.json").write_text(json.dumps({"id": "jev-1", "answers": {"E": {"choice": "pass"}}}))
+        routes = self.tmp / "routes.jsonl"
+        routes.write_text(json.dumps({"run_id": "r1", "family": "claude", "model": "m", "cli": "t3"}) + "\n"
+                          + json.dumps({"run_id": "r2", "family": "grok", "model": "m", "cli": "t3"}) + "\n")
+        self.env = {**os.environ, "TRUE_CHECK_JUDGE": str(fake), "TRUE_CHECK_JEV_ASK": str(shadow),
+                    "TRUE_CHECK_ROUTE_LOG": str(routes), "FAKE_JEV_DIR": str(self.tmp)}
+        for k in ("TRUE_CHECK_SEATS", "TRUE_CHECK_DEFAULT_FAMILY", "GUILD_GATE_LEDGER"):
+            self.env.pop(k, None)
         self.answers([jev()])
 
     def answers(self, seq):
@@ -194,8 +216,8 @@ class Letters(Base):
             rc, out, _ = self.run_eval(subject(diff=D((path, 1, 0))))
             self.assertEqual(rc, 11, path)
 
-    def test_jev_fail_holds_without_retry(self):
-        self.answers([jev(p="fail")])
+    def test_judge_fail_holds_without_retry(self):
+        self.answers([jev(p="fail", principle="principle-fix-root-causes")])
         rc, out, _ = self.run_eval(subject())
         self.assertEqual((rc, out["failed"], self.calls()), (11, ["P"], 1))
 
@@ -460,14 +482,14 @@ class Retry(Base):
         rc, out, _ = self.run_eval(subject())
         self.assertEqual((rc, out["unknown"]), (11, ["E", "P"]))
 
-    def test_jev_down_holds(self):
+    def test_judge_down_holds(self):
         self.answers(["exit"])
         rc, out, _ = self.run_eval(subject())
         self.assertEqual((rc, self.calls()), (11, 2))
-        self.assertIn("jev-ask exit 1", out["letters"]["E"]["evidence"])
+        self.assertIn("E/P judge unavailable: judge exit 1", out["letters"]["E"]["evidence"])
 
-    def test_no_jev_command_holds(self):
-        self.env["TRUE_CHECK_JEV_ASK"] = ""
+    def test_no_judge_command_holds(self):
+        self.env["TRUE_CHECK_JUDGE"] = ""
         self.env["PATH"] = "/usr/bin:/bin"
         rc, out, _ = self.run_eval(subject())
         self.assertEqual(rc, 11)
@@ -539,6 +561,225 @@ class Verify(Base):
     def test_bad_usage_exits_3(self):
         cp = subprocess.run(["python3", str(BIN), "nope"], capture_output=True, env=self.env)
         self.assertEqual(cp.returncode, 3)
+
+
+class Gaps(Base):
+    """Paul's 2026-11-24 gap spec, G1-G7."""
+
+    def setUp(self):
+        super().setUp()
+        self.ledger = self.tmp / "ledger.json"
+        self.env["GUILD_GATE_LEDGER"] = str(self.ledger)
+        self.rows([])
+
+    def rows(self, rows, **extra):
+        self.ledger.write_text(json.dumps({"gates": rows, **extra}))
+
+    def tc(self, *args):
+        return subprocess.run(["python3", str(BIN), *args], text=True, capture_output=True, env=self.env)
+
+    def shadow_calls(self):
+        p = self.tmp / "shadow-calls"
+        return int(p.read_text()) if p.exists() else 0
+
+    # G2
+    def test_never_gated_hold_by_name_before_any_call(self):
+        self.rows([{"id": "g", "actions": ["reply"], "repos": ["rymiwe/*"], "status": "approved"}])
+        for a in ("send", "purchase", "delete", "account-change", "booking"):
+            rc, out, _ = self.run_eval(subject(action=a, gate="g", repo="rymiwe/guild"))
+            self.assertEqual((rc, out["allow_reason"]), (11, f"never gated: {a} always goes to Ryan"))
+        self.assertEqual((self.calls(), self.shadow_calls()), (0, 0))
+
+    def test_row_listing_a_never_gated_action_is_refused(self):
+        self.rows([{"id": "g", "actions": ["reply", "send"], "repos": ["rymiwe/*"], "status": "approved"}])
+        rc, out, _ = self.run_eval(subject(action="reply", gate="g", repo="rymiwe/guild", pr=pr()))
+        self.assertEqual(rc, 11)
+        self.assertIn("lists never-gated action send", out["allow_reason"])
+
+    # G1
+    def test_approve_is_gateable(self):
+        rc, out, _ = self.run_eval(subject(action="approve", repo="rymiwe/guild", pr=pr()))
+        self.assertEqual(rc, 11)
+        self.assertIn("no gate row", out["allow_reason"])
+        self.rows([{"id": "g", "actions": ["approve"], "repos": ["rymiwe/*"], "status": "approved"}])
+        rc, out, _ = self.run_eval(subject(action="approve", gate="g", repo="rymiwe/guild", pr=pr()))
+        self.assertEqual(rc, 0)
+
+    def nodiff(self, action, **obj):
+        o = {"kind": "x", "count": 1, "undo": "delete line 42"}
+        o.update(obj)
+        s = subject(action=action, object=o)
+        del s["diff"]
+        return s
+
+    def test_nodiff_reminder_needs_undo(self):
+        rc, out, _ = self.run_eval(self.nodiff("reminder"))
+        self.assertEqual((rc, out["verdicts"]), (0, "T:pass R:pass U:pass E:pass P:pass"))
+        rc, out, _ = self.run_eval(self.nodiff("reminder", undo=""))
+        self.assertEqual(rc, 11)
+        self.assertIn("undo", out["letters"]["R"]["evidence"])
+
+    def test_nodiff_t_caps(self):
+        rc, out, _ = self.run_eval(self.nodiff("reminder", count=2))
+        self.assertIn("T", out["failed"])
+        rc, out, _ = self.run_eval(self.nodiff("routine-edit", name="digest", lines=21))
+        self.assertIn("T", out["failed"])
+
+    def test_nodiff_u_ignores_caller_letters(self):
+        s = self.nodiff("routine-edit", name="wes-pr-gate", lines=3)
+        s["letters"] = {"U": {"verdict": "pass", "evidence": "model"}}
+        s["U"] = "pass"
+        rc, out, _ = self.run_eval(s)
+        self.assertEqual(rc, 11)
+        self.assertIn("U:fail", out["verdicts"])
+        rc, out, _ = self.run_eval(self.nodiff("skill-edit", name="pay-bills", lines=3))
+        self.assertIn("U", out["failed"])
+
+    def test_nodiff_judge_reads_object_and_evidence(self):
+        self.run_eval(self.nodiff("reminder"))
+        req = json.loads((self.tmp / "request.json").read_text())
+        self.assertIn("delete line 42", req["state"])
+        self.assertIn("tests/test_parse.py", req["state"])
+        self.assertNotIn("Patch:", req["state"])
+
+    # G4
+    def test_evidence_is_required_before_the_judge(self):
+        s = subject()
+        del s["evidence"]
+        rc, out, _ = self.run_eval(s)
+        self.assertEqual((rc, out["letters"]["E"]["verdict"], self.calls()), (11, "fail", 0))
+        self.assertIn("evidence", out["letters"]["E"]["evidence"])
+        rc, out, _ = self.run_eval(subject(evidence=["x y"]))
+        self.assertEqual((rc, self.calls()), (11, 0))
+
+    def test_e_pass_citing_no_evidence_item_is_unknown(self):
+        a = jev()
+        a["answers"]["E"]["cites"] = "not-in-the-list"
+        self.answers([a])
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual((rc, out["letters"]["E"]["verdict"]), (11, "unknown"))
+
+    # G3
+    def test_p_fail_names_the_principle(self):
+        self.answers([jev(p="fail", principle="principle-subtract-before-you-add")])
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual(rc, 11)
+        self.assertIn("principle-subtract-before-you-add", out["letters"]["P"]["evidence"])
+
+    def test_p_fail_without_a_listed_principle_is_unknown(self):
+        self.answers([jev(p="fail", principle="principle-made-up")])
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual((rc, out["unknown"], self.calls()), (11, ["P"], 2))
+
+    def test_judge_request_lists_principles_and_excludes_builder(self):
+        self.run_eval(subject())
+        req = json.loads((self.tmp / "request.json").read_text())
+        self.assertIn("principle-fix-root-causes", req["principles"])
+        self.assertEqual(req["exclude_family"], "claude")
+
+    def test_judge_of_builder_family_holds(self):
+        self.answers([jev(family="grok")])
+        rc, out, _ = self.run_eval(subject(builder={"run_id": "r2"}))
+        self.assertEqual(rc, 11)
+        self.assertIn("same family", out["letters"]["E"]["evidence"])
+
+    def test_jev_is_log_only(self):
+        (self.tmp / "shadow.json").write_text(json.dumps({"id": "j", "answers": {"E": {"choice": "fail", "confidence": 1}}}))
+        rc, out, _ = self.run_eval(subject())
+        self.assertEqual((rc, out["jev_shadow"]["answer"]["answers"]["E"]["choice"]), (0, "fail"))
+        self.assertEqual(self.shadow_calls(), 1)
+        rc, out, _ = self.run_eval(subject(), ["--no-jev"])
+        self.assertEqual((rc, self.shadow_calls()), (0, 1))
+
+    # G6
+    def test_jev_unavailable_changes_no_verdict(self):
+        for cmd in (str(self.tmp / "missing"), "/bin/false"):
+            self.env["TRUE_CHECK_JEV_ASK"] = cmd
+            rc, out, _ = self.run_eval(subject())
+            self.assertEqual(rc, 0)
+            self.assertTrue(out["jev"].startswith("jev: unavailable"), out["jev"])
+
+    # G7
+    def seats(self, *seats, default="claude"):
+        f = self.tmp / "seats.json"
+        f.write_text(json.dumps([{"family": a, "model": b} for a, b in seats]))
+        self.env.update(TRUE_CHECK_SEATS=str(f), TRUE_CHECK_DEFAULT_FAMILY=default)
+
+    def unknown_builder(self, **extra):
+        s = subject(**extra)
+        s.pop("builder", None)
+        s.update(extra)
+        return s
+
+    def test_unknown_builder_uses_two_families(self):
+        self.seats(("gpt", "g"), ("claude", "c"), ("gemini", "x"))
+        rc, out, _ = self.run_eval(self.unknown_builder())
+        self.assertEqual((rc, self.calls()), (0, 2))
+        self.assertIn("two-family fallback: gpt, gemini", out["reviewers"])
+
+    def test_one_failing_fallback_reviewer_holds(self):
+        self.seats(("gpt", "g"), ("gemini", "x"))
+        self.answers([jev(), jev(e="fail")])
+        rc, out, _ = self.run_eval(self.unknown_builder())
+        self.assertEqual((rc, out["failed"]), (11, ["E"]))
+
+    def test_no_two_eligible_families_holds(self):
+        self.seats(("gpt", "g"), ("claude", "claude-sonnet"))
+        rc, out, _ = self.run_eval(self.unknown_builder(builder={"family_claimed": "anthropic"}))
+        self.assertEqual((rc, self.calls()), (11, 0))
+        self.assertIn("builder family unverified", out["letters"]["E"]["evidence"])
+        self.seats(("gpt", "g"), ("claude", "claude-opus-5-5"), default="grok")
+        rc, out, _ = self.run_eval(self.unknown_builder())
+        self.assertIn("builder family unverified", out["letters"]["E"]["evidence"])
+
+    def test_claim_is_noted_never_trusted(self):
+        rc, out, _ = self.run_eval(subject(builder={"run_id": "r1", "family_claimed": "openai"}))
+        self.assertEqual((rc, out["builder"]["family"]), (0, "claude"))
+        self.assertIn("mismatch: self-reported gpt", out["builder"]["source"])
+
+    # G5
+    ROW = {"id": "g-a", "actions": ["reply"], "repos": ["rymiwe/*"], "status": "approved", "owner": "Code Cole",
+           "scope": "reply | on rymiwe", "ryan_pick": "t1u", "verdict": "paul/v.md", "date": "2026-11-24"}
+
+    def test_ledger_render_matches_golden(self):
+        rows = [self.ROW, {**self.ROW, "id": "g-b", "status": "pending proof", "actions": ["approve", "reply"]}]
+        self.rows(rows, preamble=["# Autonomy gates", ""])
+        cp = self.tc("ledger-render")
+        golden = ("<!-- generated from gate-ledger.json by true-check ledger-render; do not edit -->\n"
+                  "# Autonomy gates\n\n"
+                  "| id | date | Ryan pick | scope | owner | verdict | status | actions | repos |\n"
+                  "|---|---|---|---|---|---|---|---|---|\n"
+                  "| g-a | 2026-11-24 | t1u | reply \\| on rymiwe | Code Cole | paul/v.md | approved | reply | rymiwe/* |\n"
+                  "| g-b | 2026-11-24 | t1u | reply \\| on rymiwe | Code Cole | paul/v.md | pending proof | approve, reply | rymiwe/* |\n")
+        self.assertEqual((cp.returncode, cp.stdout), (0, golden))
+
+    def test_ledger_check_catches_a_hand_edit(self):
+        self.rows([self.ROW])
+        f = self.tmp / "autonomy-gates.md"
+        self.assertEqual(self.tc("ledger-render", "--out", str(f)).returncode, 0)
+        self.assertEqual(self.tc("ledger-check", str(f)).returncode, 0)
+        f.write_text(f.read_text().replace("approved", "active"))
+        cp = self.tc("ledger-check", str(f))
+        self.assertEqual(cp.returncode, 11)
+        self.assertIn("LEDGER DRIFT", cp.stdout)
+
+    def test_ledger_render_needs_every_field_and_renders_a_send_row(self):
+        bad = dict(self.ROW)
+        del bad["owner"]
+        self.rows([bad])
+        self.assertEqual(self.tc("ledger-render").returncode, 3)
+        self.rows([{**self.ROW, "actions": ["send"]}])
+        self.assertEqual(self.tc("ledger-render").returncode, 0)
+        rc, out, _ = self.run_eval(subject(action="reply", gate="g-a", repo="rymiwe/guild", pr=pr()))
+        self.assertIn("lists never-gated action send", out["allow_reason"])
+
+    def test_interface_is_backward_compatible(self):
+        self.assertEqual(json.loads(self.tc("limits").stdout)["jev_min"], 0.7)
+        rc, out, _ = self.run_eval(subject())
+        self.assertTrue({"status", "failed", "unknown", "allowed", "allow_reason", "letters", "jev_calls",
+                         "subject_sha256"} <= set(out))
+        self.assertEqual(self.tc("eval").returncode, 3)
+        self.assertEqual(self.tc("ledger-check").returncode, 3)
 
 
 if __name__ == "__main__":
