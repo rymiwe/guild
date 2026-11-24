@@ -875,7 +875,8 @@ def safe(st) -> bool:
 def open_consumed(create: bool) -> int | None:
     """consumed.log as an fd: never through a symlink, never when group/other-writable. None if absent."""
     import stat
-    flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | (os.O_CREAT if create else 0)
+    # O_NONBLOCK: a FIFO here must not block the open; fstat below refuses anything not a plain file.
+    flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if create else 0)
     try:
         fd = os.open(consumed_log(), flags, 0o600)
     except FileNotFoundError:
@@ -958,12 +959,24 @@ def gate_pass(subject: dict, gate: str) -> tuple[str | None, str | None]:
         if not name.endswith(".json"):
             continue
         try:
-            fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW)
+            lst = os.lstat(f)
+        except OSError:
+            continue  # gone
+        if not stat.S_ISREG(lst.st_mode):
+            # A FIFO, device, link or dir named *.json: opening a FIFO would block (D11).
+            why = f"enforced_by {gate}: {name} is not a plain file; skipped"
+            continue
+        try:
+            # O_NONBLOCK: if the entry was swapped for a FIFO after lstat, the open still returns.
+            fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError:
             continue  # a link, or gone
         try:
             st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or not safe(st):
+            if not stat.S_ISREG(st.st_mode):
+                why = f"enforced_by {gate}: {name} is not a plain file; skipped"
+                continue
+            if not safe(st):
                 continue  # a record anyone else could write proves nothing
             with os.fdopen(os.dup(fd), "rb") as fh:
                 raw = fh.read()
