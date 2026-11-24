@@ -11,6 +11,12 @@ flock on LOG.lock. LOG is --file, else $SCORECARD_FILE or its alias
 $HITL_SCORECARD_LOG, else the fleet default; both env vars set to different
 files exits 2 with the log untouched (same rule as lint-scorecard).
 Never rewrites old rows. No secrets in rows.
+
+match_poteto: a resolution row (one with ryan_pick) that has no match_poteto
+gets it filled under the lock: true when ryan_pick's letter equals the latest
+stage poteto-shadow row's poteto_lean letter for that decision_id, false when
+it differs. No poteto-shadow row, or a lean that is null or unavailable,
+leaves the row as written. A match_poteto the writer set is kept.
 """
 import fcntl
 import json
@@ -52,12 +58,39 @@ def main(argv) -> int:
         sys.stderr.write("scorecard-append: refused; log unchanged\n")
         return 1
     row = json.loads(text.strip())
-    line = json.dumps(row, ensure_ascii=False) + "\n"
     with open(path + ".lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
+        fill_match_poteto(path, row)
         with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
     return 0
+
+
+def poteto_lean_of(path, did):
+    lean = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"poteto-shadow"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("decision_id") == did and r.get("stage") == "poteto-shadow":
+                    lean = r.get("poteto_lean")
+    except FileNotFoundError:
+        return None
+    return lean if isinstance(lean, str) and len(lean) == 1 and lean.isupper() else None
+
+
+def fill_match_poteto(path, row):
+    pick = row.get("ryan_pick")
+    if "match_poteto" in row or not isinstance(pick, str) or not pick.strip():
+        return
+    lean = poteto_lean_of(path, row.get("decision_id"))
+    if lean is not None:
+        row["match_poteto"] = pick.strip()[:1] == lean
 
 
 if __name__ == "__main__":

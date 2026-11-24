@@ -26,7 +26,12 @@ The baseline counts non-empty rows, the same rows the lint counts.
 Rules come from skill jev-hitl-triage (Steps 2-4 and the Scorecard section).
 Exit 2 on usage error or missing file.
 
-Row codes:      JSON, TS, BOT, DECISION_ID, AUTOMATABLE, JEV_REASON
+Row codes:      JSON, TS, BOT, DECISION_ID, AUTOMATABLE, JEV_REASON, POTETO
+POTETO (stage poteto-shadow rows, from poteto-judge): poteto_rubric is set;
+poteto_lean is one option letter (with poteto_principle), null (no lean) or
+"unavailable" (with poteto_reason); auto_state is rule, assist, human or
+unavailable, and rule needs auto_kind gate-row, check or policy plus auto_rule.
+On any row, auto_state (if present) uses that set and match_poteto is a bool.
 Decision codes (a decision is any decision_id with an `options` or
 `bot_lean` row): NO_BOT_LEAN, NO_BOT_LEAN_TS, NO_JEV_LEAN, NO_JEV_TS,
 LEAN_ORDER (bot_lean_ts later than jev_ts).
@@ -44,6 +49,9 @@ from collections import Counter
 DEFAULT_FILE = os.path.expanduser("~/agent-data/fleet/experiments/hitl-scorecard/log.jsonl")
 GROUP_PLACEHOLDERS = frozenset({"Family", "Household", "Money", "Media", "Staff"})
 AUTOMATABLE = frozenset({"full", "partial", "no"})
+AUTO_STATES = frozenset({"rule", "assist", "human", "unavailable"})
+RULE_KINDS = frozenset({"gate-row", "check", "policy"})
+LETTER_RE = re.compile(r"^[A-Z]$")
 TS_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:[+-]\d{2}:?\d{2}|Z)$"
 )
@@ -140,6 +148,38 @@ def row_problems(row, names: set[str]) -> list[tuple[str, str]]:
             out.append(("AUTOMATABLE", f"{k}={row[k]!r} must be full, partial or no"))
     if row.get("jev_lean") == "unavailable" and not row.get("jev_reason"):
         out.append(("JEV_REASON", "jev_lean=unavailable needs jev_reason in the same row"))
+    out.extend(("POTETO", why) for why in poteto_problems(row))
+    return out
+
+
+def poteto_problems(row: dict) -> list[str]:
+    out = []
+    if "match_poteto" in row and not isinstance(row["match_poteto"], bool):
+        out.append(f"match_poteto={row['match_poteto']!r} must be true or false")
+    if "auto_state" in row and row["auto_state"] not in AUTO_STATES:
+        out.append(f"auto_state={row['auto_state']!r} must be rule, assist, human or unavailable")
+    if row.get("stage") != "poteto-shadow":
+        return out
+    if not isinstance(row.get("poteto_rubric"), str) or not row["poteto_rubric"].strip():
+        out.append("poteto-shadow row needs poteto_rubric")
+    if "poteto_lean" not in row:
+        out.append("poteto-shadow row needs poteto_lean (a letter, null or unavailable)")
+    lean = row.get("poteto_lean")
+    if lean == "unavailable":
+        if not row.get("poteto_reason"):
+            out.append("poteto_lean=unavailable needs poteto_reason")
+    elif lean is not None:
+        if not isinstance(lean, str) or not LETTER_RE.match(lean):
+            out.append(f"poteto_lean={lean!r} must be one option letter, null or unavailable")
+        elif not isinstance(row.get("poteto_principle"), str) or not row["poteto_principle"].strip():
+            out.append("a poteto_lean letter needs poteto_principle")
+    if "auto_state" not in row:
+        out.append("poteto-shadow row needs auto_state")
+    elif row["auto_state"] == "rule":
+        if row.get("auto_kind") not in RULE_KINDS:
+            out.append(f"auto_kind={row.get('auto_kind')!r} must be gate-row, check or policy")
+        if not isinstance(row.get("auto_rule"), str) or not row["auto_rule"].strip():
+            out.append("auto_state=rule needs auto_rule")
     return out
 
 
