@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""poteto-judge: one other-family judge call per decision card. Never blocks a card.
+
+usage: poteto-judge card DECISION_ID
+       poteto-judge request DECISION_ID [--true-subject SUBJECT.json]
+
+card prints one JSON object {"line", "text", "row", "candidate"}:
+  line       "🥔 Poteto: <letter> · <Principle>", "🥔 Poteto: no lean (<why>)" or
+             "🥔 Poteto: unavailable (<reason>)". A lean is shown only when the judge
+             named an option letter and one rubric principle exactly; anything else is
+             unavailable, never a guessed lean.
+  text       "🤖 Automate: rule (<kind>) · <rule, 60 chars max>" | "assist · <why>" |
+             "keep human · <why>" | "unavailable (<reason>)".
+  row        a stage "poteto-shadow" scorecard row (bot, decision_id, poteto_*, auto_*).
+             poteto-judge never writes it: the caller (decision-options) appends it
+             through scorecard-append.
+  candidate  for a valid "rule" answer, {key, bot, kind, rule (full text), decision_id,
+             why}; else null. key = sha256(bot|kind|normalized rule)[:12].
+It exits 0 on every model problem (error, timeout, bad JSON, unlisted principle);
+exit 1 only when the log has no pre-card options for DECISION_ID, 2 on usage.
+
+request prints the request without calling a model. With --true-subject it is the
+shared request: true-check's E and P questions (from bin/true-check itself) plus the
+poteto question, so one call answers all four. true-check reads only answers.E and
+answers.P; poteto-judge reads answers.poteto (or a flat answer).
+
+Blind packet: options, notes and gate_candidate (plus bot, for the row) from rows
+logged before the first card-built or resolution row. Never bot_lean, jev_* or
+anything written after the card.
+
+Rubric: Paul-owned docs/rubric-vN.md beside true-check (highest N), or
+$POTETO_RUBRIC. Its "- Name: ..." lines are the principle list; each must map to a
+true-check PRINCIPLE_NAMES slug. The version logged is vN-<sha256[:8]>.
+
+Never-gated: a "rule" naming one of true-check's NEVER_GATED actions (or the
+keyword backstop: send, post, pay, delete, close, booking, account, permission,
+share, ...) is "unavailable (never-gated action)". It never creates a gate.
+
+Seat: Gemini gemini-4-neon-low through agy (another family from the bots and
+from Jev, not Opus). No fallback seat: if agy fails, the lean is unavailable.
+Never metered Cursor. Budget $POTETO_JUDGE_TIMEOUT seconds (default 20) for the
+call and at most one retry inside it.
+
+Env: HITL_SCORECARD_LOG | SCORECARD_FILE (log), POTETO_RUBRIC, POTETO_JUDGE_TIMEOUT,
+POTETO_JUDGE_CMD (tests: a command reading the prompt on stdin).
+"""
+from __future__ import annotations
+
+import glob
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+TRUE_CHECK = os.path.join(HERE, "true-check")
+DEFAULT_LOG = os.path.expanduser("~/agent-data/fleet/experiments/hitl-scorecard/log.jsonl")
+DEFAULT_MODEL = "gemini-4-neon-low"
+DEFAULT_TIMEOUT = 20.0
+MIN_RETRY_S = 2.0
+CARD_RULE_MAX = 60
+POST_CARD = {"card-built", "resolution", "resolved", "decided", "ryan", "auto-proceed"}
+PACKET_KEYS = ("bot", "options", "notes", "gate_candidate")
+RULE_KINDS = {"gate-row", "check", "policy"}
+BACKSTOP = re.compile(r"\b(send|sends|email|e-mail|text|sms|dm|post|reply|buy|purchase|pay|payment|order|"
+                      r"delete|remove|trash|close|book|booking|account|password|permission|share)\b", re.I)
+# Rubric names whose slug is not the plain hyphenated name.
+SLUG_ALIASES = {"Sequence Work into Verifiable Units": "principle-sequence-verifiable-units"}
+
+
+def true_check():
+    loader = importlib.machinery.SourceFileLoader("true_check", TRUE_CHECK)
+    spec = importlib.util.spec_from_loader("true_check", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def never_gated_re(tc=None) -> re.Pattern:
+    tc = tc or true_check()
+    words = [re.escape(w).replace(r"\-", "[- ]") for w in tc.NEVER_GATED]
+    return re.compile(r"\b(" + "|".join(words) + r")", re.I)
+
+
+def principle_slug(name: str) -> str:
+    return SLUG_ALIASES.get(name) or "principle-" + "-".join(name.lower().replace("-", " ").split())
+
+
+def rubric_path() -> str:
+    if os.environ.get("POTETO_RUBRIC"):
+        return os.environ["POTETO_RUBRIC"]
+    found = []
+    for p in glob.glob(os.path.join(ROOT, "docs", "rubric-v*.md")):
+        m = re.fullmatch(r"rubric-v(\d+)\.md", os.path.basename(p))
+        if m:
+            found.append((int(m.group(1)), p))
+    if not found:
+        raise FileNotFoundError("no docs/rubric-vN.md beside true-check")
+    return max(found)[1]
+
+
+def rubric(path: str | None = None):
+    path = path or rubric_path()
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    names = set(re.findall(r"^- ([A-Z][A-Za-z -]+?):", text, re.M))
+    m = re.search(r"rubric-(v\d+)\.md$", os.path.basename(path))
+    version = (m.group(1) if m else "v?") + "-" + hashlib.sha256(text.encode()).hexdigest()[:8]
+    return text, names, version
+
+
+def log_path() -> str:
+    return os.environ.get("HITL_SCORECARD_LOG") or os.environ.get("SCORECARD_FILE") or DEFAULT_LOG
+
+
+def blind_packet(did: str, path: str | None = None) -> dict:
+    merged = {}
+    with open(path or log_path(), encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(r, dict) or r.get("decision_id") != did:
+                continue
+            if r.get("stage") in POST_CARD or "ryan_pick" in r:
+                break
+            for k in PACKET_KEYS:
+                if k in r:
+                    merged[k] = r[k]
+    return merged
+
+
+def prompt_for(packet: dict, text: str) -> str:
+    return text + "\n\nDecision packet:\n" + json.dumps(packet, ensure_ascii=False, indent=1)
+
+
+def shared_request(packet: dict, subject: dict, path: str | None = None) -> dict:
+    """true-check's E/P request plus the poteto question: one call answers both."""
+    tc = true_check()
+    text, _, version = rubric(path)
+    req = tc.judge_request(subject, tc.uses_nodiff(subject), None, None)
+    req["questions"]["poteto"] = {"type": "object", "rubric": version, "prompt": prompt_for(packet, text)}
+    return req
+
+
+def answer_of(raw: dict) -> dict:
+    a = raw.get("answers") if isinstance(raw.get("answers"), dict) else None
+    if a is not None and isinstance(a.get("poteto"), dict):
+        return a["poteto"]
+    return raw
+
+
+def default_cmd() -> str:
+    return f'agy --model {DEFAULT_MODEL} --disable-slash-commands -p "$(cat)"'
+
+
+def ask_once(prompt: str, timeout: float) -> dict:
+    cmd = os.environ.get("POTETO_JUDGE_CMD")
+    if not cmd:
+        if not shutil.which("agy"):
+            raise RuntimeError("agy not on PATH")
+        cmd = default_cmd()
+    p = subprocess.run(cmd, shell=True, input=prompt, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        err = re.search(r'"status":"([A-Z_]+)"', p.stdout + p.stderr)
+        raise RuntimeError(f"judge exit {p.returncode}" + (f" {err.group(1)}" if err else ""))
+    m = re.search(r"\{.*\}", p.stdout, re.S)
+    if not m:
+        raise RuntimeError("no JSON in judge answer")
+    raw = json.loads(m.group(0))
+    if not isinstance(raw, dict):
+        raise RuntimeError("judge answer is not an object")
+    return answer_of(raw)
+
+
+def ask(prompt: str, budget: float) -> dict:
+    """One call, plus one retry only if the budget has room. A timeout is not retried."""
+    t0 = time.monotonic()
+    try:
+        return ask_once(prompt, budget)
+    except subprocess.TimeoutExpired:
+        raise
+    except Exception:
+        left = budget - (time.monotonic() - t0)
+        if left < MIN_RETRY_S:
+            raise
+        return ask_once(prompt, left)
+
+
+def clip(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def automate(a: dict, packet: dict, did: str, gated: re.Pattern):
+    """Return (row fields, card text, candidate or None). Never raises."""
+    state, kind, rule = a.get("automate"), a.get("rule_kind"), str(a.get("rule") or "").strip()
+    why = str(a.get("automate_why") or "").strip()[:80]
+    banned = bool(rule) and bool(gated.search(rule) or BACKSTOP.search(rule))
+    if state == "rule" and kind in RULE_KINDS and rule and len(rule.split()) <= 30 and not banned:
+        norm = " ".join(rule.lower().split())
+        key = hashlib.sha256(f"{packet.get('bot')}|{kind}|{norm}".encode()).hexdigest()[:12]
+        cand = {"key": key, "bot": packet.get("bot"), "kind": kind, "rule": rule, "decision_id": did, "why": why}
+        fields = {"auto_state": "rule", "auto_kind": kind, "auto_rule": rule, "auto_why": why}
+        return fields, f"🤖 Automate: rule ({kind}) · {clip(rule, CARD_RULE_MAX)}", cand
+    if state == "assist":
+        return {"auto_state": "assist", "auto_why": why}, f"🤖 Automate: assist · {why}", None
+    if state == "human":
+        return {"auto_state": "human", "auto_why": why}, f"🤖 Automate: keep human · {why}", None
+    reason = "never-gated action" if state == "rule" and banned else "invalid automate answer"
+    return {"auto_state": "unavailable", "auto_reason": reason}, f"🤖 Automate: unavailable ({reason})", None
+
+
+def judge_card(did: str) -> dict | None:
+    text, names, version = rubric()
+    tc = true_check()
+    names = {n for n in names if principle_slug(n) in tc.PRINCIPLE_NAMES}
+    gated = never_gated_re(tc)
+    packet = blind_packet(did)
+    if not isinstance(packet.get("options"), dict) or not packet["options"]:
+        return None
+    custom = bool(os.environ.get("POTETO_JUDGE_CMD"))
+    row = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "bot": packet.get("bot"),
+           "decision_id": did, "stage": "poteto-shadow", "poteto_rubric": version,
+           "poteto_model": "custom" if custom else DEFAULT_MODEL}
+    text_line, cand = "🤖 Automate: unavailable (no answer)", None
+    t0 = time.monotonic()
+    try:
+        a = ask(prompt_for(packet, text), float(os.environ.get("POTETO_JUDGE_TIMEOUT") or DEFAULT_TIMEOUT))
+        af, text_line, cand = automate(a, packet, did, gated)
+        row.update(af)
+        lean, principle = a.get("lean"), a.get("principle")
+        if lean is None:
+            row.update(poteto_lean=None, poteto_why=str(a.get("why") or "")[:120])
+            line = f"🥔 Poteto: no lean ({row['poteto_why']})"
+        elif lean not in packet["options"]:
+            raise ValueError(f"letter {lean!r} not in options")
+        elif principle not in names:
+            raise ValueError(f"principle {principle!r} not in rubric")
+        else:
+            conf = a.get("conf")
+            row.update(poteto_lean=lean, poteto_principle=principle, poteto_why=str(a.get("why") or "")[:120],
+                       poteto_conf=conf if isinstance(conf, (int, float)) and not isinstance(conf, bool) else None)
+            line = f"🥔 Poteto: {lean} · {principle}"
+    except subprocess.TimeoutExpired:
+        row.update(poteto_lean="unavailable", poteto_reason="timeout", auto_state="unavailable",
+                   auto_reason="timeout")
+        line, text_line, cand = "🥔 Poteto: unavailable (timeout)", "🤖 Automate: unavailable (timeout)", None
+    except Exception as e:  # never block a card
+        reason = (str(e) or type(e).__name__)[:80]
+        row.update(poteto_lean="unavailable", poteto_reason=reason)
+        if "auto_state" not in row:
+            row.update(auto_state="unavailable", auto_reason=reason)
+        line = f"🥔 Poteto: unavailable ({reason})"
+    row["poteto_latency_s"] = round(time.monotonic() - t0, 1)
+    return {"line": line, "text": text_line, "row": row, "candidate": cand}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "card":
+        try:
+            out = judge_card(argv[1])
+        except FileNotFoundError as e:
+            print(f"poteto-judge: {e}", file=sys.stderr)
+            return 1
+        if out is None:
+            print(f"poteto-judge: no pre-card options for {argv[1]}", file=sys.stderr)
+            return 1
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    if len(argv) in (2, 4) and argv[0] == "request":
+        packet = blind_packet(argv[1])
+        if len(argv) == 4 and argv[2] == "--true-subject":
+            with open(argv[3]) as f:
+                req = shared_request(packet, json.load(f))
+        elif len(argv) == 2:
+            text, _, version = rubric()
+            req = {"rubric": version, "prompt": prompt_for(packet, text)}
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+        print(json.dumps(req, ensure_ascii=False, indent=1))
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
