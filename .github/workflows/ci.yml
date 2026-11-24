@@ -134,6 +134,9 @@ jobs:
       - name: Run the Grok Bot pace check tests
         run: python3 tests/test_grokbot_pace_check.py -v
 
+      - name: Run the HITL scorecard lint tests
+        run: python3 -W error::ResourceWarning tests/test_lint_scorecard.py -v
+
       - name: Run the outcome ledger tests
         run: python3 tests/test_guild_ledger.py -v
 

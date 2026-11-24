@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Append one row to the fleet HITL scorecard after validating it.
+
+usage: echo '<one JSON object>' | scorecard-append [--file LOG]
+
+Validation is `lint-scorecard --check` (same rules as the lint: ts with
+offset, canonical bot name, decision_id, automatable_* in full/partial/no,
+jev_reason when jev_lean is unavailable). A bad row is refused with exit 1,
+a message on stderr, and a byte-identical log. The append happens under
+flock on LOG.lock. LOG is --file, else $SCORECARD_FILE or its alias
+$HITL_SCORECARD_LOG, else the fleet default; both env vars set to different
+files exits 2 with the log untouched (same rule as lint-scorecard).
+Never rewrites old rows. No secrets in rows.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+
+import importlib.machinery
+import importlib.util
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LINT = os.path.join(HERE, "lint-scorecard")
+
+
+def _lint_module():
+    loader = importlib.machinery.SourceFileLoader("lint_scorecard", LINT)
+    spec = importlib.util.spec_from_loader("lint_scorecard", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def main(argv) -> int:
+    cli_file = None
+    if argv[:1] == ["--file"] and len(argv) == 2:
+        cli_file = argv[1]
+    elif argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    path, err = _lint_module().resolve_log(cli_file)
+    if err:
+        print(f"scorecard-append: {err}; log unchanged", file=sys.stderr)
+        return 2
+    text = sys.stdin.read()
+    chk = subprocess.run([sys.executable, LINT, "--check"], input=text,
+                         capture_output=True, text=True)
+    if chk.returncode != 0:
+        sys.stderr.write(chk.stderr)
+        sys.stderr.write("scorecard-append: refused; log unchanged\n")
+        return 1
+    row = json.loads(text.strip())
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    with open(path + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
