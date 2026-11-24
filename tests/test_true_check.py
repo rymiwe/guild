@@ -876,12 +876,14 @@ class Conditions(Base):
         self.assertEqual((rc, ok), (11, False))
         self.assertIn("unknown condition max_per_day", why)
 
-    def test_approved_row_needs_a_conditions_object(self):
+    def test_conditions_must_be_an_object_and_absent_means_none(self):
+        self.row(["open-pr"], ["draft"])
+        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
+        self.assertEqual((rc, ok, why), (11, False, "gate row g is malformed: conditions must be an object"))
         self.ledger.write_text(json.dumps({"gates": [{"id": "g", "actions": ["open-pr"], "repos": ["example/*"],
                                                       "status": "approved"}]}))
-        rc, ok, why = self.act(action="open-pr", draft=True, reviewers=[], assignees=[])
-        self.assertEqual((rc, ok), (11, False))
-        self.assertIn("no conditions object", why)
+        rc, ok, why = self.act(action="open-pr")
+        self.assertEqual((rc, ok), (0, True), "no conditions key: the row alone grants, as before")
 
     # 3. open-pr: draft only, no reviewers (P5, P6); mark-ready stays unknown
     def test_p5_open_pr_without_draft_field_holds(self):

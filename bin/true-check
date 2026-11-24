@@ -38,8 +38,9 @@ that covers the action and repo ("*" for a type with no repo):
               "status": "approved", "conditions": {...}, "notes": "...", "owner": "...",
               "scope": "...", "ryan_pick": "...", "verdict": "...", "date": "YYYY-MM-DD"}]}
 allow reads id, actions, repos, status and conditions; ledger-render needs all
-eleven. An approved row must carry a conditions object ({} for none). Each
-condition binds only the actions named here; an unknown key holds the row:
+eleven. A row with no conditions key has none (the row is the whole grant), so
+flip a row to approved only with its conditions in place. Each condition binds
+only the actions named here; an unknown key or a non-object holds the row:
   draft: true          open-pr needs subject.draft true
   reviewers: N         open-pr needs subject.reviewers as a list of at most N
   assignees: N         open-pr needs subject.assignees as a list of at most N
@@ -933,9 +934,7 @@ def ledger_row(subject: dict, repo: str) -> tuple[bool, str]:
         repos = [r.casefold() for r in repos]
         if not any(r == repo or r == "*" or (r.endswith("/*") and repo.startswith(r[:-1])) for r in repos):
             return False, f"gate row {gate} does not cover {repo}"
-        if "conditions" not in row:
-            return False, f"gate row {gate} is malformed: no conditions object"
-        why = conditions_hold(subject, gate, row["conditions"])
+        why = conditions_hold(subject, gate, row.get("conditions", {}))
         if why:
             return False, why
         return True, f"gate row {gate} approves {subject['action']} on {repo}"
