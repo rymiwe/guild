@@ -117,10 +117,11 @@ class GuildUpdateTest(unittest.TestCase):
         self.root.mkdir(parents=True)
         self._git("clone", "-q", str(self.guild_origin), str(self.root / "src"))
 
-    def update(self, runs: str) -> subprocess.CompletedProcess[str]:
+    def update(self, runs: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
         self.runs.write_text(runs)
         env = {
             **self.git_env,
+            **({"HOME": str(home)} if home else {}),
             "PATH": step1.build_clean_path(self.stub_bin),
             "GUILD_RELEASE_ROOT": str(self.root),
             "GUILD_MEMBER_SOURCES_DIR": str(self.sources),
@@ -139,11 +140,66 @@ class GuildUpdateTest(unittest.TestCase):
         link = self.root / "current"
         return os.readlink(link) if link.is_symlink() else None
 
-    def notifications(self) -> list[str]:
-        return self.notify_log.read_text().splitlines() if self.notify_log.exists() else []
+    def notifications(self, status: str = "FAILED") -> list[str]:
+        lines = self.notify_log.read_text().splitlines() if self.notify_log.exists() else []
+        return [line for line in lines if f" guild-update {status} " in line]
 
     def head_id(self) -> str:
         return "g-" + self._git("rev-parse", "HEAD", cwd=self.guild_work).stdout.strip()[:12]
+
+    def test_home_check_pings_once_per_release_that_home_lags(self) -> None:
+        # A real HOME layout: quartermaster's --check finds Guild's host guild-exec under it.
+        home = self.root.parent / "home"
+        self.root = home / ".local" / "share" / "guild"
+        self.root.mkdir(parents=True)
+        self._git("clone", "-q", str(self.guild_origin), str(self.root / "src"))
+        runs = "completed success pr-gate-contract\n"
+
+        # An empty HOME lags every member.
+        proc = self.update(runs, home)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        first = self.head_id()
+        self.assertEqual(self.current(), f"releases/{first}")
+        lag = self.notifications("HOME-LAG")
+        self.assertEqual(len(lag), 1, proc.stderr)
+        for member in PINS:
+            self.assertIn(member, lag[0])
+
+        # Install every member into HOME through current/, as a release machine does.
+        gate = home / ".local" / "share" / "quartermaster" / "bin"
+        (home / ".local" / "bin").mkdir(parents=True)
+        os.symlink(self.root / "src" / "bin" / "guild-exec-host", home / ".local" / "bin" / "guild-exec")
+        (home / ".bash_profile").write_text(f"PATH={gate}:$PATH\n")
+        env = {**self.git_env, "HOME": str(home), "PSTACK_HOME": str(self.pstack),
+               "PATH": step1.build_clean_path(gate, home / ".local" / "bin")}
+        for member in PINS:
+            installer = self.root / "current" / "code" / member / "install.sh"
+            subprocess.run(["bash", str(installer)], env=env, check=True, capture_output=True)
+
+        # The next release finds HOME current, unit and skill links included.
+        (self.guild_work / "home-check-marker").write_text("1\n")
+        try:
+            self.commit_guild("A second release")
+            proc = self.update(runs, home)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(self.current(), f"releases/{self.head_id()}")
+            self.assertNotIn("HOME lags", proc.stderr)
+            self.assertEqual(len(self.notifications("HOME-LAG")), 1)
+
+            # A wrapper removed by hand shows up at the next release, which names only its member.
+            (home / ".local" / "bin" / "conclave-review").unlink()
+            (self.guild_work / "home-check-marker").write_text("2\n")
+            self.commit_guild("A third release")
+            proc = self.update(runs, home)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lag = self.notifications("HOME-LAG")
+            self.assertEqual(len(lag), 2)
+            self.assertIn("for: conclave (", lag[1])
+            self.assertFalse((self.root / "releases" / first).exists(), "prune should drop the first release")
+            self.assertTrue((home / ".claude" / "skills" / "bopeep").exists(), "the skill link must not dangle")
+        finally:
+            (self.guild_work / "home-check-marker").unlink()
+            self.commit_guild("Drop the marker")
 
     def test_member_fetch_error_is_transient(self) -> None:
         bopeep = self.sources / "bopeep"
