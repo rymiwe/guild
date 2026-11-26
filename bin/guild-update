@@ -17,14 +17,16 @@
 #      $GUILD_MEMBER_SOURCES_DIR, and runs the candidate's `guild-release deploy` (or
 #      `switch`, when an earlier run built the release but did not activate it). A
 #      failure writes failed/<id> and leaves the active release and $GUILD_SRC in place.
-#   5. On success, records installed/<id>, restarts the watcher (try-restart: only when it
-#      runs), prunes unused releases, and moves $GUILD_SRC to that commit, so a new updater
-#      and host guild-exec take effect only with a release that deployed.
+#   5. On success, records installed/<id>, runs each member's `install.sh --check` against
+#      HOME from the new release, restarts the watcher (try-restart: only when it runs),
+#      prunes unused releases, and moves $GUILD_SRC to that commit, so a new updater and
+#      host guild-exec take effect only with a release that deployed.
 #
 # Reporting: a failure exits 1 and sends one `job-notify --send` ping per commit (or per
 # error streak). A fetch or GitHub API error is transient and exits 0; from the 8th in a
 # row (2 hours at the timer's pace) each run fails. A run that gets past every fetch
-# ends a streak.
+# ends a streak. A HOME that fails a member's --check after a switch sends one HOME-LAG
+# ping per release and does not fail the run.
 #
 # Environment:
 #   GUILD_RELEASE_ROOT        release root (default ~/.local/share/guild)
@@ -44,20 +46,25 @@ wait_limit_s=86400
 
 say() { printf 'guild-update: %s\n' "$*" >&2; }
 
-# fail KEY MESSAGE: exit 1, pinging once per KEY. job-notify does not report delivery.
+# ping KEY STATUS MESSAGE: one job-notify ping per KEY. job-notify does not report delivery.
+ping() {
+  local key=$1 status=$2
+  shift 2
+  [ ! -e "$state/pinged/$key" ] || return 0
+  touch "$state/pinged/$key"
+  if command -v job-notify >/dev/null 2>&1; then
+    job-notify --send "$root" guild-update "$status" "$(tr -cd '[:print:]' <<<"$*" | tr -d '\\"')" ||
+      say "job-notify failed"
+  else
+    say "job-notify not on PATH"
+  fi
+}
+# fail KEY MESSAGE: exit 1, pinging once per KEY.
 fail() {
   local key=$1
   shift
   say "FAILED: $*"
-  if [ ! -e "$state/pinged/$key" ]; then
-    touch "$state/pinged/$key"
-    if command -v job-notify >/dev/null 2>&1; then
-      job-notify --send "$root" guild-update FAILED "$(tr -cd '[:print:]' <<<"$*" | tr -d '\\"')" ||
-        say "job-notify failed"
-    else
-      say "job-notify not on PATH"
-    fi
-  fi
+  ping "$key" FAILED "$@"
   exit 1
 }
 transient() {
@@ -147,6 +154,22 @@ touch "$root/installed/$id"
 all_clear
 say "activated $id"
 
+# A switch moves only the release dir. Each member's --check against HOME reports the
+# wrappers, hooks, units and skills there that do not match the new release.
+lagging=
+for member in $members; do
+  installer=$root/current/code/$member/install.sh
+  [ -f "$installer" ] || continue
+  if ! out=$(bash "$installer" --check 2>&1); then
+    lagging="$lagging $member"
+    say "HOME lags $id for $member: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
+  fi
+done
+[ -z "$lagging" ] ||
+  ping "$id-home" HOME-LAG "$id is active but HOME lags it for:$lagging (install.sh --check)"
+
+# Unit files can link through current/, so the switch may have changed their text.
+[ -z "$restart_units" ] || systemctl --user daemon-reload || say "daemon-reload failed"
 for unit in $restart_units; do
   systemctl --user try-restart "$unit" || say "try-restart $unit failed"
 done
