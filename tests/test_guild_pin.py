@@ -163,15 +163,138 @@ class GuildPinTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
 
     def test_auto_skips_when_open_pin_pr_exists(self) -> None:
+        self.git("push", "-q", "origin", "HEAD:refs/heads/pin/alpha-ccccccc", cwd=self.repo)
+        for mergeable in ("MERGEABLE", "UNKNOWN"):
+            gh = {
+                "list": json.dumps([{"number": 40, "headRefName": "pin/alpha-ccccccc",
+                                    "url": "https://github.com/acme/guild/pull/40",
+                                    "mergeable": mergeable}]),
+            }
+            out = self.run_pin(gh, "--auto")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("open pin PR already exists: https://github.com/acme/guild/pull/40", out.stdout)
+            self.assertFalse([c for c in self.gh_calls() if c.startswith(("pr close", "pr create"))])
+            self.assertNotEqual(self.git("ls-remote", "--heads", "origin", "pin/alpha-ccccccc", cwd=self.repo), "")
+            self.assertEqual(self.notifications(), [])
+
+    def test_auto_closes_conflicting_pin_pr_deletes_branch_and_replans(self) -> None:
+        new_a, new_b = "c" * 40, "d" * 40
+        other = self.tmp / "other"
+        self.git("clone", "-q", str(self.tmp / "origin.git"), str(other), cwd=self.tmp)
+        self.git("checkout", "-q", "-b", "pin/alpha-ccccccc", cwd=other)
+        (other / "tests" / "member-pins.json").write_text(json.dumps({**OLD, "alpha": new_a}, indent=2) + "\n")
+        self.git("commit", "-qam", "Pin alpha ccccccc at trunk", cwd=other)
+        self.git("push", "-q", "origin", "pin/alpha-ccccccc", cwd=other)
+        self.git("checkout", "-q", "main", cwd=other)
+        (other / "tests" / "member-pins.json").write_text(json.dumps({**OLD, "beta": new_b}, indent=2) + "\n")
+        self.git("commit", "-qam", "Pin beta ddddddd at trunk", cwd=other)
+        self.git("push", "-q", "origin", "main", cwd=other)
+
         gh = {
             "list": json.dumps([{"number": 40, "headRefName": "pin/alpha-ccccccc",
-                                "url": "https://github.com/acme/guild/pull/40"}]),
+                                "url": "https://github.com/acme/guild/pull/40",
+                                "mergeable": "CONFLICTING"}]),
+            "close": "",
+            "repos/acme/alpha/commits/HEAD": new_a,
+            "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
+            f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
+            "repos/acme/beta/commits/HEAD": new_b,
+            "create": "https://github.com/acme/guild/pull/41",
+            "checks": [['[{"name": "ci"}]', 0], ["", 0]],
+            "merge": "",
         }
         out = self.run_pin(gh, "--auto")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("open pin PR already exists: https://github.com/acme/guild/pull/40", out.stdout)
-        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr create")])
+        self.assertNotIn("open pin PR already exists", out.stdout)
+        self.assertIn("pr close https://github.com/acme/guild/pull/40", self.gh_calls())
+        self.assertNotIn("--delete-branch", " ".join(self.gh_calls()))
+        self.assertIn("guild-pin: merged https://github.com/acme/guild/pull/41", out.stdout)
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "pin/*", cwd=self.repo), "")
         self.assertEqual(self.notifications(), [])
+
+        self.git("pull", "-q", "--ff-only", "origin", "main", cwd=other)
+        (other / "tests" / "member-pins.json").write_text(json.dumps({"alpha": new_a, "beta": new_b}, indent=2) + "\n")
+        self.git("commit", "-qam", "Merge PR 41", cwd=other)
+        self.git("push", "-q", "origin", "main", cwd=other)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/pin/beta-ddddddd", cwd=other)
+        settled_gh = {
+            "list": json.dumps([{"number": 42, "headRefName": "pin/beta-ddddddd",
+                                "url": "https://github.com/acme/guild/pull/42",
+                                "mergeable": "CONFLICTING"}]),
+            "close": "",
+            "repos/acme/alpha/commits/HEAD": new_a,
+            "repos/acme/beta/commits/HEAD": new_b,
+        }
+        out2 = self.run_pin(settled_gh, "--auto")
+        self.assertEqual(out2.returncode, 0, out2.stderr)
+        self.assertIn("pr close https://github.com/acme/guild/pull/42", self.gh_calls())
+        self.assertIn("every pin is at its member's trunk head", out2.stdout)
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "pin/*", cwd=self.repo), "")
+
+        self.git("push", "-q", "origin", "HEAD:refs/heads/pin/alpha-ccccccc", cwd=other)
+        fork_gh = {
+            "list": json.dumps([{"number": 43, "headRefName": "pin/alpha-ccccccc",
+                                "isCrossRepository": True,
+                                "url": "https://github.com/acme/guild/pull/43",
+                                "mergeable": "CONFLICTING"}]),
+            "repos/acme/alpha/commits/HEAD": new_a,
+            "repos/acme/beta/commits/HEAD": new_b,
+        }
+        out3 = self.run_pin(fork_gh, "--auto")
+        self.assertEqual(out3.returncode, 0, out3.stderr)
+        self.assertNotIn("pr close https://github.com/acme/guild/pull/43", self.gh_calls())
+        self.assertNotEqual(self.git("ls-remote", "--heads", "origin", "pin/alpha-ccccccc", cwd=self.repo), "")
+
+    def test_auto_recovers_after_transient_branch_delete_failure(self) -> None:
+        new_a, new_b = "c" * 40, "d" * 40
+        other = self.tmp / "other"
+        self.git("clone", "-q", str(self.tmp / "origin.git"), str(other), cwd=self.tmp)
+        self.git("checkout", "-q", "-b", "pin/alpha-ccccccc", cwd=other)
+        (other / "tests" / "member-pins.json").write_text(json.dumps({**OLD, "alpha": new_a}, indent=2) + "\n")
+        self.git("commit", "-qam", "Pin alpha ccccccc at trunk", cwd=other)
+        self.git("push", "-q", "origin", "pin/alpha-ccccccc", cwd=other)
+        self.git("checkout", "-q", "main", cwd=other)
+        (other / "tests" / "member-pins.json").write_text(json.dumps({**OLD, "beta": new_b}, indent=2) + "\n")
+        self.git("commit", "-qam", "Pin beta ddddddd at trunk", cwd=other)
+        self.git("push", "-q", "origin", "main", cwd=other)
+
+        hook = self.tmp / "origin.git" / "hooks" / "pre-receive"
+        marker = self.tmp / "blocked_once"
+        hook.write_text(
+            f"#!/bin/sh\nwhile read old new ref; do\n"
+            f"  if [ \"$new\" = \"{'0' * 40}\" ] && [ ! -f \"{marker}\" ]; then\n"
+            f"    touch \"{marker}\"\n"
+            f"    echo transient delete failure >&2\n"
+            f"    exit 1\n"
+            f"  fi\n"
+            f"done\n"
+        )
+        hook.chmod(0o755)
+
+        first = self.run_pin({
+            "list": json.dumps([{"number": 40, "headRefName": "pin/alpha-ccccccc",
+                                "url": "https://github.com/acme/guild/pull/40",
+                                "mergeable": "CONFLICTING"}]),
+            "close": "",
+        }, "--auto")
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("git push -q origin --delete pin/alpha-ccccccc failed", first.stderr)
+        self.assertEqual(len(self.notifications()), 1)
+
+        second = self.run_pin({
+            "list": "[]",
+            "repos/acme/alpha/commits/HEAD": new_a,
+            "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
+            f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
+            "repos/acme/beta/commits/HEAD": new_b,
+            "create": "https://github.com/acme/guild/pull/41",
+            "checks": [['[{"name": "ci"}]', 0], ["", 0]],
+            "merge": "",
+        }, "--auto")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("guild-pin: merged https://github.com/acme/guild/pull/41", second.stdout)
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "pin/*", cwd=self.repo), "")
+        self.assertEqual(list((self.tmp / "pin-state" / "pinged").iterdir()), [])
 
     def test_auto_waits_with_exit_0_and_no_ping_when_checks_pending(self) -> None:
         new_a = "c" * 40
