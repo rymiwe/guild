@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """Move member pins to each member's trunk head, so a Guild release carries merged work.
 
-usage: guild-pin [--apply] [--auto] [MEMBER ...]
+usage: guild-pin [--apply] [--auto] [--resume PR_URL] [MEMBER ...]
 
 Reads tests/member-pins.json from origin's main of this Guild checkout. For each
 member (default: every pinned member) it reads the head of the member's default
 branch on GitHub. A head moves the pin only when every check run on it passed;
 a head with a pending or failed run keeps the old pin and is reported. A member
-with no check runs at all moves, and the plan says so.
+with no check runs at all moves when Actions is enabled. When Actions is
+disabled, no check runs alone is not enough: a passed local-test record for that
+exact tree is required (unsupported members without a local-test suite stay
+blocked). Local-test evidence (`guild-local-test run`) never overrides a genuine
+CI failure; it may clear only the known Actions billing failure annotation.
+Local-test is not GitHub CI.
 
 Without --apply it prints the plan and changes nothing. With --apply it commits
-the new pins on a branch in a temporary worktree, opens a pull request whose body
-lists the commits each pin carries, waits for Guild CI, and merges it. The
-Surface updater then installs the release on its own. Exit 0 with nothing to move.
+the new pins on a branch in a temporary worktree. When Actions is disabled it
+runs local-test on that exact candidate before creating the PR, then merges when
+evidence matches. When Actions is enabled it opens the PR and waits for Guild CI.
+`--resume PR_URL` runs local-test on an existing pin PR candidate (if needed) and
+merges when evidence covers its tree+pins.
 
 With --auto (for systemd timers), it implies --apply, acquires an flock, closes
-any conflicting pin/* PR and skips when another open pin/* PR exists, exits 0
-while member checks are still pending, retries fetch errors quietly until the
-eighth in a row, and sends one `job-notify --send` ping per failure key.
+any conflicting pin/* PR, and if another open pin/* PR exists tries to merge it
+only when local-test evidence already covers that candidate (it does not run
+suites from the timer). Exits 0 while member checks are still pending, retries
+fetch errors quietly until the eighth in a row, and sends one `job-notify --send`
+ping per failure key.
 """
 from __future__ import annotations
 
@@ -34,6 +43,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import guild_local_test as local_test  # noqa: E402
+
 PINS_PATH = "tests/member-pins.json"
 # Fetch into a ref only this script writes: guild-host-sync fetches origin/main in this checkout on its own timer,
 # and two fetches into one ref fail with "cannot lock ref".
@@ -49,9 +61,11 @@ class Move:
     member: str
     old: str
     new: str
+    tree: str = ""
     blocked: str = ""
     pending: bool = False
     unchecked: bool = False
+    local_test: bool = False
     subjects: list[str] = field(default_factory=list)
 
 
@@ -158,14 +172,41 @@ def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
         new = sh("gh", "api", f"repos/{org}/{member}/commits/HEAD", "--jq", ".sha")
         if new == old:
             continue
-        move = Move(member, old, new)
-        runs = json.loads(sh("gh", "api", f"repos/{org}/{member}/commits/{new}/check-runs",
-                             "--jq", "[.check_runs[] | {name, status, conclusion}]"))
+        tree = sh("gh", "api", f"repos/{org}/{member}/commits/{new}", "--jq", ".commit.tree.sha")
+        repo = f"{org}/{member}"
+        move = Move(member, old, new, tree=tree)
+        runs = json.loads(sh(
+            "gh", "api", f"repos/{org}/{member}/commits/{new}/check-runs",
+            "--jq", "[.check_runs[] | {id, name, status, conclusion}]",
+        ))
         bad = [r for r in runs if r["status"] != "completed" or r["conclusion"] not in PASSED]
-        if bad:
+        local_ok = local_test.accepts(
+            repo, sha=new, tree=tree, pins=None, require_passed=True,
+        ) is not None
+        local_fail = local_test.accepts(
+            repo, sha=new, tree=tree, pins=None, require_passed=False,
+        )
+        local_fail = bool(local_fail and local_fail["status"] == "failed")
+        actions_on = local_test.actions_enabled(repo)
+        if local_fail:
+            move.blocked = "local-test failed"
+        elif not bad:
+            if runs:
+                move.local_test = False
+            elif actions_on:
+                move.unchecked = True
+            elif local_ok:
+                move.local_test = True
+            else:
+                move.blocked = "actions disabled; need local-test for this tree"
+        elif local_test.only_billing_failures(repo, bad) and local_ok:
+            move.local_test = True
+        elif local_test.only_billing_failures(repo, bad) and not local_ok:
+            move.blocked = "billing-blocked check; need local-test for this tree"
+            move.pending = False
+        else:
             move.blocked = ", ".join(f"{r['name']} {r['conclusion'] or r['status']}" for r in bad)
             move.pending = all(r["status"] != "completed" for r in bad)
-        move.unchecked = not runs
         move.subjects = sh("gh", "api", f"repos/{org}/{member}/compare/{old}...{new}", "--jq",
                            '.commits[] | .sha[0:7] + " " + (.commit.message | split("\\n")[0])').splitlines()
         moves.append(move)
@@ -175,14 +216,41 @@ def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
 def report(org: str, moves: list[Move]) -> str:
     lines = []
     for m in moves:
-        state = f"blocked: {m.blocked}" if m.blocked else ("no check runs" if m.unchecked else "checks passed")
+        if m.blocked:
+            state = f"blocked: {m.blocked}"
+        elif m.local_test:
+            state = "local-test passed"
+        elif m.unchecked:
+            state = "no check runs"
+        else:
+            state = "checks passed"
         lines.append(f"- **{m.member}** {m.old[:7]} -> {m.new[:7]} ({state})")
         lines += [f"  - [{s[:7]}](https://github.com/{org}/{m.member}/commit/{s[:7]}){s[7:]}" for s in m.subjects]
     return "\n".join(lines)
 
 
-def ci_passed(url: str, cwd: Path) -> bool:
-    # A PR opened seconds ago has no check runs yet, and `gh pr checks --watch` exits 1 on that.
+def candidate_identity(cwd: Path, pins: dict[str, str]) -> tuple[str, str, dict[str, str]]:
+    """Tree and pins from the pin-candidate checkout (not the installed main)."""
+    head = local_test.git(Path(cwd), "rev-parse", "HEAD")
+    tree = local_test.git(Path(cwd), "rev-parse", "HEAD^{tree}")
+    pins_here = local_test.load_pins(Path(cwd) / PINS_PATH)
+    want = {k: local_test.normalize_sha(v) for k, v in pins.items()}
+    if pins_here != want:
+        raise RuntimeError("guild-pin: candidate pins file does not match the planned pins")
+    return head, tree, pins_here
+
+
+def ci_passed(url: str, cwd: Path, pins: dict[str, str]) -> bool:
+    """Accept Guild CI, or local-test for this candidate tree+pins when Actions is off."""
+    slug = repo_slug()
+    head, tree, pins_here = candidate_identity(cwd, pins)
+    local_ok = local_test.accepts(
+        slug, sha=head, tree=tree, pins=pins_here, require_passed=True,
+    ) is not None
+    actions_on = local_test.actions_enabled(slug)
+    if not actions_on:
+        return local_ok
+    # Actions on: local-test never skips real CI / pending checks.
     for _ in range(CHECKS_APPEAR_TRIES):
         out = subprocess.run(["gh", "pr", "checks", url, "--json", "name"], cwd=cwd, capture_output=True, text=True)
         try:
@@ -194,6 +262,18 @@ def ci_passed(url: str, cwd: Path) -> bool:
     else:
         return False
     return subprocess.run(["gh", "pr", "checks", url, "--watch", "--fail-fast"], cwd=cwd).returncode == 0
+
+
+def merge_if_ready(url: str, cwd: Path, pins: dict[str, str]) -> None:
+    if not ci_passed(url, cwd, pins):
+        raise RuntimeError(
+            f"guild-pin: Guild CI did not pass on {url}, and no passed local-test "
+            f"record covers its head tree and pins; not merged. "
+            f"When Actions is off: guild-local-test run --checkout <candidate> "
+            f"then guild-pin --resume {url}"
+        )
+    sh("gh", "pr", "merge", url, "--merge", cwd=cwd)
+    print(f"guild-pin: merged {url}")
 
 
 def apply(org: str, pins: dict[str, str], ready: list[Move], *, replace_orphan: bool = False) -> None:
@@ -209,21 +289,25 @@ def apply(org: str, pins: dict[str, str], ready: list[Move], *, replace_orphan: 
         try:
             (wt / PINS_PATH).write_text(json.dumps(pins, indent=2) + "\n", encoding="utf-8")
             sh("git", "commit", "-q", "-am", title, cwd=wt)
+            actions_on = local_test.actions_enabled(repo_slug())
+            if not actions_on:
+                # Run the exact candidate suite before opening a PR so --auto is not stuck.
+                print("guild-pin: Actions disabled; running local-test on pin candidate", file=sys.stderr)
+                rec = local_test.run(checkout=wt)
+                if rec["status"] != "passed":
+                    raise RuntimeError(
+                        "guild-pin: local-test failed on pin candidate; not creating PR"
+                    )
             if replace_orphan and sh("git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"):
                 delete_remote_branch(branch)
             sh("git", "push", "-q", "-u", "origin", branch, cwd=wt)
             body = "## Why\nShip merged member work to the Surface release.\n\n## Pins\n" + report(org, ready)
             url = sh("gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", body, cwd=wt)
             print(url)
-            if not ci_passed(url, wt):
-                raise RuntimeError(f"guild-pin: Guild CI did not pass on {url}; not merged")
-            sh("gh", "pr", "merge", url, "--merge", cwd=wt)
+            merge_if_ready(url, wt, pins)
             merged = True
-            print(f"guild-pin: merged {url}")
         finally:
             subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, capture_output=True)
-            # The local branch always goes: a failed run that kept it made every later run fail on `worktree add -b`.
-            # Not gh's --delete-branch: it checks out main here, which fails when another worktree holds main.
             cmds = [["git", "branch", "-q", "-D", branch]]
             if merged:
                 cmds.insert(0, ["git", "push", "-q", "origin", "--delete", branch])
@@ -233,12 +317,68 @@ def apply(org: str, pins: dict[str, str], ready: list[Move], *, replace_orphan: 
                     print(f"guild-pin: left branch {branch} behind: {done.stderr.strip()}", file=sys.stderr)
 
 
+def resume_pin_pr(url: str, *, run_suite: bool = True) -> None:
+    """Merge an existing pin PR when local-test covers its exact tree+pins (Actions off)."""
+    slug = repo_slug()
+    actions_on = local_test.actions_enabled(slug)
+    meta = json.loads(sh("gh", "pr", "view", url, "--json", "headRefOid,headRefName,url"))
+    head = meta["headRefOid"]
+    branch = meta["headRefName"]
+    with tempfile.TemporaryDirectory(prefix="guild-pin-resume-") as tmp:
+        wt = Path(tmp) / "wt"
+        sh("git", "fetch", "-q", "origin", head)
+        sh("git", "worktree", "add", "-q", "--detach", str(wt), head)
+        try:
+            pins = local_test.load_pins(wt / PINS_PATH)
+            head_sha, tree, pins_here = candidate_identity(wt, pins)
+            if local_test.accepts(
+                slug, sha=head_sha, tree=tree, pins=pins_here, require_passed=True,
+            ) is None:
+                if actions_on:
+                    raise RuntimeError(
+                        f"guild-pin: Actions is enabled; use Guild CI on {url}, not --resume"
+                    )
+                if not run_suite:
+                    raise RuntimeError(
+                        f"guild-pin: no local-test evidence for {url} tree {tree}; "
+                        f"run guild-local-test run --checkout <candidate> then --resume"
+                    )
+                print("guild-pin: running local-test on existing pin PR candidate", file=sys.stderr)
+                rec = local_test.run(checkout=wt)
+                if rec["status"] != "passed":
+                    raise RuntimeError(f"guild-pin: local-test failed for {url}; not merged")
+            merge_if_ready(url, wt, pins_here)
+            if branch.startswith("pin/"):
+                done = subprocess.run(
+                    ["git", "push", "-q", "origin", "--delete", branch],
+                    cwd=ROOT, capture_output=True, text=True,
+                )
+                if done.returncode != 0:
+                    print(f"guild-pin: left branch {branch} behind: {done.stderr.strip()}", file=sys.stderr)
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, capture_output=True)
+
+
 def main(argv: list[str]) -> int:
     do_auto = "--auto" in argv
     do_apply = do_auto or ("--apply" in argv)
-    names = [a for a in argv if a not in ("--apply", "--auto")]
+    resume_url = None
+    if "--resume" in argv:
+        i = argv.index("--resume")
+        if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+            print("guild-pin: --resume needs a PR URL", file=sys.stderr)
+            return 2
+        resume_url = argv[i + 1]
+    names = [
+        a for a in argv
+        if a not in ("--apply", "--auto", "--resume", resume_url)
+    ]
     if any(a.startswith("-") for a in names):
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+
+    if resume_url and (do_auto or do_apply or names):
+        print("guild-pin: --resume cannot combine with --apply/--auto/members", file=sys.stderr)
         return 2
 
     lock_file = None
@@ -253,6 +393,9 @@ def main(argv: list[str]) -> int:
             return 0
 
     try:
+        if resume_url:
+            resume_pin_pr(resume_url, run_suite=True)
+            return 0
         try:
             sh("git", "fetch", "-q", "--no-write-fetch-head", "--refmap=", "origin", f"+refs/heads/main:{MAIN_REF}")
         except RuntimeError as exc:
@@ -274,8 +417,16 @@ def main(argv: list[str]) -> int:
                 else:
                     existing.append(pr)
             if existing:
-                print(f"guild-pin: open pin PR already exists: {existing[0]['url']}")
-                return 0
+                url = existing[0]["url"]
+                # Resume only when evidence already covers the PR (timer must not run suites).
+                try:
+                    resume_pin_pr(url, run_suite=False)
+                    if state_dir is not None:
+                        clear_pings(state_dir)
+                    return 0
+                except RuntimeError as exc:
+                    print(f"guild-pin: open pin PR already exists: {url} ({exc})")
+                    return 0
         moves = plan(org, pins, names or list(pins))
         if not moves:
             print("guild-pin: every pin is at its member's trunk head")
