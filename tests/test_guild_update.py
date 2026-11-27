@@ -20,8 +20,12 @@ import test_pr_gate_contract as step1  # noqa: E402
 REAL_HOME = step1.REAL_HOME
 STUB_GH = """#!/bin/sh
 # gh api repos/acme/guild/actions/runs?head_sha=SHA&event=push... --jq ...: print the prepared lines.
+# gh api repos/acme/guild/commits/SHA/status --jq ...: print SHA's local-tests state from "SHA STATE" lines.
 case "$*" in
   "api repos/acme/guild/actions/runs?head_sha="*"&event=push&"*) cat "$GH_RUNS_FILE" ;;
+  "api repos/acme/guild/commits/"*"/status "*)
+    sha=${2#repos/acme/guild/commits/}
+    sed -n "s/^${sha%/status} //p" "$GH_STATUS_FILE" ;;
   *) echo "unexpected gh call: $*" >&2; exit 1 ;;
 esac
 """
@@ -113,12 +117,15 @@ class GuildUpdateTest(unittest.TestCase):
         case = self.tmp / self.id().rsplit(".", 1)[-1]
         self.root = case / "root"
         self.runs = case / "runs.txt"
+        self.statuses = case / "statuses.txt"
         self.notify_log = case / "notify.log"
         self.root.mkdir(parents=True)
         self._git("clone", "-q", str(self.guild_origin), str(self.root / "src"))
 
-    def update(self, runs: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def update(self, runs: str, home: Path | None = None,
+               local: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         self.runs.write_text(runs)
+        self.statuses.write_text("".join(f"{sha} {state}\n" for sha, state in (local or {}).items()))
         env = {
             **self.git_env,
             **({"HOME": str(home)} if home else {}),
@@ -129,6 +136,7 @@ class GuildUpdateTest(unittest.TestCase):
             "GUILD_UPDATE_REPO": "acme/guild",
             "PSTACK_HOME": str(self.pstack),
             "GH_RUNS_FILE": str(self.runs),
+            "GH_STATUS_FILE": str(self.statuses),
             "NOTIFY_LOG": str(self.notify_log),
         }
         return subprocess.run(
@@ -259,6 +267,56 @@ class GuildUpdateTest(unittest.TestCase):
             self.assertEqual(self.update("in_progress - CI\n").returncode, 1)
         self.assertEqual(len(self.notifications()), 1)
         self.assertIn("after 24 hours", self.notifications()[0])
+
+    def test_local_pass_on_the_exact_commit_stands_in_for_ci(self) -> None:
+        head = self._git("rev-parse", "HEAD", cwd=self.guild_work).stdout.strip()
+        # A pass recorded on another commit, or a failed local run, leaves the updater waiting for CI.
+        for local in ({"0" * 40: "success"}, {head: "failure"}):
+            proc = self.update("", local=local)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("waiting", proc.stderr)
+            self.assertIsNone(self.current())
+        # A pass on the exact commit installs it, even over a CI run that never started.
+        proc = self.update("completed failure pr-gate-contract\n", local={head: "success"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.current(), f"releases/{self.head_id()}")
+        self.assertEqual(self.notifications(), [])
+
+    def merge_branch(self, name: str, main_moves: bool) -> str:
+        """Merge a one-commit branch into main as a pin PR lands; return the branch head."""
+        work = self.guild_work
+        self._git("checkout", "-q", "-b", name, cwd=work)
+        (work / f"{name}.txt").write_text("pin\n")
+        self._git("add", "-A", cwd=work)
+        self._git("commit", "-qm", name, cwd=work)
+        head = self._git("rev-parse", "HEAD", cwd=work).stdout.strip()
+        self._git("checkout", "-q", "-", cwd=work)
+        if main_moves:
+            (work / f"{name}-main.txt").write_text("moved\n")
+            self._git("add", "-A", cwd=work)
+            self._git("commit", "-qm", f"main moves under {name}", cwd=work)
+        self._git("merge", "-q", "--no-ff", "-m", f"Merge {name}", name, cwd=work)
+        self._git("push", "-q", "origin", "HEAD:main", cwd=work)
+        return head
+
+    def test_merge_commit_takes_its_pr_heads_pass_only_with_the_same_tree(self) -> None:
+        try:
+            head = self.merge_branch("pin-same-tree", main_moves=False)
+            proc = self.update("", local={head: "success"})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed = f"releases/{self.head_id()}"
+            self.assertEqual(self.current(), installed)
+
+            # main moved before the merge, so the merge holds files the PR head's run never saw.
+            head = self.merge_branch("pin-main-moved", main_moves=True)
+            proc = self.update("", local={head: "success"})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("waiting", proc.stderr)
+            self.assertEqual(self.current(), installed)
+        finally:
+            for name in ("pin-same-tree.txt", "pin-main-moved.txt", "pin-main-moved-main.txt"):
+                (self.guild_work / name).unlink(missing_ok=True)
+            self.commit_guild("Drop the merge test files")
 
     def test_failed_ci_reports_once_and_installs_nothing(self) -> None:
         proc = self.update("completed failure pr-gate-contract\n")

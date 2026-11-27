@@ -95,6 +95,7 @@ class GuildPinTest(unittest.TestCase):
             "repos/acme/beta/commits/HEAD": new_b,
             "repos/acme/beta/commits/" + new_b + "/check-runs": json.dumps(
                 [{"name": "suite", "status": "completed", "conclusion": "failure"}]),
+            "repos/acme/beta/commits/" + new_b + "/status": "",
             f"repos/acme/beta/compare/{OLD['beta']}...{new_b}": "d" * 7 + " Break it",
         }
         before = self.state()
@@ -105,14 +106,33 @@ class GuildPinTest(unittest.TestCase):
         self.assertIn("**beta** bbbbbbb -> ddddddd (blocked: suite failure)", out.stdout)
         self.assertEqual(self.state(), before, "a plan without --apply changed the checkout")
 
-    def test_member_without_check_runs_moves_and_says_so(self) -> None:
+    def test_member_without_check_runs_waits_for_a_local_pass(self) -> None:
         new_a = "e" * 40
         gh = {"repos/acme/alpha/commits/HEAD": new_a,
               "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
+              "repos/acme/alpha/commits/" + new_a + "/status": "",
               f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": ""}
         out = self.run_pin(gh, "alpha")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("**alpha** aaaaaaa -> eeeeeee (blocked: no check runs or local pass)", out.stdout)
+        out = self.run_pin({**gh, "repos/acme/alpha/commits/" + new_a + "/status": "success"}, "alpha")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("**alpha** aaaaaaa -> eeeeeee (no check runs)", out.stdout)
+        self.assertIn("**alpha** aaaaaaa -> eeeeeee (local tests passed)", out.stdout)
+
+    def test_local_pass_moves_a_head_whose_check_run_failed(self) -> None:
+        # Actions records a billing refusal as a failed check run; a local run of the suite stands in for it.
+        new_b = "d" * 40
+        gh = {"repos/acme/beta/commits/HEAD": new_b,
+              "repos/acme/beta/commits/" + new_b + "/check-runs": json.dumps(
+                  [{"name": "test", "status": "completed", "conclusion": "failure"}]),
+              "repos/acme/beta/commits/" + new_b + "/status": "success",
+              f"repos/acme/beta/compare/{OLD['beta']}...{new_b}": ""}
+        out = self.run_pin(gh, "beta")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("**beta** bbbbbbb -> ddddddd (local tests passed)", out.stdout)
+        out = self.run_pin({**gh, "repos/acme/beta/commits/" + new_b + "/status": "failure"}, "beta")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("(blocked: test failure)", out.stdout)
 
     def test_pins_at_trunk_need_nothing(self) -> None:
         gh = {"repos/acme/alpha/commits/HEAD": OLD["alpha"], "repos/acme/beta/commits/HEAD": OLD["beta"]}
@@ -124,6 +144,7 @@ class GuildPinTest(unittest.TestCase):
         new_a = "f" * 40
         return {"repos/acme/alpha/commits/HEAD": new_a,
                 "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
+                "repos/acme/alpha/commits/" + new_a + "/status": "success",
                 f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
                 "create": "https://github.com/acme/guild/pull/9", "checks": checks, "merge": ""}
 
@@ -134,7 +155,11 @@ class GuildPinTest(unittest.TestCase):
         out = self.run_pin(self.apply_fixture([["", 1], ['[{"name": "ci"}]', 0], ["", 0]]), "--apply", "alpha")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("guild-pin: merged https://github.com/acme/guild/pull/9", out.stdout)
-        self.assertIn("pr merge https://github.com/acme/guild/pull/9 --merge", self.gh_calls())
+        merges = [c for c in self.gh_calls() if c.startswith("pr merge https://github.com/acme/guild/pull/9 --merge ")]
+        self.assertEqual(len(merges), 1, self.gh_calls())
+        head = merges[0].split("--match-head-commit ", 1)[1]
+        pins = json.loads(self.git("show", f"{head}:tests/member-pins.json", cwd=self.tmp / "origin.git"))
+        self.assertEqual(pins["alpha"], "f" * 40, "the merge must name the pushed pin commit")
 
     def test_apply_removes_the_pin_branch_after_the_merge(self) -> None:
         # gh's own --delete-branch checks out main locally, which fails when another worktree holds main.
@@ -150,6 +175,33 @@ class GuildPinTest(unittest.TestCase):
         self.assertIn("Guild CI did not pass on https://github.com/acme/guild/pull/9; not merged", out.stderr)
         self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")], "merged after CI failed")
         self.assertEqual(self.git("branch", "--list", "pin/*", cwd=self.repo), "")
+
+    def test_auto_leaves_a_pin_pr_without_checks_open_then_merges_it_once_it_passes(self) -> None:
+        # With Actions off no check ever appears; guild-local-pass later posts a local-tests status on the head.
+        self.env["GUILD_PIN_CHECK_TRIES"] = "1"
+        gh = {**self.apply_fixture([["", 1]]), "list": "[]", "repos/acme/beta/commits/HEAD": OLD["beta"]}
+        out = self.run_pin(gh, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("no checks on https://github.com/acme/guild/pull/9", out.stdout)
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")])
+        self.assertEqual(self.notifications(), [])
+        head = self.git("ls-remote", "--heads", "origin", "pin/alpha-fffffff", cwd=self.repo).split()[0]
+
+        open_pr = json.dumps([{"number": 9, "headRefName": "pin/alpha-fffffff", "headRefOid": head,
+                               "url": "https://github.com/acme/guild/pull/9", "mergeable": "MERGEABLE"}])
+        for buckets in ("[]", '[{"bucket": "pending"}]', '[{"bucket": "pass"}, {"bucket": "fail"}]'):
+            out = self.run_pin({"list": open_pr, "checks": buckets}, "--auto")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("open pin PR already exists: https://github.com/acme/guild/pull/9", out.stdout)
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")])
+
+        out = self.run_pin({"list": open_pr, "checks": '[{"bucket": "pass"}]', "merge": ""}, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("guild-pin: merged https://github.com/acme/guild/pull/9", out.stdout)
+        self.assertIn(f"pr merge https://github.com/acme/guild/pull/9 --merge --match-head-commit {head}",
+                      self.gh_calls())
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "pin/*", cwd=self.repo), "")
+        self.assertEqual(self.notifications(), [])
 
     def test_failed_commit_leaves_no_branch_and_the_next_run_retries(self) -> None:
         hook = self.repo / ".git" / "hooks" / "pre-commit"
@@ -197,6 +249,7 @@ class GuildPinTest(unittest.TestCase):
             "close": "",
             "repos/acme/alpha/commits/HEAD": new_a,
             "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
+            "repos/acme/alpha/commits/" + new_a + "/status": "success",
             f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
             "repos/acme/beta/commits/HEAD": new_b,
             "create": "https://github.com/acme/guild/pull/41",
@@ -285,6 +338,7 @@ class GuildPinTest(unittest.TestCase):
             "list": "[]",
             "repos/acme/alpha/commits/HEAD": new_a,
             "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
+            "repos/acme/alpha/commits/" + new_a + "/status": "success",
             f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
             "repos/acme/beta/commits/HEAD": new_b,
             "create": "https://github.com/acme/guild/pull/41",
@@ -303,6 +357,7 @@ class GuildPinTest(unittest.TestCase):
             "repos/acme/alpha/commits/HEAD": new_a,
             "repos/acme/alpha/commits/" + new_a + "/check-runs": json.dumps(
                 [{"name": "test", "status": "in_progress", "conclusion": None}]),
+            "repos/acme/alpha/commits/" + new_a + "/status": "",
             f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
             "repos/acme/beta/commits/HEAD": OLD["beta"],
         }
@@ -318,6 +373,7 @@ class GuildPinTest(unittest.TestCase):
             "repos/acme/beta/commits/HEAD": new_b,
             "repos/acme/beta/commits/" + new_b + "/check-runs": json.dumps(
                 [{"name": "suite", "status": "completed", "conclusion": "failure"}]),
+            "repos/acme/beta/commits/" + new_b + "/status": "",
             f"repos/acme/beta/compare/{OLD['beta']}...{new_b}": "",
         }
         self.assertEqual(self.run_pin(bad_gh, "--auto").returncode, 1)
@@ -415,6 +471,7 @@ class GuildPinTest(unittest.TestCase):
             "repos/acme/alpha/commits/HEAD": new_a,
             "repos/acme/alpha/commits/" + new_a + "/check-runs": json.dumps(
                 [{"name": "test", "status": "in_progress", "conclusion": None}]),
+            "repos/acme/alpha/commits/" + new_a + "/status": "",
             f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
             "repos/acme/beta/commits/HEAD": OLD["beta"],
         }

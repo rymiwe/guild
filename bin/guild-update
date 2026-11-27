@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the newest Guild release whose exact commit passed CI. guild-update.timer runs it.
+# Install the newest Guild release whose exact commit passed CI or local tests. guild-update.timer runs it.
 #
 # usage: guild-update
 #
@@ -10,9 +10,11 @@
 #      `guild-release prune` never touches installed/. Stops (exit 1) when
 #      <root>/failed/g-<sha12> exists: that commit failed to deploy. Delete the file to
 #      retry it.
-#   3. Waits (exit 0) while the push workflow runs for that commit are queued or running,
-#      and fails after 24 hours of waiting. Fails when the latest attempt of any of them
-#      did not succeed; a passing re-run recovers the commit.
+#   3. Goes on when a `local-tests` success status (guild-local-pass) sits on that commit,
+#      or on its second parent when the two have the same tree (a pin PR merged while main
+#      stood still). Otherwise waits (exit 0) while the push workflow runs for that commit
+#      are queued or running, and fails after 24 hours of waiting. Fails when the latest
+#      attempt of any of them did not succeed; a passing re-run recovers the commit.
 #   4. Exports that commit to a candidate directory, fetches each pinned member under
 #      $GUILD_MEMBER_SOURCES_DIR, and runs the candidate's `guild-release deploy` (or
 #      `switch`, when an earlier run built the release but did not activate it). A
@@ -106,8 +108,20 @@ repo=${GUILD_UPDATE_REPO:-$(git -C "$src" remote get-url origin |
 [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
   fail setup "cannot read owner/repo from the origin URL in $src; set GUILD_UPDATE_REPO"
 
+tested=$sha
+if head=$(git -C "$src" rev-parse -q --verify "$sha^2") &&
+  [ "$(git -C "$src" rev-parse "$sha^{tree}")" = "$(git -C "$src" rev-parse "$head^{tree}")" ]; then
+  tested="$sha $head"
+fi
+runs=
+for c in $tested; do
+  st=$(gh api "repos/$repo/commits/$c/status" \
+    --jq '[.statuses[] | select(.context == "local-tests") | .state] | first // ""') ||
+    transient "cannot read statuses for $c"
+  [ "$st" != success ] || { runs="completed success local-tests on $c"; break; }
+done
 # Workflow runs, not check runs: a workflow run completes only when all its jobs have.
-runs=$(gh api "repos/$repo/actions/runs?head_sha=$sha&event=push&per_page=100" \
+[ -n "$runs" ] || runs=$(gh api "repos/$repo/actions/runs?head_sha=$sha&event=push&per_page=100" \
   --jq '.workflow_runs[] | "\(.status) \(.conclusion // "-") \(.name)"') ||
   transient "cannot read CI for $sha"
 

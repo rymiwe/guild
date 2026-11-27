@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Run Guild's CI suite on this machine, against the member commits in tests/member-pins.json.
+# It runs the test steps of .github/workflows/ci.yml; tests/test_local_suite.py keeps the two in step.
+#
+# usage: scripts/local-suite
+#
+# Member sources come from $GUILD_MEMBER_SOURCES_DIR (default ~/code). Each pinned commit is cloned
+# into a temporary .deps, as CI checks them out. Needs gitleaks and tmux on PATH. Stops at the first
+# failing step, as CI does. `guild-local-pass guild SHA -- scripts/local-suite` records a pass.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+sources=${GUILD_MEMBER_SOURCES_DIR:-$HOME/code}
+for tool in gitleaks tmux; do
+  command -v "$tool" >/dev/null || { echo "local-suite: $tool not on PATH" >&2; exit 2; }
+done
+
+deps=$(mktemp -d)
+trap 'rm -rf "$deps"' EXIT
+while read -r name sha; do
+  git -C "$sources/$name" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$sources/$name" fetch -q origin
+  git clone -q --no-checkout "$sources/$name" "$deps/$name"
+  git -C "$deps/$name" -c advice.detachedHead=false checkout -q --detach "$sha"
+done < <(python3 -c 'import json; [print(k, v) for k, v in json.load(open("tests/member-pins.json")).items()]')
+
+step() { printf '== %s\n' "$*"; "$@"; }
+step python3 tests/test_true_check.py -v
+step python3 tests/test_jev_router.py -v
+step python3 -B tests/test_autostart_draft_review.py
+step python3 -B tests/work-review-requests-check-fixtures/run_tests.py
+step env GUILD_MEMBER_SOURCES_DIR="$deps" python3 tests/test_pr_gate_contract.py -v
+for t in test-evidence-check test-post-gated-review test-review-lint; do
+  step env CONCLAVE_HOME="$deps/conclave" bash "$deps/bridgekeeper/tests/$t.sh"
+done
+step env GUILD_MEMBER_SOURCES_DIR="$deps" python3 tests/test_release_lifecycle.py -v
+step python3 tests/test_release_retention.py -v
+step env GUILD_MEMBER_SOURCES_DIR="$deps" python3 tests/test_guild_update.py -v
+step python3 tests/test_guild_pin.py -v
+step python3 tests/test_guild_host_sync.py -v
+step python3 tests/test_guild_local_pass.py -v
+step python3 tests/test_grokbot_pace_check.py -v
+step python3 -W error::ResourceWarning tests/test_lint_scorecard.py -v
+step python3 -W error::ResourceWarning tests/test_poteto_judge.py -v
+step python3 tests/test_guild_ledger.py -v
+step python3 tests/test_poteto_watch.py -v
+step python3 tests/test_guild_triage.py -v
+echo "local-suite: passed"

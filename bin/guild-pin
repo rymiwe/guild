@@ -5,19 +5,22 @@ usage: guild-pin [--apply] [--auto] [MEMBER ...]
 
 Reads tests/member-pins.json from origin's main of this Guild checkout. For each
 member (default: every pinned member) it reads the head of the member's default
-branch on GitHub. A head moves the pin only when every check run on it passed;
-a head with a pending or failed run keeps the old pin and is reported. A member
-with no check runs at all moves, and the plan says so.
+branch on GitHub. A head moves the pin when every check run on it passed, or
+when a `local-tests` success status sits on that exact commit (guild-local-pass
+posts it, for when GitHub Actions is off). Any other head keeps the old pin and
+is reported, a head with no check runs included.
 
 Without --apply it prints the plan and changes nothing. With --apply it commits
 the new pins on a branch in a temporary worktree, opens a pull request whose body
 lists the commits each pin carries, waits for Guild CI, and merges it. The
 Surface updater then installs the release on its own. Exit 0 with nothing to move.
+A PR that gets no checks within five minutes stays open for a local pass.
 
 With --auto (for systemd timers), it implies --apply, acquires an flock, closes
-any conflicting pin/* PR and skips when another open pin/* PR exists, exits 0
-while member checks are still pending, retries fetch errors quietly until the
-eighth in a row, and sends one `job-notify --send` ping per failure key.
+any conflicting pin/* PR, merges an open pin/* PR whose checks have passed and
+otherwise skips while one is open, exits 0 while member checks are still pending,
+retries fetch errors quietly until the eighth in a row, and sends one
+`job-notify --send` ping per failure key.
 """
 from __future__ import annotations
 
@@ -39,9 +42,11 @@ PINS_PATH = "tests/member-pins.json"
 # and two fetches into one ref fail with "cannot lock ref".
 MAIN_REF = "refs/guild-pin/main"
 PASSED = {"success", "skipped", "neutral"}
-CHECKS_APPEAR_TRIES = 60
+# Tests shorten the wait for checks to appear.
+CHECKS_APPEAR_TRIES = int(os.environ.get("GUILD_PIN_CHECK_TRIES") or 60)
 CHECKS_APPEAR_SECONDS = 5
 TRANSIENT_LIMIT = 8
+LOCAL_CONTEXT = "local-tests"
 
 
 @dataclass
@@ -51,7 +56,7 @@ class Move:
     new: str
     blocked: str = ""
     pending: bool = False
-    unchecked: bool = False
+    local: bool = False
     subjects: list[str] = field(default_factory=list)
 
 
@@ -132,7 +137,7 @@ def transient_fetch(state_dir: Path, message: str) -> int:
 
 def open_pin_prs(slug: str) -> list[dict[str, object]]:
     raw = sh("gh", "pr", "list", "--repo", slug, "--state", "open",
-             "--json", "number,headRefName,url,mergeable,isCrossRepository")
+             "--json", "number,headRefName,headRefOid,url,mergeable,isCrossRepository")
     prs = json.loads(raw or "[]")
     return [p for p in prs if not p.get("isCrossRepository") and str(p.get("headRefName", "")).startswith("pin/")]
 
@@ -162,26 +167,37 @@ def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
         runs = json.loads(sh("gh", "api", f"repos/{org}/{member}/commits/{new}/check-runs",
                              "--jq", "[.check_runs[] | {name, status, conclusion}]"))
         bad = [r for r in runs if r["status"] != "completed" or r["conclusion"] not in PASSED]
-        if bad:
-            move.blocked = ", ".join(f"{r['name']} {r['conclusion'] or r['status']}" for r in bad)
-            move.pending = all(r["status"] != "completed" for r in bad)
-        move.unchecked = not runs
+        if bad or not runs:
+            if local_passed(f"{org}/{member}", new):
+                move.local = True
+            else:
+                move.blocked = (", ".join(f"{r['name']} {r['conclusion'] or r['status']}" for r in bad)
+                                or "no check runs or local pass")
+                move.pending = all(r["status"] != "completed" for r in bad)
         move.subjects = sh("gh", "api", f"repos/{org}/{member}/compare/{old}...{new}", "--jq",
                            '.commits[] | .sha[0:7] + " " + (.commit.message | split("\\n")[0])').splitlines()
         moves.append(move)
     return moves
 
 
+def local_passed(slug: str, sha: str) -> bool:
+    # The combined status holds the newest status per context, so a later failure replaces a pass.
+    state = sh("gh", "api", f"repos/{slug}/commits/{sha}/status", "--jq",
+               f'[.statuses[] | select(.context == "{LOCAL_CONTEXT}") | .state] | first // ""')
+    return state == "success"
+
+
 def report(org: str, moves: list[Move]) -> str:
     lines = []
     for m in moves:
-        state = f"blocked: {m.blocked}" if m.blocked else ("no check runs" if m.unchecked else "checks passed")
+        state = f"blocked: {m.blocked}" if m.blocked else ("local tests passed" if m.local else "checks passed")
         lines.append(f"- **{m.member}** {m.old[:7]} -> {m.new[:7]} ({state})")
         lines += [f"  - [{s[:7]}](https://github.com/{org}/{m.member}/commit/{s[:7]}){s[7:]}" for s in m.subjects]
     return "\n".join(lines)
 
 
-def ci_passed(url: str, cwd: Path) -> bool:
+def ci_passed(url: str, cwd: Path) -> bool | None:
+    """Whether the PR's checks passed, or None when none appeared: with Actions off, a local pass comes later."""
     # A PR opened seconds ago has no check runs yet, and `gh pr checks --watch` exits 1 on that.
     for _ in range(CHECKS_APPEAR_TRIES):
         out = subprocess.run(["gh", "pr", "checks", url, "--json", "name"], cwd=cwd, capture_output=True, text=True)
@@ -192,8 +208,18 @@ def ci_passed(url: str, cwd: Path) -> bool:
             pass
         time.sleep(CHECKS_APPEAR_SECONDS)
     else:
-        return False
+        return None
     return subprocess.run(["gh", "pr", "checks", url, "--watch", "--fail-fast"], cwd=cwd).returncode == 0
+
+
+def checks_passed_now(url: str) -> bool:
+    """Whether every check and status on the PR head has passed; none at all is not a pass."""
+    out = subprocess.run(["gh", "pr", "checks", url, "--json", "bucket"], cwd=ROOT, capture_output=True, text=True)
+    try:
+        buckets = {c["bucket"] for c in json.loads(out.stdout or "[]")}
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return False
+    return bool(buckets) and buckets <= {"pass", "skipping"}
 
 
 def apply(org: str, pins: dict[str, str], ready: list[Move], *, replace_orphan: bool = False) -> None:
@@ -215,9 +241,14 @@ def apply(org: str, pins: dict[str, str], ready: list[Move], *, replace_orphan: 
             body = "## Why\nShip merged member work to the Surface release.\n\n## Pins\n" + report(org, ready)
             url = sh("gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", body, cwd=wt)
             print(url)
-            if not ci_passed(url, wt):
+            passed = ci_passed(url, wt)
+            if passed is None:
+                print(f"guild-pin: no checks on {url}; a later run merges it once its checks or a local pass succeed")
+                return
+            if not passed:
                 raise RuntimeError(f"guild-pin: Guild CI did not pass on {url}; not merged")
-            sh("gh", "pr", "merge", url, "--merge", cwd=wt)
+            # --match-head-commit: merge only the commit whose checks were read.
+            sh("gh", "pr", "merge", url, "--merge", "--match-head-commit", sh("git", "rev-parse", "HEAD", cwd=wt), cwd=wt)
             merged = True
             print(f"guild-pin: merged {url}")
         finally:
@@ -274,7 +305,13 @@ def main(argv: list[str]) -> int:
                 else:
                     existing.append(pr)
             if existing:
-                print(f"guild-pin: open pin PR already exists: {existing[0]['url']}")
+                pr = existing[0]
+                if not checks_passed_now(str(pr["url"])):
+                    print(f"guild-pin: open pin PR already exists: {pr['url']}")
+                    return 0
+                sh("gh", "pr", "merge", str(pr["url"]), "--merge", "--match-head-commit", str(pr["headRefOid"]))
+                delete_remote_branch(str(pr["headRefName"]))
+                print(f"guild-pin: merged {pr['url']}")
                 return 0
         moves = plan(org, pins, names or list(pins))
         if not moves:

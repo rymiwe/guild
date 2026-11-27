@@ -311,7 +311,9 @@ class ReleaseLifecycleTest(unittest.TestCase):
         try:
             host_after = snapshot_guarded()
             if host_after != cls.host_before:
-                raise AssertionError("Host installation paths changed during release lifecycle test")
+                changed = sorted({path for root in host_after for path, _ in
+                                  set(cls.host_before[root].items()) ^ set(host_after[root].items())})
+                raise AssertionError(f"Host installation paths changed during release lifecycle test: {changed[:10]}")
         finally:
             cls.tmp_ctx.cleanup()
 

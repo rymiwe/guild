@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Run a test command at one exact commit and record the result as a `local-tests` commit status.
+
+usage: guild-local-pass REPO SHA -- COMMAND [ARG ...]
+
+REPO names a checkout under $GUILD_MEMBER_SOURCES_DIR (default ~/code), such as `guild` or
+`quartermaster`. COMMAND runs in a new detached worktree of that checkout at SHA, so the tree it
+tests is exactly SHA. Exit 0 posts a `success` status on SHA to the checkout's GitHub origin; any
+other exit posts `failure`. guild-pin and guild-update accept a `local-tests` success on the exact
+commit in place of GitHub check runs. Exits with COMMAND's code.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+CONTEXT = "local-tests"
+
+
+def git(*args: str, cwd: Path) -> str:
+    out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"guild-local-pass: git {' '.join(args)} failed: {out.stderr.strip()}")
+    return out.stdout.strip()
+
+
+def resolve(src: Path, ref: str) -> str:
+    # A fetch by SHA writes no ref, so it cannot collide with another fetch of origin in this checkout.
+    if subprocess.run(["git", "cat-file", "-e", f"{ref}^{{commit}}"], cwd=src, capture_output=True).returncode != 0:
+        if not re.fullmatch(r"[0-9a-f]{40}", ref):
+            raise RuntimeError(f"guild-local-pass: {ref} is not in {src}; pass the full SHA")
+        git("fetch", "-q", "--no-write-fetch-head", "origin", ref, cwd=src)
+    return git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=src)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 4 or argv[2] != "--":
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    repo, ref, cmd = argv[0], argv[1], argv[3:]
+    src = Path(os.environ.get("GUILD_MEMBER_SOURCES_DIR") or Path.home() / "code") / repo
+    try:
+        m = re.search(r"github\.com[:/]+([^/]+/[^/]+?)(?:\.git)?$", git("remote", "get-url", "origin", cwd=src))
+        if not m:
+            raise RuntimeError(f"guild-local-pass: origin of {src} is not on GitHub")
+        sha = resolve(src, ref)
+        with tempfile.TemporaryDirectory(prefix="guild-local-pass-") as tmp:
+            wt = Path(tmp) / repo
+            git("worktree", "add", "-q", "--detach", str(wt), sha, cwd=src)
+            try:
+                rc = subprocess.run(cmd, cwd=wt).returncode
+            finally:
+                subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=src, capture_output=True)
+        verdict = "passed" if rc == 0 else f"failed (exit {rc})"
+        # GitHub caps a description at 140 characters; a long command keeps its end, where its arguments are.
+        lead, command = f"{verdict} on {socket.gethostname()}: ", shlex.join(cmd)
+        room = 140 - len(lead)
+        description = lead + (command if len(command) <= room else "..." + command[-(room - 3):])
+        posted = subprocess.run(["gh", "api", "-X", "POST", f"repos/{m.group(1)}/statuses/{sha}",
+                                 "-f", f"state={'success' if rc == 0 else 'failure'}", "-f", f"context={CONTEXT}",
+                                 "-f", f"description={description}"], capture_output=True, text=True)
+        if posted.returncode != 0:
+            raise RuntimeError(f"guild-local-pass: posting the {CONTEXT} status failed: {posted.stderr.strip()}")
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(f"guild-local-pass: {repo} {sha[:7]} {verdict}; posted {CONTEXT}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
