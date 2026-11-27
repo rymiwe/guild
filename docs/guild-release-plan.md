@@ -19,7 +19,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 
 ## Step 1 checks and pins
 
-- **Pins**: `tests/member-pins.json` holds the member commits. CI and `guild-update` read that file; git history records each bump and why. `bin/guild-pin` prints which pins would move to their member's trunk head and the commits each carries. `bin/guild-pin --apply` opens the bump PR, waits for Guild CI, and merges it. A member head with a failed or pending check keeps its old pin.
+- **Pins**: `tests/member-pins.json` holds the member commits. CI and `guild-update` read that file; git history records each bump and why. `bin/guild-pin` prints which pins would move to their member's trunk head and the commits each carries. `bin/guild-pin --apply` opens the bump PR, waits for Guild CI, and merges it. A member head moves when every check run on it passed, or when a `local-tests` status on it passed (see [When GitHub Actions is off](#when-github-actions-is-off)). Any other head keeps its old pin, a head with no check runs included.
 - **Command**: `python3 tests/test_pr_gate_contract.py -v`
 - **Result**: `Ran 7 tests in 5.500s, OK` (installed wrappers, clear gate `pr-gate PASS`, blocker URL `FAIL: unanswered_threads: unanswered: https://github.com/AcmeCorp/widgets/pull/7#discussion_r456`, real `pr-lint` failure, missing `threads-check` error, missing `pr-lint` error, and unchanged host install paths; also verified against shallow detached-HEAD CI-style source clones with `GUILD_MEMBER_SOURCES_DIR`).
 - **CI workflow**: `.github/workflows/ci.yml` checks out the exact SHAs from `tests/member-pins.json` using `secrets.GUILD_READ_TOKEN` (failing closed if unset) and runs `python3 tests/test_pr_gate_contract.py -v`.
@@ -50,7 +50,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 
 ## Step 4 checks and mechanism
 
-- **Updater (`bin/guild-update`, `systemd/guild-update.{service,timer}`)**: every 15 minutes it fetches its own Guild checkout (`~/.local/share/guild/src`) and reads `origin/HEAD`. It installs release `g-<sha12>` only when the latest attempt of every push workflow run on that exact commit completed with success, skipped, or neutral. It waits while CI is queued or running, and fails after 24 hours of waiting. A run stops at 20 minutes.
+- **Updater (`bin/guild-update`, `systemd/guild-update.{service,timer}`)**: every 15 minutes it fetches its own Guild checkout (`~/.local/share/guild/src`) and reads `origin/HEAD`. It installs release `g-<sha12>` only when the latest attempt of every push workflow run on that exact commit completed with success, skipped, or neutral, or when a `local-tests` status on that commit passed. A merge commit with the same tree as its second parent (a pin PR merged while main stood still) also takes that parent's `local-tests` pass. It waits while CI is queued or running, and fails after 24 hours of waiting. A run stops at 20 minutes.
   - It exports that commit to a candidate directory, fetches each pinned member under `~/code`, and runs the candidate's `guild-release deploy` (or `switch`, when an earlier run built the release but did not activate it). On success it records `<root>/installed/<id>`, runs `systemctl --user try-restart bopeep-watch.service` and `guild-release prune`, and moves its checkout to that commit.
   - A failed deploy writes `<root>/failed/<id>` and leaves the active release and the checkout in place. Later runs skip that commit until the next Guild commit; delete the file to retry it. A failed CI run is checked again each run, so a passing re-run recovers the commit.
   - Every failure exits 1 and sends one `job-notify --send` ping per commit and kind. A fetch or GitHub API error retries quietly; from the eighth in a row each run fails, with one ping for the streak.
@@ -58,7 +58,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
   - `installed/` outlives `prune`. A commit installed once is never reinstalled, so a hand rollback or switch stands until the next Guild commit.
 - **Host `guild-exec` (`bin/guild-exec-host`)**: member wrappers in `~/.local/bin` and `~/.claude/hooks` call `guild-exec TOOL PATH`. Linked as `~/.local/bin/guild-exec`, this sends a tool the active release carries to that release, and any other tool (for example `orderly`) to `~/code/quartermaster/bin/guild-exec`. With no release it sends everything there, so installing it first changes nothing.
 - **BLD verification (2026-11-18)**: `guild-release deploy` into a scratch root with `tests/member-pins.json` built `bld1` in 8 s. Through `current/bin`, `pr-gate --repo rymiwe/guild --pr 6` printed the same eleven lines as the live `~/.local/bin/pr-gate`. A second release from member trunks switched and rolled back. The Quartermaster pin [d47a182](https://github.com/rymiwe/quartermaster/commit/d47a182c8e5d03f95c681fcb4a51de34d690f8e3) is the cgroup fix ([quartermaster#109](https://github.com/rymiwe/quartermaster/pull/109)).
-- **Command**: `python3 tests/test_guild_update.py -v`. **Result**: `Ran 5 tests, OK` (waits on running or missing CI and fails once after 24 hours; a member fetch error retries quietly and fails from the eighth run in a row with one ping; failed CI pings once, installs nothing, and recovers when a re-run passes; a hand rollback stands after prune removes the rolled-away release; passed CI activates, a repeat run is a no-op, the host `guild-exec` routes release and non-release tools, and a CI-passed commit with an unfetchable pin leaves the release and the updater checkout where they were, then skips that commit).
+- **Command**: `python3 tests/test_guild_update.py -v`. **Result**: `Ran 8 tests, OK` (a `local-tests` pass installs only the exact commit, or a merge commit with its head's tree; waits on running or missing CI and fails once after 24 hours; a member fetch error retries quietly and fails from the eighth run in a row with one ping; failed CI pings once, installs nothing, and recovers when a re-run passes; a hand rollback stands after prune removes the rolled-away release; passed CI activates, a repeat run is a no-op, the host `guild-exec` routes release and non-release tools, and a CI-passed commit with an unfetchable pin leaves the release and the updater checkout where they were, then skips that commit).
 
 ### Enable on the Surface (owner runs, once)
 
@@ -82,6 +82,26 @@ Check the launcher version: `~/.local/share/guild/current/code/quartermaster` mu
 2. CI checks out every pin and runs the release and contract test suites.
 3. Within 15 minutes of CI passing, Surface's `guild-update.timer` builds and activates `g-<sha12>` and restarts `bopeep-watch`.
 4. On BLD (where `guild-exec` runs directly from `~/code/<tool>`), `guild-host-sync.timer` runs `bin/guild-host-sync` every 15 minutes to fast-forward `guild`, `roster` checkouts, and `pstack`, and `try-restart` `orderly.service` when `orderly` advances.
+
+## When GitHub Actions is off
+
+A `local-tests` commit status stands in for CI. `bin/guild-local-pass REPO SHA -- COMMAND` runs COMMAND in a new detached worktree of `~/code/REPO` at exactly SHA, then posts `success` or `failure` on that commit. A pass on one commit never counts for another, so a new head always needs its own run.
+
+1. After a member merges to trunk, run its workflow's test steps at the new head with `guild-local-pass MEMBER SHA -- ...`. Run them as the workflow does, in a clean env, but with Python 3.12 or newer first on `PATH` when the system `python3` is older.
+2. The next `guild-pin --auto` run opens the pin PR, waits five minutes for checks, finds none, and leaves the PR open.
+3. Run Guild's suite on the PR head: `bin/guild-local-pass guild HEAD_SHA -- scripts/local-suite`. The next `guild-pin --auto` run merges the PR.
+4. The updater installs the merge commit on the head's pass. If main moved before the merge, the trees differ: run step 3 on the merge commit.
+5. A commit pushed straight to Guild main needs the same `scripts/local-suite` run before the Surface installs it.
+
+`scripts/local-suite` runs the test steps of `ci.yml` against the pinned members. `tests/test_guild_local_pass.py` fails when the two lists drift. An updater older than this gate cannot install a commit without CI, so the first release with the gate was installed by running its own `bin/guild-update` once by hand on the Surface.
+
+To turn Actions back on:
+
+1. Enable it, all actions allowed, on each repo: `for r in guild conclave quartermaster bridgekeeper bopeep thresher; do gh api -X PUT repos/rymiwe/$r/actions/permissions -F enabled=true -f allowed_actions=all; done`.
+2. Re-add the two required checks, both from the GitHub Actions app (id 15368): `suite` on conclave `master` and `test` on quartermaster `main`. For conclave: `gh api -X PATCH repos/rymiwe/conclave/branches/master/protection/required_status_checks --input checks.json`, with `checks.json` holding `{"strict": false, "checks": [{"context": "suite", "app_id": 15368}]}`.
+3. Check that Guild Pages and the quartermaster seats widget run again: `gh run list --repo rymiwe/guild --limit 3`, and the same for quartermaster.
+
+The local gate can stay. With CI on, `guild-pin` reads a member's `local-tests` status only when its check runs are not all green, so the gate does nothing until someone runs `guild-local-pass`.
 
 A new roster tool also needs a pin, a checkout step in `.github/workflows/ci.yml`, and `contents:read` for `GUILD_READ_TOKEN`.
 
