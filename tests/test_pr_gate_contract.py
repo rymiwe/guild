@@ -181,6 +181,9 @@ def snapshot_tree(path: Path) -> dict[str, tuple[int, int, int, int, int]]:
     snap[str(path)] = (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns)
     if path.is_dir() and not path.is_symlink():
         for root, dirs, files in os.walk(path, followlinks=False):
+            if Path(root).parts[-2:] == (".claude", "skills"):
+                # Claude Code syncs org skills into skills/synced on its own schedule; no installer writes it.
+                dirs[:] = [d for d in dirs if d != "synced"]
             for entry in [*dirs, *files]:
                 full = Path(root) / entry
                 est = full.lstat()
