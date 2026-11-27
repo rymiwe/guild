@@ -37,6 +37,7 @@ step env GUILD_MEMBER_SOURCES_DIR="$deps" python3 tests/test_guild_update.py -v
 step python3 tests/test_guild_pin.py -v
 step python3 tests/test_guild_host_sync.py -v
 step python3 tests/test_guild_local_pass.py -v
+step python3 tests/test_guild_local_ci.py -v
 step python3 tests/test_grokbot_pace_check.py -v
 step python3 -W error::ResourceWarning tests/test_lint_scorecard.py -v
 step python3 -W error::ResourceWarning tests/test_poteto_judge.py -v

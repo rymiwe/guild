@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Run `run:` steps of a GitHub workflow in the current checkout, the way the ubuntu runner does:
+# a clean env and an empty HOME. The python3 first on the caller's PATH stands in for the runner's,
+# because a host's /usr/bin/python3 can be older; its directory replaces `PATH=/usr/bin:/bin` inside
+# the steps. gitleaks and ruby are linked in when the caller has them.
+#
+# usage: [CI_ENV="KEY=VALUE ..."] ci-step WORKFLOW STEP_NAME...
+#
+# The steps come from WORKFLOW as it is in the checkout, so they match the commit under test.
+# CI_ENV adds the job and step env the workflow sets. A missing step fails the run.
+set -euo pipefail
+wf=$1
+shift
+py_dir=$(dirname "$(command -v python3)")
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+mkdir -p "$tmp/home" "$tmp/bin"
+# Tools the runner image has: link the real binary. A mise shim works only where mise activates it.
+for tool in gitleaks ruby; do
+  p=$(command -v "$tool") || p=
+  case $p in "" | */mise/shims/*) p=$(mise where "$tool@latest" 2>/dev/null)/bin/$tool ;; esac
+  [ -x "$p" ] || p=
+  if [ -n "$p" ]; then ln -s "$p" "$tmp/bin/$tool"; fi
+done
+for name in "$@"; do
+  python3 - "$wf" "$name" >"$tmp/step.sh" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+i = next((n for n, l in enumerate(lines) if re.fullmatch(r"\s*- name: " + re.escape(sys.argv[2]), l)), None)
+if i is None:
+    sys.exit(f"ci-step: no step named {sys.argv[2]!r} in {sys.argv[1]}")
+indent = len(lines[i]) - len(lines[i].lstrip())
+for j in range(i + 1, len(lines)):
+    l = lines[j]
+    if l.strip() and len(l) - len(l.lstrip()) <= indent:
+        sys.exit(f"ci-step: step {sys.argv[2]!r} has no run")
+    m = re.fullmatch(r"(\s*)run: (.*)", l)
+    if m:
+        break
+if m.group(2) != "|":
+    print(m.group(2))
+    sys.exit()
+body = []
+for l in lines[j + 1:]:
+    if l.strip() and len(l) - len(l.lstrip()) <= len(m.group(1)):
+        break
+    body.append(l)
+pad = min(len(l) - len(l.lstrip()) for l in body if l.strip())
+print("\n".join(l[pad:] for l in body))
+PY
+  sed -i "s#PATH=/usr/bin:/bin#PATH=$py_dir:/usr/bin:/bin#g; s#/tmp/emptyhome#$tmp/emptyhome#g" "$tmp/step.sh"
+  echo "== $name"
+  # shellcheck disable=SC2086
+  env -i PATH="$tmp/bin:$py_dir:/usr/bin:/bin" HOME="$tmp/home" LANG=C.UTF-8 ${CI_ENV:-} \
+    bash --noprofile --norc -eo pipefail "$tmp/step.sh"
+done

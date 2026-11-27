@@ -1,0 +1,11 @@
+[Unit]
+Description=Run member and pin PR suites locally while GitHub Actions is off
+
+# The pin host only: it posts local-tests statuses that guild-pin and guild-update accept in place of CI.
+[Service]
+Type=oneshot
+# One run can hold several suites of up to 10 minutes each.
+TimeoutStartSec=90min
+# linuxbrew comes before /usr/bin: the system python3 there is too old.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/guild-exec guild bin/guild-local-ci

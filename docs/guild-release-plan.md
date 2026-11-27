@@ -87,11 +87,15 @@ Check the launcher version: `~/.local/share/guild/current/code/quartermaster` mu
 
 While Actions is off on a repo, a `local-tests` commit status stands in for its CI. `bin/guild-local-pass REPO SHA -- COMMAND` runs COMMAND in a new detached worktree of `~/code/REPO` at exactly SHA, then posts `success` or `failure` on that commit. A pass on one commit never counts for another, so a new head always needs its own run.
 
-1. After a member merges to trunk, run its workflow's test steps at the new head with `guild-local-pass MEMBER SHA -- ...`. Run them as the workflow does, in a clean env, but with Python 3.12 or newer first on `PATH` when the system `python3` is older. Start the run from its own scope (`systemd-run --user --scope --quiet guild-local-pass ...`): inside a T3 agent's scope, quartermaster's `job-launch` wraps tmux in `systemd-run --user`, which fails in a clean env, and 68 job tests fail for that reason alone.
-2. The next `guild-pin --auto` run opens the pin PR and leaves it open: with Actions off on Guild, no check will come.
-3. Run Guild's suite on the PR head: `bin/guild-local-pass guild HEAD_SHA -- scripts/local-suite`. The next `guild-pin --auto` run merges the PR on that exact head's pass. A pin PR whose base main has moved past is closed instead, and the run re-plans on the new main, so the merge always has the tested tree.
-4. The updater installs the merge commit on the head's pass. If main still moved in the moment before the merge, the trees differ and the updater waits: run step 3 on the merge commit.
-5. A commit pushed straight to Guild main needs the same `scripts/local-suite` run before the Surface installs it.
+`guild-local-ci.timer` on the pin host runs `bin/guild-local-ci` every 10 minutes and does the runs a CI runner would:
+
+1. For each member with Actions off whose trunk head differs from its pin and has no `local-tests` status, it runs that member's workflow test steps at the head through `scripts/ci-step`, which reads the steps from the commit under test.
+2. `guild-pin --auto` then opens the pin PR and leaves it open: with Actions off on Guild, no check will come.
+3. `guild-local-ci` runs `scripts/local-suite` on the PR head. The next `guild-pin --auto` run merges the PR on that exact head's pass. A pin PR whose base main has moved past is closed instead, and the run re-plans on the new main, so the merge always has the tested tree.
+4. The updater installs the merge commit on the head's pass. If main still moved in the moment before the merge, the trees differ and the updater waits: run `bin/guild-local-pass guild SHA -- scripts/local-suite` on the merge commit.
+5. A commit pushed straight to Guild main needs that same run by hand before the Surface installs it.
+
+A failed run is not retried; `guild-pin` pings once, and a rerun of `guild-local-pass` replaces the status. Each run's output is in `~/.local/state/guild/local-ci/`. Run a suite by hand from its own scope (`systemd-run --user --scope --quiet guild-local-pass ...`): inside a T3 agent's scope, quartermaster's `job-launch` wraps tmux in `systemd-run --user`, which fails in a clean env.
 
 `scripts/local-suite` runs the test steps of `ci.yml` against the pinned members. `tests/test_guild_local_pass.py` fails when the two lists drift. An updater older than this gate cannot install a commit without CI, so the first release with the gate was installed by running its own `bin/guild-update` once by hand on the Surface.
 

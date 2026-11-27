@@ -1,0 +1,9 @@
+[Unit]
+Description=Run waiting local suites every 10 minutes while GitHub Actions is off
+
+[Timer]
+OnBootSec=9min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

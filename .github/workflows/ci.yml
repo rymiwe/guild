@@ -129,7 +129,7 @@ jobs:
         run: python3 tests/test_guild_update.py -v
 
       - name: Run the pin, host sync and local pass tool tests
-        run: python3 tests/test_guild_pin.py -v && python3 tests/test_guild_host_sync.py -v && python3 tests/test_guild_local_pass.py -v
+        run: python3 tests/test_guild_pin.py -v && python3 tests/test_guild_host_sync.py -v && python3 tests/test_guild_local_pass.py -v && python3 tests/test_guild_local_ci.py -v
 
       - name: Run the Grok Bot pace check tests
         run: python3 tests/test_grokbot_pace_check.py -v
