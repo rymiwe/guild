@@ -87,7 +87,7 @@ Check the launcher version: `~/.local/share/guild/current/code/quartermaster` mu
 
 A `local-tests` commit status stands in for CI. `bin/guild-local-pass REPO SHA -- COMMAND` runs COMMAND in a new detached worktree of `~/code/REPO` at exactly SHA, then posts `success` or `failure` on that commit. A pass on one commit never counts for another, so a new head always needs its own run.
 
-1. After a member merges to trunk, run its workflow's test steps at the new head with `guild-local-pass MEMBER SHA -- ...`. Run them as the workflow does, in a clean env, but with Python 3.12 or newer first on `PATH` when the system `python3` is older.
+1. After a member merges to trunk, run its workflow's test steps at the new head with `guild-local-pass MEMBER SHA -- ...`. Run them as the workflow does, in a clean env, but with Python 3.12 or newer first on `PATH` when the system `python3` is older. Start the run from its own scope (`systemd-run --user --scope --quiet guild-local-pass ...`): inside a T3 agent's scope, quartermaster's `job-launch` wraps tmux in `systemd-run --user`, which fails in a clean env, and 68 job tests fail for that reason alone.
 2. The next `guild-pin --auto` run opens the pin PR, waits five minutes for checks, finds none, and leaves the PR open.
 3. Run Guild's suite on the PR head: `bin/guild-local-pass guild HEAD_SHA -- scripts/local-suite`. The next `guild-pin --auto` run merges the PR.
 4. The updater installs the merge commit on the head's pass. If main moved before the merge, the trees differ: run step 3 on the merge commit.
