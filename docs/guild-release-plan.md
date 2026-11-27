@@ -19,7 +19,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 
 ## Step 1 checks and pins
 
-- **Pins**: `tests/member-pins.json` holds the member commits. CI and `guild-update` read that file; git history records each bump and why. `bin/guild-pin` prints which pins would move to their member's trunk head and the commits each carries. `bin/guild-pin --apply` opens the bump PR, waits for Guild CI, and merges it. A member head moves when every check run on it passed, or when a `local-tests` status on it passed (see [When GitHub Actions is off](#when-github-actions-is-off)). Any other head keeps its old pin, a head with no check runs included.
+- **Pins**: `tests/member-pins.json` holds the member commits. CI and `guild-update` read that file; git history records each bump and why. `bin/guild-pin` prints which pins would move to their member's trunk head and the commits each carries. `bin/guild-pin --apply` opens the bump PR, waits for Guild CI, and merges it. A member head moves when every check run on it passed, or, while Actions is off on that member, when a `local-tests` status on it passed (see [When GitHub Actions is off](#when-github-actions-is-off)). Any other head keeps its old pin, a head with no check runs included.
 - **Command**: `python3 tests/test_pr_gate_contract.py -v`
 - **Result**: `Ran 7 tests in 5.500s, OK` (installed wrappers, clear gate `pr-gate PASS`, blocker URL `FAIL: unanswered_threads: unanswered: https://github.com/AcmeCorp/widgets/pull/7#discussion_r456`, real `pr-lint` failure, missing `threads-check` error, missing `pr-lint` error, and unchanged host install paths; also verified against shallow detached-HEAD CI-style source clones with `GUILD_MEMBER_SOURCES_DIR`).
 - **CI workflow**: `.github/workflows/ci.yml` checks out the exact SHAs from `tests/member-pins.json` using `secrets.GUILD_READ_TOKEN` (failing closed if unset) and runs `python3 tests/test_pr_gate_contract.py -v`.
@@ -50,7 +50,7 @@ Do not add a rollout format or scheduler in step 1. The first deliverable is the
 
 ## Step 4 checks and mechanism
 
-- **Updater (`bin/guild-update`, `systemd/guild-update.{service,timer}`)**: every 15 minutes it fetches its own Guild checkout (`~/.local/share/guild/src`) and reads `origin/HEAD`. It installs release `g-<sha12>` only when the latest attempt of every push workflow run on that exact commit completed with success, skipped, or neutral, or when a `local-tests` status on that commit passed. A merge commit with the same tree as its second parent (a pin PR merged while main stood still) also takes that parent's `local-tests` pass. It waits while CI is queued or running, and fails after 24 hours of waiting. A run stops at 20 minutes.
+- **Updater (`bin/guild-update`, `systemd/guild-update.{service,timer}`)**: every 15 minutes it fetches its own Guild checkout (`~/.local/share/guild/src`) and reads `origin/HEAD`. It installs release `g-<sha12>` only when the latest attempt of every push workflow run on that exact commit completed with success, skipped, or neutral, or, while Actions is off on Guild, when a `local-tests` status on that commit passed. A merge commit with the same tree as its second parent (a pin PR merged while main stood still) also takes that parent's `local-tests` pass. It waits while CI is queued or running, and fails after 24 hours of waiting. A run stops at 20 minutes.
   - It exports that commit to a candidate directory, fetches each pinned member under `~/code`, and runs the candidate's `guild-release deploy` (or `switch`, when an earlier run built the release but did not activate it). On success it records `<root>/installed/<id>`, runs `systemctl --user try-restart bopeep-watch.service` and `guild-release prune`, and moves its checkout to that commit.
   - A failed deploy writes `<root>/failed/<id>` and leaves the active release and the checkout in place. Later runs skip that commit until the next Guild commit; delete the file to retry it. A failed CI run is checked again each run, so a passing re-run recovers the commit.
   - Every failure exits 1 and sends one `job-notify --send` ping per commit and kind. A fetch or GitHub API error retries quietly; from the eighth in a row each run fails, with one ping for the streak.
@@ -85,12 +85,12 @@ Check the launcher version: `~/.local/share/guild/current/code/quartermaster` mu
 
 ## When GitHub Actions is off
 
-A `local-tests` commit status stands in for CI. `bin/guild-local-pass REPO SHA -- COMMAND` runs COMMAND in a new detached worktree of `~/code/REPO` at exactly SHA, then posts `success` or `failure` on that commit. A pass on one commit never counts for another, so a new head always needs its own run.
+While Actions is off on a repo, a `local-tests` commit status stands in for its CI. `bin/guild-local-pass REPO SHA -- COMMAND` runs COMMAND in a new detached worktree of `~/code/REPO` at exactly SHA, then posts `success` or `failure` on that commit. A pass on one commit never counts for another, so a new head always needs its own run.
 
 1. After a member merges to trunk, run its workflow's test steps at the new head with `guild-local-pass MEMBER SHA -- ...`. Run them as the workflow does, in a clean env, but with Python 3.12 or newer first on `PATH` when the system `python3` is older. Start the run from its own scope (`systemd-run --user --scope --quiet guild-local-pass ...`): inside a T3 agent's scope, quartermaster's `job-launch` wraps tmux in `systemd-run --user`, which fails in a clean env, and 68 job tests fail for that reason alone.
-2. The next `guild-pin --auto` run opens the pin PR, waits five minutes for checks, finds none, and leaves the PR open.
-3. Run Guild's suite on the PR head: `bin/guild-local-pass guild HEAD_SHA -- scripts/local-suite`. The next `guild-pin --auto` run merges the PR.
-4. The updater installs the merge commit on the head's pass. If main moved before the merge, the trees differ: run step 3 on the merge commit.
+2. The next `guild-pin --auto` run opens the pin PR and leaves it open: with Actions off on Guild, no check will come.
+3. Run Guild's suite on the PR head: `bin/guild-local-pass guild HEAD_SHA -- scripts/local-suite`. The next `guild-pin --auto` run merges the PR on that exact head's pass. A pin PR whose base main has moved past is closed instead, and the run re-plans on the new main, so the merge always has the tested tree.
+4. The updater installs the merge commit on the head's pass. If main still moved in the moment before the merge, the trees differ and the updater waits: run step 3 on the merge commit.
 5. A commit pushed straight to Guild main needs the same `scripts/local-suite` run before the Surface installs it.
 
 `scripts/local-suite` runs the test steps of `ci.yml` against the pinned members. `tests/test_guild_local_pass.py` fails when the two lists drift. An updater older than this gate cannot install a commit without CI, so the first release with the gate was installed by running its own `bin/guild-update` once by hand on the Surface.
@@ -101,7 +101,7 @@ To turn Actions back on:
 2. Re-add the two required checks, both from the GitHub Actions app (id 15368): `suite` on conclave `master` and `test` on quartermaster `main`. For conclave: `gh api -X PATCH repos/rymiwe/conclave/branches/master/protection/required_status_checks --input checks.json`, with `checks.json` holding `{"strict": false, "checks": [{"context": "suite", "app_id": 15368}]}`.
 3. Check that Guild Pages and the quartermaster seats widget run again: `gh run list --repo rymiwe/guild --limit 3`, and the same for quartermaster.
 
-The local gate can stay. With CI on, `guild-pin` reads a member's `local-tests` status only when its check runs are not all green, so the gate does nothing until someone runs `guild-local-pass`.
+The local gate can stay. Each gate reads a repo's Actions state first, so once Actions is on again the check runs decide and a `local-tests` status counts for nothing. A failed read of that state blocks; it never reads as off. Limits: `guild-local-pass` trusts the command it is given, and records it in the status description, so a wrong command posts a pass that means nothing. A billing failure with Actions still enabled blocks until Actions is turned off or a run passes.
 
 A new roster tool also needs a pin, a checkout step in `.github/workflows/ci.yml`, and `contents:read` for `GUILD_READ_TOKEN`.
 

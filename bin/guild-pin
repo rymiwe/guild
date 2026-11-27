@@ -5,20 +5,22 @@ usage: guild-pin [--apply] [--auto] [MEMBER ...]
 
 Reads tests/member-pins.json from origin's main of this Guild checkout. For each
 member (default: every pinned member) it reads the head of the member's default
-branch on GitHub. A head moves the pin when every check run on it passed, or
-when a `local-tests` success status sits on that exact commit (guild-local-pass
-posts it, for when GitHub Actions is off). Any other head keeps the old pin and
-is reported, a head with no check runs included.
+branch on GitHub. A head moves the pin when every check run on it passed, or,
+while GitHub Actions is off on that member, when a `local-tests` success status
+sits on that exact commit (guild-local-pass posts it). Any other head keeps the
+old pin and is reported, a head with no check runs included.
 
 Without --apply it prints the plan and changes nothing. With --apply it commits
 the new pins on a branch in a temporary worktree, opens a pull request whose body
 lists the commits each pin carries, waits for Guild CI, and merges it. The
 Surface updater then installs the release on its own. Exit 0 with nothing to move.
-A PR that gets no checks within five minutes stays open for a local pass.
+While Actions is off on Guild, the PR stays open until its head has a local-tests
+pass; a PR that gets no checks within five minutes stays open too. A PR merges
+only when its head sits directly on main, so the merge has the tested tree.
 
 With --auto (for systemd timers), it implies --apply, acquires an flock, closes
-any conflicting pin/* PR, merges an open pin/* PR whose checks have passed and
-otherwise skips while one is open, exits 0 while member checks are still pending,
+any pin/* PR that conflicts or whose base main has moved past, merges an open
+pin/* PR whose head passed and otherwise skips while one is open, exits 0 while member checks are still pending,
 retries fetch errors quietly until the eighth in a row, and sends one
 `job-notify --send` ping per failure key.
 """
@@ -41,6 +43,7 @@ PINS_PATH = "tests/member-pins.json"
 # Fetch into a ref only this script writes: guild-host-sync fetches origin/main in this checkout on its own timer,
 # and two fetches into one ref fail with "cannot lock ref".
 MAIN_REF = "refs/guild-pin/main"
+PR_REF = "refs/guild-pin/pr"
 PASSED = {"success", "skipped", "neutral"}
 # Tests shorten the wait for checks to appear.
 CHECKS_APPEAR_TRIES = int(os.environ.get("GUILD_PIN_CHECK_TRIES") or 60)
@@ -152,8 +155,20 @@ def delete_remote_branch(branch: str) -> None:
 def close_pin_pr(pr: dict[str, object]) -> None:
     url, branch = str(pr["url"]), str(pr["headRefName"])
     sh("gh", "pr", "close", url)
-    print(f"guild-pin: closed conflicting pin PR {url}")
+    print(f"guild-pin: closed stale pin PR {url}")
     delete_remote_branch(branch)
+
+
+def base_moved(branch: str, head: str) -> bool:
+    """Whether main moved past the pin commit's parent: a merge would then hold a tree that nothing tested."""
+    sh("git", "fetch", "-q", "--no-write-fetch-head", "--refmap=", "origin",
+       f"+refs/heads/main:{MAIN_REF}", f"+refs/heads/{branch}:{PR_REF}")
+    return sh("git", "rev-parse", f"{head}^1") != sh("git", "rev-parse", MAIN_REF)
+
+
+def actions_on(slug: str) -> bool:
+    # A read error raises, so a local pass never stands in for CI by mistake.
+    return sh("gh", "api", f"repos/{slug}/actions/permissions", "--jq", ".enabled") == "true"
 
 
 def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
@@ -168,7 +183,8 @@ def plan(org: str, pins: dict[str, str], members: list[str]) -> list[Move]:
                              "--jq", "[.check_runs[] | {name, status, conclusion}]"))
         bad = [r for r in runs if r["status"] != "completed" or r["conclusion"] not in PASSED]
         if bad or not runs:
-            if local_passed(f"{org}/{member}", new):
+            # A local pass stands in for CI only while Actions is off: with it on, the check runs decide.
+            if local_passed(f"{org}/{member}", new) and not actions_on(f"{org}/{member}"):
                 move.local = True
             else:
                 move.blocked = (", ".join(f"{r['name']} {r['conclusion'] or r['status']}" for r in bad)
@@ -212,14 +228,19 @@ def ci_passed(url: str, cwd: Path) -> bool | None:
     return subprocess.run(["gh", "pr", "checks", url, "--watch", "--fail-fast"], cwd=cwd).returncode == 0
 
 
-def checks_passed_now(url: str) -> bool:
-    """Whether every check and status on the PR head has passed; none at all is not a pass."""
-    out = subprocess.run(["gh", "pr", "checks", url, "--json", "bucket"], cwd=ROOT, capture_output=True, text=True)
+def pin_pr_passed(slug: str, url: str, head: str) -> bool:
+    """Whether the pin PR head passed: its CI workflow checks with Actions on, its own local-tests pass with it off."""
+    if not actions_on(slug):
+        return local_passed(slug, head)
+    out = subprocess.run(["gh", "pr", "checks", url, "--json", "bucket,workflow"], cwd=ROOT,
+                         capture_output=True, text=True)
     try:
-        buckets = {c["bucket"] for c in json.loads(out.stdout or "[]")}
+        checks = json.loads(out.stdout or "[]")
+        ci = any(c["workflow"] for c in checks)
+        buckets = {c["bucket"] for c in checks}
     except (json.JSONDecodeError, TypeError, KeyError):
         return False
-    return bool(buckets) and buckets <= {"pass", "skipping"}
+    return ci and buckets <= {"pass", "skipping"}
 
 
 def apply(org: str, pins: dict[str, str], ready: list[Move], *, replace_orphan: bool = False) -> None:
@@ -241,14 +262,21 @@ def apply(org: str, pins: dict[str, str], ready: list[Move], *, replace_orphan: 
             body = "## Why\nShip merged member work to the Surface release.\n\n## Pins\n" + report(org, ready)
             url = sh("gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", body, cwd=wt)
             print(url)
+            head = sh("git", "rev-parse", "HEAD", cwd=wt)
+            if not actions_on(repo_slug()):
+                print(f"guild-pin: Actions is off; a later run merges {url} once its head has a local-tests pass")
+                return
             passed = ci_passed(url, wt)
             if passed is None:
-                print(f"guild-pin: no checks on {url}; a later run merges it once its checks or a local pass succeed")
+                print(f"guild-pin: no checks on {url}; a later run merges it once its checks pass")
                 return
             if not passed:
                 raise RuntimeError(f"guild-pin: Guild CI did not pass on {url}; not merged")
+            if base_moved(branch, head):
+                print(f"guild-pin: main moved under {url}; the next run closes it and re-plans")
+                return
             # --match-head-commit: merge only the commit whose checks were read.
-            sh("gh", "pr", "merge", url, "--merge", "--match-head-commit", sh("git", "rev-parse", "HEAD", cwd=wt), cwd=wt)
+            sh("gh", "pr", "merge", url, "--merge", "--match-head-commit", head, cwd=wt)
             merged = True
             print(f"guild-pin: merged {url}")
         finally:
@@ -298,15 +326,16 @@ def main(argv: list[str]) -> int:
             raise RuntimeError(f"guild-pin: not a pinned member: {', '.join(unknown)}")
         org = owner()
         if do_auto:
+            slug = repo_slug()
             existing = []
-            for pr in open_pin_prs(repo_slug()):
-                if pr.get("mergeable") == "CONFLICTING":
+            for pr in open_pin_prs(slug):
+                if pr.get("mergeable") == "CONFLICTING" or base_moved(str(pr["headRefName"]), str(pr["headRefOid"])):
                     close_pin_pr(pr)
                 else:
                     existing.append(pr)
             if existing:
                 pr = existing[0]
-                if not checks_passed_now(str(pr["url"])):
+                if not pin_pr_passed(slug, str(pr["url"]), str(pr["headRefOid"])):
                     print(f"guild-pin: open pin PR already exists: {pr['url']}")
                     return 0
                 sh("gh", "pr", "merge", str(pr["url"]), "--merge", "--match-head-commit", str(pr["headRefOid"]))

@@ -10,11 +10,12 @@
 #      `guild-release prune` never touches installed/. Stops (exit 1) when
 #      <root>/failed/g-<sha12> exists: that commit failed to deploy. Delete the file to
 #      retry it.
-#   3. Goes on when a `local-tests` success status (guild-local-pass) sits on that commit,
-#      or on its second parent when the two have the same tree (a pin PR merged while main
-#      stood still). Otherwise waits (exit 0) while the push workflow runs for that commit
-#      are queued or running, and fails after 24 hours of waiting. Fails when the latest
-#      attempt of any of them did not succeed; a passing re-run recovers the commit.
+#   3. While GitHub Actions is off on the repo, goes on when a `local-tests` success status
+#      (guild-local-pass) sits on that commit, or on its second parent when the two have the
+#      same tree (a pin PR merged while main stood still). Otherwise waits (exit 0) while
+#      the push workflow runs for that commit are queued or running, and fails after 24
+#      hours of waiting. Fails when the latest attempt of any of them did not succeed; a
+#      passing re-run recovers the commit.
 #   4. Exports that commit to a candidate directory, fetches each pinned member under
 #      $GUILD_MEMBER_SOURCES_DIR, and runs the candidate's `guild-release deploy` (or
 #      `switch`, when an earlier run built the release but did not activate it). A
@@ -114,6 +115,9 @@ if head=$(git -C "$src" rev-parse -q --verify "$sha^2") &&
   tested="$sha $head"
 fi
 runs=
+# A local pass stands in for CI only while Actions is off; a read error retries, never reads as off.
+actions=$(gh api "repos/$repo/actions/permissions" --jq .enabled) || transient "cannot read the Actions state of $repo"
+[ "$actions" = false ] || tested=
 for c in $tested; do
   st=$(gh api "repos/$repo/commits/$c/status" \
     --jq '[.statuses[] | select(.context == "local-tests") | .state] | first // ""') ||
