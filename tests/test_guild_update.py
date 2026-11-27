@@ -23,6 +23,7 @@ STUB_GH = """#!/bin/sh
 # gh api repos/acme/guild/commits/SHA/status --jq ...: print SHA's local-tests state from "SHA STATE" lines.
 case "$*" in
   "api repos/acme/guild/actions/runs?head_sha="*"&event=push&"*) cat "$GH_RUNS_FILE" ;;
+  "api repos/acme/guild/actions/permissions "*) echo "${GH_ACTIONS_ENABLED:-true}" ;;
   "api repos/acme/guild/commits/"*"/status "*)
     sha=${2#repos/acme/guild/commits/}
     sed -n "s/^${sha%/status} //p" "$GH_STATUS_FILE" ;;
@@ -122,8 +123,8 @@ class GuildUpdateTest(unittest.TestCase):
         self.root.mkdir(parents=True)
         self._git("clone", "-q", str(self.guild_origin), str(self.root / "src"))
 
-    def update(self, runs: str, home: Path | None = None,
-               local: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def update(self, runs: str, home: Path | None = None, local: dict[str, str] | None = None,
+               actions: str = "true") -> subprocess.CompletedProcess[str]:
         self.runs.write_text(runs)
         self.statuses.write_text("".join(f"{sha} {state}\n" for sha, state in (local or {}).items()))
         env = {
@@ -137,6 +138,7 @@ class GuildUpdateTest(unittest.TestCase):
             "PSTACK_HOME": str(self.pstack),
             "GH_RUNS_FILE": str(self.runs),
             "GH_STATUS_FILE": str(self.statuses),
+            "GH_ACTIONS_ENABLED": actions,
             "NOTIFY_LOG": str(self.notify_log),
         }
         return subprocess.run(
@@ -270,14 +272,16 @@ class GuildUpdateTest(unittest.TestCase):
 
     def test_local_pass_on_the_exact_commit_stands_in_for_ci(self) -> None:
         head = self._git("rev-parse", "HEAD", cwd=self.guild_work).stdout.strip()
-        # A pass recorded on another commit, or a failed local run, leaves the updater waiting for CI.
-        for local in ({"0" * 40: "success"}, {head: "failure"}):
-            proc = self.update("", local=local)
+        # A pass recorded on another commit, a failed local run, or any pass while Actions is on leaves
+        # the updater waiting for CI.
+        for local, actions in (({"0" * 40: "success"}, "false"), ({head: "failure"}, "false"),
+                               ({head: "success"}, "true")):
+            proc = self.update("", local=local, actions=actions)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("waiting", proc.stderr)
             self.assertIsNone(self.current())
-        # A pass on the exact commit installs it, even over a CI run that never started.
-        proc = self.update("completed failure pr-gate-contract\n", local={head: "success"})
+        # With Actions off, a pass on the exact commit installs it, even over a CI run that never started.
+        proc = self.update("completed failure pr-gate-contract\n", local={head: "success"}, actions="false")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.current(), f"releases/{self.head_id()}")
         self.assertEqual(self.notifications(), [])
@@ -302,14 +306,14 @@ class GuildUpdateTest(unittest.TestCase):
     def test_merge_commit_takes_its_pr_heads_pass_only_with_the_same_tree(self) -> None:
         try:
             head = self.merge_branch("pin-same-tree", main_moves=False)
-            proc = self.update("", local={head: "success"})
+            proc = self.update("", local={head: "success"}, actions="false")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             installed = f"releases/{self.head_id()}"
             self.assertEqual(self.current(), installed)
 
             # main moved before the merge, so the merge holds files the PR head's run never saw.
             head = self.merge_branch("pin-main-moved", main_moves=True)
-            proc = self.update("", local={head: "success"})
+            proc = self.update("", local={head: "success"}, actions="false")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("waiting", proc.stderr)
             self.assertEqual(self.current(), installed)

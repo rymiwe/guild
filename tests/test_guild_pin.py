@@ -115,9 +115,14 @@ class GuildPinTest(unittest.TestCase):
         out = self.run_pin(gh, "alpha")
         self.assertEqual(out.returncode, 1, out.stderr)
         self.assertIn("**alpha** aaaaaaa -> eeeeeee (blocked: no check runs or local pass)", out.stdout)
-        out = self.run_pin({**gh, "repos/acme/alpha/commits/" + new_a + "/status": "success"}, "alpha")
+        passed = {**gh, "repos/acme/alpha/commits/" + new_a + "/status": "success"}
+        out = self.run_pin({**passed, "repos/acme/alpha/actions/permissions": "false"}, "alpha")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("**alpha** aaaaaaa -> eeeeeee (local tests passed)", out.stdout)
+        # Once Actions is back on, the check runs decide and a local pass no longer counts.
+        out = self.run_pin({**passed, "repos/acme/alpha/actions/permissions": "true"}, "alpha")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("(blocked: no check runs or local pass)", out.stdout)
 
     def test_local_pass_moves_a_head_whose_check_run_failed(self) -> None:
         # Actions records a billing refusal as a failed check run; a local run of the suite stands in for it.
@@ -126,13 +131,16 @@ class GuildPinTest(unittest.TestCase):
               "repos/acme/beta/commits/" + new_b + "/check-runs": json.dumps(
                   [{"name": "test", "status": "completed", "conclusion": "failure"}]),
               "repos/acme/beta/commits/" + new_b + "/status": "success",
+              "repos/acme/beta/actions/permissions": "false",
               f"repos/acme/beta/compare/{OLD['beta']}...{new_b}": ""}
         out = self.run_pin(gh, "beta")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("**beta** bbbbbbb -> ddddddd (local tests passed)", out.stdout)
-        out = self.run_pin({**gh, "repos/acme/beta/commits/" + new_b + "/status": "failure"}, "beta")
-        self.assertEqual(out.returncode, 1, out.stderr)
-        self.assertIn("(blocked: test failure)", out.stdout)
+        for blocked in ({"repos/acme/beta/commits/" + new_b + "/status": "failure"},
+                        {"repos/acme/beta/actions/permissions": "true"}):
+            out = self.run_pin({**gh, **blocked}, "beta")
+            self.assertEqual(out.returncode, 1, out.stderr)
+            self.assertIn("(blocked: test failure)", out.stdout)
 
     def test_pins_at_trunk_need_nothing(self) -> None:
         gh = {"repos/acme/alpha/commits/HEAD": OLD["alpha"], "repos/acme/beta/commits/HEAD": OLD["beta"]}
@@ -145,8 +153,24 @@ class GuildPinTest(unittest.TestCase):
         return {"repos/acme/alpha/commits/HEAD": new_a,
                 "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
                 "repos/acme/alpha/commits/" + new_a + "/status": "success",
+                "repos/acme/alpha/actions/permissions": "false",
                 f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
+                "repos/acme/guild/actions/permissions": "true",
                 "create": "https://github.com/acme/guild/pull/9", "checks": checks, "merge": ""}
+
+    def push_pin_branch(self, branch: str, pins: dict) -> str:
+        """Push a pin commit on top of origin's main, as guild-pin opens one; return its SHA."""
+        work = self.tmp / branch.replace("/", "-")
+        self.git("clone", "-q", str(self.tmp / "origin.git"), str(work), cwd=self.tmp)
+        self.git("checkout", "-q", "-b", branch, cwd=work)
+        (work / "tests" / "member-pins.json").write_text(json.dumps(pins, indent=2) + "\n")
+        self.git("commit", "-qam", f"Pin {branch}", cwd=work)
+        self.git("push", "-q", "origin", branch, cwd=work)
+        return self.git("rev-parse", "HEAD", cwd=work).strip()
+
+    def open_pr(self, branch: str, head: str, number: int = 9) -> str:
+        return json.dumps([{"number": number, "headRefName": branch, "headRefOid": head,
+                            "url": f"https://github.com/acme/guild/pull/{number}", "mergeable": "MERGEABLE"}])
 
     def gh_calls(self) -> list[str]:
         return (self.tmp / "gh.json.log").read_text().splitlines()
@@ -176,32 +200,72 @@ class GuildPinTest(unittest.TestCase):
         self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")], "merged after CI failed")
         self.assertEqual(self.git("branch", "--list", "pin/*", cwd=self.repo), "")
 
-    def test_auto_leaves_a_pin_pr_without_checks_open_then_merges_it_once_it_passes(self) -> None:
-        # With Actions off no check ever appears; guild-local-pass later posts a local-tests status on the head.
-        self.env["GUILD_PIN_CHECK_TRIES"] = "1"
-        gh = {**self.apply_fixture([["", 1]]), "list": "[]", "repos/acme/beta/commits/HEAD": OLD["beta"]}
+    def test_actions_off_pin_pr_merges_only_on_its_heads_local_pass(self) -> None:
+        gh = {**self.apply_fixture([]), "list": "[]", "repos/acme/beta/commits/HEAD": OLD["beta"],
+              "repos/acme/guild/actions/permissions": "false"}
         out = self.run_pin(gh, "--auto")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("no checks on https://github.com/acme/guild/pull/9", out.stdout)
-        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")])
-        self.assertEqual(self.notifications(), [])
+        self.assertIn("Actions is off; a later run merges https://github.com/acme/guild/pull/9", out.stdout)
+        self.assertFalse([c for c in self.gh_calls() if c.startswith(("pr merge", "pr checks"))])
         head = self.git("ls-remote", "--heads", "origin", "pin/alpha-fffffff", cwd=self.repo).split()[0]
 
-        open_pr = json.dumps([{"number": 9, "headRefName": "pin/alpha-fffffff", "headRefOid": head,
-                               "url": "https://github.com/acme/guild/pull/9", "mergeable": "MERGEABLE"}])
-        for buckets in ("[]", '[{"bucket": "pending"}]', '[{"bucket": "pass"}, {"bucket": "fail"}]'):
-            out = self.run_pin({"list": open_pr, "checks": buckets}, "--auto")
+        resume = {"list": self.open_pr("pin/alpha-fffffff", head), "repos/acme/guild/actions/permissions": "false",
+                  "checks": '[{"bucket": "pass", "workflow": "CI"}]', "merge": ""}
+        # Passing checks or a failed local run are not a local pass on this exact head.
+        for state in ("", "failure"):
+            out = self.run_pin({**resume, f"repos/acme/guild/commits/{head}/status": state}, "--auto")
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("open pin PR already exists: https://github.com/acme/guild/pull/9", out.stdout)
         self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")])
 
-        out = self.run_pin({"list": open_pr, "checks": '[{"bucket": "pass"}]', "merge": ""}, "--auto")
+        out = self.run_pin({**resume, f"repos/acme/guild/commits/{head}/status": "success"}, "--auto")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("guild-pin: merged https://github.com/acme/guild/pull/9", out.stdout)
         self.assertIn(f"pr merge https://github.com/acme/guild/pull/9 --merge --match-head-commit {head}",
                       self.gh_calls())
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "pin/*", cwd=self.repo), "")
         self.assertEqual(self.notifications(), [])
+
+    def test_actions_on_pin_pr_without_checks_stays_open_until_ci_workflow_checks_pass(self) -> None:
+        self.env["GUILD_PIN_CHECK_TRIES"] = "1"
+        gh = {**self.apply_fixture([["", 1]]), "list": "[]", "repos/acme/beta/commits/HEAD": OLD["beta"]}
+        out = self.run_pin(gh, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("no checks on https://github.com/acme/guild/pull/9", out.stdout)
+        self.assertEqual(self.notifications(), [])
+        head = self.git("ls-remote", "--heads", "origin", "pin/alpha-fffffff", cwd=self.repo).split()[0]
+
+        resume = {"list": self.open_pr("pin/alpha-fffffff", head), "repos/acme/guild/actions/permissions": "true",
+                  "merge": ""}
+        # A passing status that no CI workflow posted, such as local-tests, does not stand in while Actions is on.
+        for checks in ("[]", '[{"bucket": "pass", "workflow": ""}]',
+                       '[{"bucket": "pass", "workflow": "CI"}, {"bucket": "pending", "workflow": "CI"}]'):
+            out = self.run_pin({**resume, "checks": checks}, "--auto")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("open pin PR already exists: https://github.com/acme/guild/pull/9", out.stdout)
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")])
+
+        out = self.run_pin({**resume, "checks": '[{"bucket": "pass", "workflow": "CI"}]'}, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(f"pr merge https://github.com/acme/guild/pull/9 --merge --match-head-commit {head}",
+                      self.gh_calls())
+
+    def test_auto_closes_a_pin_pr_whose_base_main_moved_past(self) -> None:
+        # Merging it would put a tree on main that neither CI nor a local run saw.
+        head = self.push_pin_branch("pin/alpha-ccccccc", {**OLD, "alpha": "c" * 40})
+        (self.repo / "notes.txt").write_text("main moves\n")
+        self.git("add", "notes.txt", cwd=self.repo)
+        self.git("commit", "-qm", "main moves", cwd=self.repo)
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+        gh = {"list": self.open_pr("pin/alpha-ccccccc", head, 40), "close": "",
+              "repos/acme/alpha/commits/HEAD": OLD["alpha"], "repos/acme/beta/commits/HEAD": OLD["beta"]}
+        out = self.run_pin(gh, "--auto")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("closed stale pin PR https://github.com/acme/guild/pull/40", out.stdout)
+        self.assertIn("pr close https://github.com/acme/guild/pull/40", self.gh_calls())
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")])
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "pin/*", cwd=self.repo), "")
+        self.assertIn("every pin is at its member's trunk head", out.stdout)
 
     def test_failed_commit_leaves_no_branch_and_the_next_run_retries(self) -> None:
         hook = self.repo / ".git" / "hooks" / "pre-commit"
@@ -215,12 +279,14 @@ class GuildPinTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
 
     def test_auto_skips_when_open_pin_pr_exists(self) -> None:
-        self.git("push", "-q", "origin", "HEAD:refs/heads/pin/alpha-ccccccc", cwd=self.repo)
+        head = self.push_pin_branch("pin/alpha-ccccccc", {**OLD, "alpha": "c" * 40})
         for mergeable in ("MERGEABLE", "UNKNOWN"):
             gh = {
-                "list": json.dumps([{"number": 40, "headRefName": "pin/alpha-ccccccc",
+                "list": json.dumps([{"number": 40, "headRefName": "pin/alpha-ccccccc", "headRefOid": head,
                                     "url": "https://github.com/acme/guild/pull/40",
                                     "mergeable": mergeable}]),
+                "repos/acme/guild/actions/permissions": "false",
+                f"repos/acme/guild/commits/{head}/status": "",
             }
             out = self.run_pin(gh, "--auto")
             self.assertEqual(out.returncode, 0, out.stderr)
@@ -250,8 +316,10 @@ class GuildPinTest(unittest.TestCase):
             "repos/acme/alpha/commits/HEAD": new_a,
             "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
             "repos/acme/alpha/commits/" + new_a + "/status": "success",
+            "repos/acme/alpha/actions/permissions": "false",
             f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
             "repos/acme/beta/commits/HEAD": new_b,
+            "repos/acme/guild/actions/permissions": "true",
             "create": "https://github.com/acme/guild/pull/41",
             "checks": [['[{"name": "ci"}]', 0], ["", 0]],
             "merge": "",
@@ -339,8 +407,10 @@ class GuildPinTest(unittest.TestCase):
             "repos/acme/alpha/commits/HEAD": new_a,
             "repos/acme/alpha/commits/" + new_a + "/check-runs": "[]",
             "repos/acme/alpha/commits/" + new_a + "/status": "success",
+            "repos/acme/alpha/actions/permissions": "false",
             f"repos/acme/alpha/compare/{OLD['alpha']}...{new_a}": "",
             "repos/acme/beta/commits/HEAD": new_b,
+            "repos/acme/guild/actions/permissions": "true",
             "create": "https://github.com/acme/guild/pull/41",
             "checks": [['[{"name": "ci"}]', 0], ["", 0]],
             "merge": "",
