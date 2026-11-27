@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install the newest Guild release whose exact commit passed CI. guild-update.timer runs it.
+# Install the newest Guild release whose exact commit passed CI or local-test.
+# guild-update.timer runs it.
 #
 # usage: guild-update
 #
@@ -10,9 +11,13 @@
 #      `guild-release prune` never touches installed/. Stops (exit 1) when
 #      <root>/failed/g-<sha12> exists: that commit failed to deploy. Delete the file to
 #      retry it.
-#   3. Waits (exit 0) while the push workflow runs for that commit are queued or running,
-#      and fails after 24 hours of waiting. Fails when the latest attempt of any of them
-#      did not succeed; a passing re-run recovers the commit.
+#   3. Accepts the commit when a passed local-test record matches its tree and
+#      tests/member-pins.json (local-test is not GitHub CI), or when every push
+#      workflow run completed with success/skipped/neutral. Local-test never overrides
+#      a failed workflow run while Actions is enabled. When Actions is disabled and
+#      there is no finished workflow run, it requires local-test instead of waiting.
+#      Otherwise waits (exit 0) while push workflow runs are queued or running, and
+#      fails after 24 hours of waiting.
 #   4. Exports that commit to a candidate directory, fetches each pinned member under
 #      $GUILD_MEMBER_SOURCES_DIR, and runs the candidate's `guild-release deploy` (or
 #      `switch`, when an earlier run built the release but did not activate it). A
@@ -21,6 +26,10 @@
 #      HOME from the new release, restarts the watcher (try-restart: only when it runs),
 #      prunes unused releases, and moves $GUILD_SRC to that commit, so a new updater and
 #      host guild-exec take effect only with a release that deployed.
+#
+# Bootstrap: an older installed guild-update that predates local-test cannot read
+# evidence. With Actions disabled, activate once by running this script from a
+# checkout that already contains it (after importing evidence on that host).
 #
 # Reporting: a failure exits 1 and sends one `job-notify --send` ping per commit (or per
 # error streak). A fetch or GitHub API error is transient and exits 0; from the 8th in a
@@ -106,21 +115,74 @@ repo=${GUILD_UPDATE_REPO:-$(git -C "$src" remote get-url origin |
 [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
   fail setup "cannot read owner/repo from the origin URL in $src; set GUILD_UPDATE_REPO"
 
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+tree=$(git -C "$src" rev-parse "$sha^{tree}")
+# Pins for evidence must come from the candidate commit, not the installed checkout.
+pins_file=$(mktemp "${TMPDIR:-/tmp}/guild-update-pins.XXXXXX")
+git -C "$src" show "$sha:tests/member-pins.json" >"$pins_file" || {
+  rm -f "$pins_file"
+  fail setup "cannot read tests/member-pins.json at $sha"
+}
+local_ok=0
+if [ -x "$here/guild-local-test" ]; then
+  if "$here/guild-local-test" status --repo "$repo" --sha "$sha" --tree "$tree" --pins "$pins_file" >/dev/null; then
+    local_ok=1
+  fi
+fi
+rm -f "$pins_file"
+# Distinguish verified disabled from API/import errors (do not treat errors as disabled).
+actions_probe=$(python3 -c "
+import sys
+sys.path.insert(0, r'$here')
+import guild_local_test as t
+try:
+    print('1' if t.actions_enabled(r'$repo') else '0')
+except Exception as exc:
+    print('error', exc, file=sys.stderr)
+    sys.exit(2)
+") || {
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    transient "cannot read Actions permissions for $repo"
+  fi
+  fail setup "cannot probe Actions permissions for $repo"
+}
+actions_on=$actions_probe
+
 # Workflow runs, not check runs: a workflow run completes only when all its jobs have.
 runs=$(gh api "repos/$repo/actions/runs?head_sha=$sha&event=push&per_page=100" \
   --jq '.workflow_runs[] | "\(.status) \(.conclusion // "-") \(.name)"') ||
   transient "cannot read CI for $sha"
 
-if [ -z "$runs" ] || grep -qv '^completed ' <<<"$runs"; then
-  [ -e "$state/waiting-$id" ] || { rm -f "$state"/waiting-*; touch "$state/waiting-$id"; }
-  waited=$(( $(date +%s) - $(stat -c %Y "$state/waiting-$id") ))
-  [ "$waited" -lt "$wait_limit_s" ] || fail "$id-wait" "no finished CI for $sha after 24 hours"
-  say "CI not finished for $sha; waiting"
-  exit 0
+# Completed CI failures stay blocking; local-test never overrides them.
+if [ -n "$runs" ]; then
+  bad=$(grep -E '^completed ' <<<"$runs" | grep -Ev '^completed (success|skipped|neutral) ' || true)
+  if [ -n "$bad" ]; then
+    fail "$id-ci" "CI did not pass on $sha: $(tr '\n' ';' <<<"$bad")"
+  fi
 fi
-rm -f "$state"/waiting-*
-bad=$(grep -Ev '^completed (success|skipped|neutral) ' <<<"$runs" || true)
-[ -z "$bad" ] || fail "$id-ci" "CI did not pass on $sha: $(tr '\n' ';' <<<"$bad")"
+
+incomplete=0
+if [ -z "$runs" ] || grep -qv '^completed ' <<<"$runs"; then
+  incomplete=1
+fi
+
+if [ "$actions_on" -eq 1 ]; then
+  # While Actions is on, pending/empty runs still wait even if local-test exists.
+  if [ "$incomplete" -eq 1 ]; then
+    [ -e "$state/waiting-$id" ] || { rm -f "$state"/waiting-*; touch "$state/waiting-$id"; }
+    waited=$(( $(date +%s) - $(stat -c %Y "$state/waiting-$id") ))
+    [ "$waited" -lt "$wait_limit_s" ] || fail "$id-wait" "no finished CI for $sha after 24 hours"
+    say "CI not finished for $sha; waiting"
+    exit 0
+  fi
+  rm -f "$state"/waiting-*
+elif [ "$local_ok" -eq 1 ]; then
+  say "local-test passed for tree $tree (not GitHub CI)"
+  rm -f "$state"/waiting-*
+else
+  fail "$id-local" "Actions disabled and no validated local-test for $sha tree $tree"
+fi
 
 deploy_failed() {
   printf '%s\n' "$1" >"$root/failed/$id"

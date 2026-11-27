@@ -42,7 +42,10 @@ class GuildPinTest(unittest.TestCase):
         env = {"PATH": f"{self.tmp / 'bin'}:/usr/bin:/bin", "HOME": str(self.tmp), "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@acme.example",
                "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@acme.example",
-               "GH_FIXTURE": str(self.tmp / "gh.json")}
+               "GH_FIXTURE": str(self.tmp / "gh.json"),
+               "GUILD_ACTIONS_ENABLED": "1",
+               "GUILD_LOCAL_TEST_DIR": str(self.tmp / "local-test"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
         self.env = env
         (self.tmp / "bin").mkdir()
         (self.tmp / "bin" / "gh").write_text(STUB_GH)
@@ -58,6 +61,9 @@ class GuildPinTest(unittest.TestCase):
         (self.repo / "bin").mkdir(parents=True)
         (self.repo / "tests").mkdir()
         shutil.copy(ROOT / "bin" / "guild-pin", self.repo / "bin" / "guild-pin")
+        shutil.copy(ROOT / "bin" / "guild_local_test.py", self.repo / "bin" / "guild_local_test.py")
+        shutil.copy(ROOT / "bin" / "guild-local-test", self.repo / "bin" / "guild-local-test")
+        (self.repo / "bin" / "guild-local-test").chmod(0o755)
         (self.repo / "tests" / "member-pins.json").write_text(json.dumps(OLD, indent=2) + "\n")
         self.git("init", "-q", "-b", "main", cwd=self.repo)
         self.git("add", "-A", cwd=self.repo)
@@ -71,8 +77,18 @@ class GuildPinTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         return out.stdout
 
+    def with_trees(self, gh: dict) -> dict:
+        """plan() reads commits/{sha} for the tree; stub ignores --jq and prints the value."""
+        out = dict(gh)
+        for key, val in list(gh.items()):
+            if key.endswith("/commits/HEAD") and isinstance(val, str) and len(val) == 40:
+                out.setdefault(key[: -len("HEAD")] + val, "1" * 40)
+            if "/commits/" in key and key.endswith("/check-runs"):
+                out.setdefault(key.split("/check-runs")[0], "1" * 40)
+        return out
+
     def run_pin(self, gh: dict, *args: str) -> subprocess.CompletedProcess:
-        (self.tmp / "gh.json").write_text(json.dumps(gh))
+        (self.tmp / "gh.json").write_text(json.dumps(self.with_trees(gh)))
         return subprocess.run([str(self.repo / "bin" / "guild-pin"), *args], cwd=self.repo, env=self.env,
                               capture_output=True, text=True)
 
@@ -147,7 +163,8 @@ class GuildPinTest(unittest.TestCase):
     def test_apply_does_not_merge_when_ci_fails(self) -> None:
         out = self.run_pin(self.apply_fixture([['[{"name": "ci"}]', 0], ["", 1]]), "--apply", "alpha")
         self.assertEqual(out.returncode, 1, out.stderr)
-        self.assertIn("Guild CI did not pass on https://github.com/acme/guild/pull/9; not merged", out.stderr)
+        self.assertIn("Guild CI did not pass on https://github.com/acme/guild/pull/9", out.stderr)
+        self.assertIn("not merged", out.stderr)
         self.assertFalse([c for c in self.gh_calls() if c.startswith("pr merge")], "merged after CI failed")
         self.assertEqual(self.git("branch", "--list", "pin/*", cwd=self.repo), "")
 

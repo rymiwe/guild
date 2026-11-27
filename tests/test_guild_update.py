@@ -127,6 +127,7 @@ class GuildUpdateTest(unittest.TestCase):
             "GUILD_MEMBER_SOURCES_DIR": str(self.sources),
             "GUILD_UPDATE_RESTART": "",
             "GUILD_UPDATE_REPO": "acme/guild",
+            "GUILD_ACTIONS_ENABLED": "1",
             "PSTACK_HOME": str(self.pstack),
             "GH_RUNS_FILE": str(self.runs),
             "NOTIFY_LOG": str(self.notify_log),
@@ -319,6 +320,78 @@ class GuildUpdateTest(unittest.TestCase):
         finally:
             (self.guild_work / "tests" / "member-pins.json").write_text(json.dumps(PINS, indent=2) + "\n")
             self.commit_guild("Restore pins")
+
+    def test_actions_off_requires_local_test_for_changed_pins(self) -> None:
+        sys.path.insert(0, str(ROOT / "bin"))
+        import guild_local_test as lt  # noqa: E402
+
+        # Candidate with different pins than the previously installed checkout tip.
+        new_pins = dict(PINS)
+        new_pins["quartermaster"] = "1" * 40
+        (self.guild_work / "tests" / "member-pins.json").write_text(
+            json.dumps(new_pins, indent=2) + "\n"
+        )
+        try:
+            sha = self.commit_guild("Pin quartermaster to a new SHA")
+            tree = self._git("rev-parse", "HEAD^{tree}", cwd=self.guild_work).stdout.strip()
+            # Without evidence, Actions-off refuses (does not wait forever).
+            env_off = {
+                **self.git_env,
+                "PATH": step1.build_clean_path(self.stub_bin),
+                "GUILD_RELEASE_ROOT": str(self.root),
+                "GUILD_MEMBER_SOURCES_DIR": str(self.sources),
+                "GUILD_UPDATE_RESTART": "",
+                "GUILD_UPDATE_REPO": "acme/guild",
+                "GUILD_ACTIONS_ENABLED": "0",
+                "GUILD_LOCAL_TEST_DIR": str(self.tmp / "lt-state"),
+                "PSTACK_HOME": str(self.pstack),
+                "GH_RUNS_FILE": str(self.runs),
+                "NOTIFY_LOG": str(self.notify_log),
+            }
+            self.runs.write_text("")
+            proc = subprocess.run(
+                [str(self.root / "src" / "bin" / "guild-update")],
+                env=env_off, text=True, capture_output=True, timeout=300,
+            )
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("no validated local-test", proc.stderr)
+            self.assertIsNone(self.current())
+
+            # Plant SHA-bound evidence whose pins match the candidate commit (not installed src).
+            suite_id, cmds = lt.suite_for("acme/guild")
+            digest = lt.WORKFLOW_DIGESTS[suite_id][1]
+            os.environ["GUILD_LOCAL_TEST_DIR"] = str(self.tmp / "lt-state")
+            lt.write_record(
+                {
+                    "schema": lt.SCHEMA,
+                    "authority": lt.AUTHORITY_LOCAL,
+                    "suite_id": suite_id,
+                    "workflow_digest": digest,
+                    "repo": "acme/guild",
+                    "sha": sha,
+                    "tree": tree,
+                    "pins": {k: lt.normalize_sha(v) for k, v in new_pins.items()},
+                    "status": "passed",
+                    "commands": [{"argv": list(c), "exit_code": 0} for c in cmds],
+                    "recorded_at": "2026-01-01T00:00:00Z",
+                    "host": "test",
+                },
+                suite_cmds=cmds,
+            )
+            # Pin points at a missing quartermaster object → deploy fails after gate opens.
+            # Gate itself must accept local-test for the candidate pins.
+            proc = subprocess.run(
+                [str(self.root / "src" / "bin" / "guild-update")],
+                env=env_off, text=True, capture_output=True, timeout=300,
+            )
+            self.assertIn("local-test passed", proc.stderr)
+            self.assertNotIn("no validated local-test", proc.stderr)
+            # Deploy may fail on the fake quartermaster pin; that still proves the gate opened.
+            self.assertIn(proc.returncode, (0, 1), proc.stderr)
+        finally:
+            (self.guild_work / "tests" / "member-pins.json").write_text(json.dumps(PINS, indent=2) + "\n")
+            self.commit_guild("Restore pins")
+            os.environ.pop("GUILD_LOCAL_TEST_DIR", None)
 
 
 if __name__ == "__main__":
